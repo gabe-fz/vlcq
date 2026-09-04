@@ -1,0 +1,3 @@
+"""vlcq: a deterministic VLC queue."""
+
+__version__ = "0.1.0"

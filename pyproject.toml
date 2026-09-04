@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vlcq"
+version = "0.1.0"
+description = "A deterministic, persistent VLC queue for macOS"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["textual>=1.0,<2", "httpx>=0.27,<1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.8", "mypy>=1.13"]
+
+[project.scripts]
+vlcq = "vlcq.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vlcq"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["vlcq"]
