@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
-from textual.widgets import ListView, ProgressBar
+from textual.widgets import Button, ListView, ProgressBar
 
 import vlcq.cli
 from vlcq.cli import main
@@ -105,7 +105,13 @@ async def test_tui_browse_select_add_and_parent_without_auto_enqueue(tmp_path: P
     async with app.run_test(size=(120, 40)) as pilot:
         assert db.queue_entries() == []
         browser = app.query_one("#browser", ListView)
+        assert app.query_one("#browser-up", Button)
+        assert app.query_one("#browser-sort", Button)
+        assert app.query_one("#queue-clear", Button)
+        assert app.query_one("#queue-sort", Button)
         browser.focus()
+        await pilot.pause()
+        assert app.query_one("#browser-pane").has_class("focused")
         browser.index = 0
         await pilot.press("right")
         assert app.browser_path == season.resolve()
@@ -113,8 +119,15 @@ async def test_tui_browse_select_add_and_parent_without_auto_enqueue(tmp_path: P
         await pilot.press("v")
         await pilot.press("a")
         assert [e.path.name for e in app.queue.entries()] == ["e1.mkv"]
-        await pilot.press("backspace")
+        await pilot.press("left")
         assert app.browser_path == root.resolve()
+        await pilot.click("#browser-sort")
+        assert app.browser_reverse is True
+        await pilot.click("#queue-sort")
+        assert app.query_one("#queue-pane").has_class("focused")
+        await pilot.click("#queue-clear")
+        await pilot.press("y")
+        assert app.queue.entries() == []
         await app.query_one("#progress", ProgressBar).remove()
         app.refresh_playback()  # timers may race safely with screen teardown
     db.close()

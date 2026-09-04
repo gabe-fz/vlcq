@@ -41,7 +41,7 @@ vlcq progress --root ~/Videos --json
 | Up/Down | Browse |
 | Right | Enter highlighted folder; seek forward when the queue has focus |
 | `Enter` | Enter folder or play video now |
-| `Backspace` | Parent folder (confined to root) |
+| Left / `Backspace` | Parent folder; Left seeks backward outside the browser |
 | `v` | Toggle video selection |
 | `a` / `A` | Add selection / add and play |
 | `Space` | Pause/resume |
@@ -52,6 +52,12 @@ vlcq progress --root ~/Videos --json
 | `r` | Retry selected queue entry |
 | `c` | Clear completed entries |
 | `q` | Stop the owned VLC process and quit |
+
+The browser toolbar provides **Open**, **Up**, **Select**, and **Sort**. The queue
+toolbar provides **Add**, **Play**, **Sort**, and **Clear**; Clear confirms before
+removing queue entries and never deletes media. Focused panes receive a distinct
+highlight, while folders, playable videos, selections, and queue states use
+separate colors. Hidden dotfiles and unsupported file types are not shown.
 
 ## Finder / right-click handoff
 

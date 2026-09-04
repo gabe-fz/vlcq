@@ -4,16 +4,27 @@ import asyncio
 from pathlib import Path
 from typing import ClassVar
 
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Footer, Header, Input, Label, ListItem, ListView, ProgressBar, Static
+from textual.widgets import (
+    Button,
+    Footer,
+    Header,
+    Input,
+    Label,
+    ListItem,
+    ListView,
+    ProgressBar,
+    Static,
+)
 
 from .controller import PlaybackController
 from .database import Database
 from .models import BrowserEntry
-from .paths import PathError, canonical_root, list_folder
+from .paths import PathError, canonical_root, list_folder, natural_key
 from .queue import QueueService
 from .vlc import VLCError
 
@@ -48,6 +59,22 @@ class ConfirmClear(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class ConfirmClearAll(ModalScreen[bool]):
+    BINDINGS: ClassVar = [
+        Binding("y", "confirm", "Yes"),
+        Binding("n,escape", "cancel", "No"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Label("Clear every queue entry? Media files will not be changed. y/n")
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 class QuitPrompt(ModalScreen[str | None]):
     BINDINGS: ClassVar = [
         Binding("s", "stop", "Stop VLC"),
@@ -71,12 +98,27 @@ class QuitPrompt(ModalScreen[str | None]):
 class VLCQApp(App[None]):
     TITLE = "vlcq"
     CSS = """
-    #status { height: 3; padding: 0 1; }
+    #status { height: 3; padding: 0 1; color: $text; background: $boost; }
     #panes { height: 1fr; }
-    #browser-pane, #queue-pane { width: 1fr; border: solid $accent; }
+    #browser-pane { width: 1fr; border: solid $primary; background: $surface; }
+    #queue-pane { width: 1fr; border: solid $secondary; background: $surface-darken-1; }
+    #browser-pane.focused { border: heavy $warning; background: $primary-background; }
+    #queue-pane.focused { border: heavy $warning; background: $secondary-background; }
+    .pane-title { height: 1; text-style: bold; content-align: center middle; }
+    .toolbar { height: 3; align-horizontal: center; }
+    .toolbar Button { min-width: 8; width: 1fr; margin: 0 1; }
     #browser, #queue { height: 1fr; }
-    RootPrompt { align: center middle; }
-    RootPrompt > Label, RootPrompt > Input { width: 70%; padding: 1; background: $surface; }
+    .folder-entry { color: $primary-lighten-2; text-style: bold; }
+    .video-entry { color: $success-lighten-1; }
+    .selected-video { color: $warning; text-style: bold; }
+    .queue-playing { color: $warning; text-style: bold; }
+    .queue-completed { color: $success; }
+    .queue-missing, .queue-failed { color: $error; }
+    RootPrompt, ConfirmClear, ConfirmClearAll, QuitPrompt { align: center middle; }
+    RootPrompt > Label, RootPrompt > Input, ConfirmClear > Label,
+    ConfirmClearAll > Label, QuitPrompt > Label {
+        width: 70%; padding: 1; background: $surface; border: solid $accent;
+    }
     """
     BINDINGS: ClassVar = [
         Binding("o", "open_root", "Open folder"),
@@ -91,7 +133,7 @@ class VLCQApp(App[None]):
         Binding("K", "move_up", "Move up"),
         Binding("n", "next", "Next"),
         Binding("p", "previous", "Previous"),
-        Binding("left", "seek(-10)", "Back 10s"),
+        Binding("left", "left", "Up/back"),
         Binding("right", "right", "Open/forward"),
         Binding("[", "seek(-10)", "Back 10s", show=False),
         Binding("]", "seek(10)", "Forward 10s", show=False),
@@ -116,6 +158,7 @@ class VLCQApp(App[None]):
         self.browser_path = self.root
         self.browser_entries: list[BrowserEntry] = []
         self.selected_paths: set[Path] = set()
+        self.browser_reverse = False
         self.controller = PlaybackController(self.queue)
         self.no_vlc = no_vlc
         self.autoplay = autoplay
@@ -125,10 +168,20 @@ class VLCQApp(App[None]):
         yield Static(id="status")
         with Horizontal(id="panes"):
             with Vertical(id="browser-pane"):
-                yield Label("Library")
+                yield Label("LIBRARY", classes="pane-title")
+                with Horizontal(classes="toolbar"):
+                    yield Button("Open", id="browser-open", variant="primary")
+                    yield Button("Up", id="browser-up")
+                    yield Button("Select", id="browser-select")
+                    yield Button("Sort", id="browser-sort")
                 yield ListView(id="browser")
             with Vertical(id="queue-pane"):
-                yield Label("Queue")
+                yield Label("QUEUE", classes="pane-title")
+                with Horizontal(classes="toolbar"):
+                    yield Button("Add", id="queue-add", variant="success")
+                    yield Button("Play", id="queue-play", variant="warning")
+                    yield Button("Sort", id="queue-sort")
+                    yield Button("Clear", id="queue-clear", variant="error")
                 yield ListView(id="queue")
         yield ProgressBar(total=100, id="progress")
         yield Footer()
@@ -155,6 +208,13 @@ class VLCQApp(App[None]):
         if not self.no_vlc and self.controller.client is not None:
             await self.controller.stop()
 
+    def on_descendant_focus(self, event: events.DescendantFocus) -> None:
+        browser_pane = self.query_one("#browser-pane")
+        queue_pane = self.query_one("#queue-pane")
+        ancestors = event.widget.ancestors_with_self
+        browser_pane.set_class(browser_pane in ancestors, "focused")
+        queue_pane.set_class(queue_pane in ancestors, "focused")
+
     def update_status(self, message: str) -> None:
         for widget in self.query("#status"):
             if isinstance(widget, Static):
@@ -180,19 +240,41 @@ class VLCQApp(App[None]):
     async def refresh_browser(self) -> None:
         browser = self.query_one("#browser", ListView)
         await browser.clear()
-        self.browser_entries = await asyncio.to_thread(list_folder, self.browser_path, self.root)
+        entries = await asyncio.to_thread(list_folder, self.browser_path, self.root)
+        if self.browser_reverse:
+            folders = sorted(
+                (entry for entry in entries if entry.is_dir),
+                key=lambda entry: natural_key(entry.name),
+                reverse=True,
+            )
+            files = sorted(
+                (entry for entry in entries if not entry.is_dir),
+                key=lambda entry: natural_key(entry.name),
+                reverse=True,
+            )
+            entries = [*folders, *files]
+        self.browser_entries = entries
         for entry in self.browser_entries:
-            marker = "[x]" if entry.path in self.selected_paths else "[ ]"
-            icon = "/" if entry.is_dir else marker if entry.supported else "[unsupported]"
-            await browser.append(ListItem(Label(f"{icon} {entry.name}")))
+            selected = entry.path in self.selected_paths
+            marker = "[x]" if selected else "[ ]"
+            icon = "▸" if entry.is_dir else marker
+            classes = "folder-entry" if entry.is_dir else "video-entry"
+            if selected:
+                classes += " selected-video"
+            await browser.append(ListItem(Label(f"{icon} {entry.name}"), classes=classes))
 
     def refresh_queue(self) -> None:
         view = self.query_one("#queue", ListView)
         view.clear()
         current = self.queue.current()
         for entry in self.queue.entries():
-            marker = ">" if current and current.id == entry.id else " "
-            view.append(ListItem(Label(f"{marker} {entry.path.name} [{entry.state}]")))
+            marker = "▶" if current and current.id == entry.id else " "
+            view.append(
+                ListItem(
+                    Label(f"{marker} {entry.path.name} [{entry.state}]"),
+                    classes=f"queue-{entry.state}",
+                )
+            )
 
     def _browser_entry(self) -> BrowserEntry | None:
         view = self.query_one("#browser", ListView)
@@ -294,10 +376,19 @@ class VLCQApp(App[None]):
             await self.controller.previous()
         self.refresh_queue()
 
+    def _browser_has_focus(self) -> bool:
+        browser_pane = self.query_one("#browser-pane")
+        return self.focused is not None and browser_pane in self.focused.ancestors_with_self
+
+    async def action_left(self) -> None:
+        if self._browser_has_focus():
+            await self.action_parent()
+        elif not self.no_vlc:
+            await self.controller.seek(-10)
+
     async def action_right(self) -> None:
-        browser = self.query_one("#browser", ListView)
         entry = self._browser_entry()
-        if self.focused is browser and entry is not None and entry.is_dir:
+        if self._browser_has_focus() and entry is not None and entry.is_dir:
             await self.action_activate()
         elif not self.no_vlc:
             await self.controller.seek(10)
@@ -335,6 +426,41 @@ class VLCQApp(App[None]):
             except FileNotFoundError:
                 self.update_status("Video is missing")
             self.refresh_queue()
+
+    def action_clear_all(self) -> None:
+        def confirmed(value: bool | None) -> None:
+            if value:
+                self.queue.clear_all()
+                self.refresh_queue()
+
+        self.push_screen(ConfirmClearAll(), confirmed)
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id
+        if button_id == "browser-open":
+            self.action_open_root()
+        elif button_id == "browser-up":
+            await self.action_parent()
+        elif button_id == "browser-select":
+            await self.action_select()
+        elif button_id == "browser-sort":
+            self.browser_reverse = not self.browser_reverse
+            await self.refresh_browser()
+        elif button_id == "queue-add":
+            await self.action_add_selected()
+        elif button_id == "queue-play":
+            index = self._queue_index()
+            if index is not None:
+                if self.no_vlc:
+                    self.queue.play_now(index)
+                else:
+                    await self.controller.play_index(index)
+                self.refresh_queue()
+        elif button_id == "queue-sort":
+            self.queue.sort_natural()
+            self.refresh_queue()
+        elif button_id == "queue-clear":
+            self.action_clear_all()
 
     def action_clear_completed(self) -> None:
         def confirmed(value: bool | None) -> None:

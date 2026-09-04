@@ -132,8 +132,11 @@ Display:
 
 - VLC/controller connection state.
 - The active library/root folder and a browser for that root and its subfolders.
-- Supported videos with explicit-selection state; unsupported, missing, and
-  out-of-root entries with clear status.
+- Supported videos with explicit-selection state. Hidden dotfiles and
+  unsupported file types are filtered out of the browser; invalid explicit
+  operands still receive clear errors.
+- Distinct colors for folders, videos, selected items, playback states, and the
+  currently focused browser or queue pane.
 - Current filename (not the full absolute path by default).
 - Playing, paused, stopped, or unavailable state.
 - Elapsed time, duration, and percentage when available.
@@ -153,7 +156,7 @@ user explicitly requests it.
 | `o` | Open or change the library/root folder |
 | Up/Down | Browse entries in the root or an opened subfolder |
 | Right | Open the highlighted subfolder; outside the browser, seek forward |
-| `Backspace` | Return to the parent folder; at the library root, remain at the root |
+| Left / `Backspace` | Return to the parent folder while browsing; at the library root, remain at the root. Left seeks backward outside the browser |
 | `Enter` | Open a highlighted subfolder, or play a highlighted video now |
 | `v` | Toggle the highlighted supported video in the selection |
 | `a` | Add selected video(s) to the queue |
@@ -170,7 +173,9 @@ user explicitly requests it.
 | `q` | Quit with an explicit choice about the VLC process |
 
 Destructive-looking actions affect queue state only. They must never delete the
-underlying media file.
+underlying media file. Each pane also exposes visible buttons for its primary
+actions: open/up/select/sort for the browser and add/play/sort/clear for the
+queue. Clearing the full queue requires confirmation.
 
 ### 6.3 Responsiveness
 

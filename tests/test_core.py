@@ -28,6 +28,9 @@ def test_folder_browsing_is_non_recursive_and_natural(tmp_path: Path) -> None:
     touch(tmp_path / "episode10.mkv")
     touch(tmp_path / "episode2.mkv")
     touch(tmp_path / "season" / "episode1.mp4")
+    touch(tmp_path / ".hidden.mkv")
+    touch(tmp_path / "notes.txt")
+    (tmp_path / ".secret").mkdir()
     entries = list_folder(tmp_path)
     assert [e.name for e in entries] == ["season", "episode2.mkv", "episode10.mkv"]
     assert all(e.path.parent == tmp_path for e in entries)

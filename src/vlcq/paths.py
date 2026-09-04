@@ -9,7 +9,30 @@ from urllib.parse import unquote, urlsplit
 from .models import BrowserEntry
 
 VIDEO_EXTENSIONS = frozenset(
-    {".3gp", ".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm", ".wmv"}
+    {
+        ".3gp",
+        ".asf",
+        ".avi",
+        ".divx",
+        ".dv",
+        ".f4v",
+        ".flv",
+        ".m2ts",
+        ".m2v",
+        ".m4v",
+        ".mkv",
+        ".mov",
+        ".mp4",
+        ".mpeg",
+        ".mpg",
+        ".mts",
+        ".ogm",
+        ".ogv",
+        ".ts",
+        ".vob",
+        ".webm",
+        ".wmv",
+    }
 )
 _NUMBERS = re.compile(r"(\d+)")
 
@@ -88,6 +111,8 @@ def list_folder(folder: str | Path, root: str | Path | None = None) -> list[Brow
     except OSError as exc:
         raise PathError("folder cannot be read") from exc
     for child in children:
+        if child.name.startswith("."):
+            continue
         try:
             canonical = child.resolve(strict=True)
             confined = is_beneath(canonical, base)
@@ -96,7 +121,7 @@ def list_folder(folder: str | Path, root: str | Path | None = None) -> list[Brow
         except (OSError, RuntimeError):
             continue
         supported = is_file and canonical.suffix.casefold() in VIDEO_EXTENSIONS
-        if is_dir or is_file:
+        if is_dir or supported:
             entries.append(BrowserEntry(canonical, child.name, is_dir, supported))
     return sorted(entries, key=lambda item: (not item.is_dir, natural_key(item.name)))
 

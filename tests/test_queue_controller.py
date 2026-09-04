@@ -75,13 +75,18 @@ def test_queue_reorder_remove_missing_and_clear(tmp_path: Path) -> None:
     db, queue, videos = setup_queue(tmp_path)
     queue.move(0, 1)
     assert [entry.path for entry in queue.entries()] == [videos[1].resolve(), videos[0].resolve()]
+    queue.sort_natural()
+    assert [entry.path for entry in queue.entries()] == [videos[0].resolve(), videos[1].resolve()]
     queue.play_now(0)
-    videos[0].unlink()
+    videos[1].unlink()
     assert queue.next() is None
     assert queue.entries()[1].state == "missing"
     db.set_state(queue.entries()[0].id, "completed")
     queue.clear_completed()
     assert len(queue.entries()) == 1
     queue.remove(0)
+    assert queue.entries() == []
+    queue.add([videos[0]])
+    queue.clear_all()
     assert queue.entries() == []
     db.close()

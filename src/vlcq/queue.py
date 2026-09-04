@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .database import Database
 from .models import QueueEntry
-from .paths import deduplicate_natural, validate_video
+from .paths import deduplicate_natural, natural_key, validate_video
 
 
 class QueueService:
@@ -91,6 +91,15 @@ class QueueService:
         for entry in self.entries():
             if entry.state == "completed":
                 self.database.remove(entry.id)
+
+    def clear_all(self) -> None:
+        self.database.set_current(None)
+        for entry in self.entries():
+            self.database.remove(entry.id)
+
+    def sort_natural(self) -> None:
+        entries = sorted(self.entries(), key=lambda entry: natural_key(entry.path.name))
+        self.database.reorder([entry.id for entry in entries])
 
     def retry(self, index: int) -> QueueEntry:
         entry = self.entries()[index]
