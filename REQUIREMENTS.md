@@ -54,11 +54,13 @@ initial runtime dependencies are Textual and an async HTTP client such as
 ### 5.1 Open a library root and select videos
 
 ```sh
+vlcq
 vlcq play ./Odd\ Taxi/
 ```
 
-The primary workflow opens one canonical library/root folder and then opens the
-TUI. Opening the folder alone must not enqueue or start every video discovered
+Running `vlcq` without a subcommand reopens the last valid library root, or
+opens a native folder chooser when no root has been saved. The primary workflow
+opens one canonical library/root folder and then opens the TUI. Opening the folder alone must not enqueue or start every video discovered
 under it, recursively or otherwise. The TUI presents the root and its
 subfolders for browsing; users explicitly select one or more supported videos
 to add to the queue or play.

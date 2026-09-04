@@ -13,7 +13,14 @@ as `vlc` on `PATH`.
 ```sh
 python3 -m venv .venv
 .venv/bin/pip install -e .
-.venv/bin/vlcq play ~/Videos/Show
+.venv/bin/vlcq
+```
+
+Running `vlcq` reopens the last library, or displays the native macOS folder
+chooser on first use. You can also open a specific root directly:
+
+```sh
+vlcq play ~/Videos/Show
 ```
 
 Opening a folder only establishes the library root. Browse into subfolders,

@@ -55,6 +55,34 @@ def test_explicit_file_cli_establishes_root_and_seeds_queue(
     }
 
 
+def test_commandless_cli_opens_last_library(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "show"
+    root.mkdir()
+    db_path = tmp_path / "db.sqlite3"
+    database = Database(db_path)
+    database.set_root(root)
+    database.close()
+    observed: dict[str, object] = {}
+
+    class FakeApp:
+        def __init__(self, *, root: Path, database: Database, no_vlc: bool, autoplay: bool) -> None:
+            observed.update(root=root, no_vlc=no_vlc, autoplay=autoplay)
+
+        def run(self) -> None:
+            observed["ran"] = True
+
+    monkeypatch.setattr(vlcq.cli, "VLCQApp", FakeApp)
+    assert main(["--database", str(db_path)]) == 0
+    assert observed == {
+        "root": root.resolve(),
+        "no_vlc": False,
+        "autoplay": False,
+        "ran": True,
+    }
+
+
 def test_progress_cli_root_filtered(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     root = tmp_path / "root"
     root.mkdir()

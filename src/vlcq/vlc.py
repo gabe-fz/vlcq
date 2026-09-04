@@ -121,9 +121,16 @@ class VLCProcess:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
-        output, _ = await asyncio.wait_for(probe.communicate(), 5)
-        first_line = output.decode("utf-8", "replace").splitlines()[:1]
-        if probe.returncode != 0 or not first_line or "VLC version 3." not in first_line[0]:
+        if probe.stdout is None:
+            raise VLCError("could not inspect the VLC version")
+        try:
+            output = await asyncio.wait_for(probe.stdout.readline(), 5)
+        finally:
+            if probe.returncode is None:
+                probe.terminate()
+                await probe.wait()
+        first_line = output.decode("utf-8", "replace")
+        if "VLC version 3." not in first_line:
             raise VLCError("vlcq requires a compatible VLC 3 executable")
 
     async def start(self, timeout: float = 10) -> VLCClient:

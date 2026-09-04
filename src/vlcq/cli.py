@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -21,7 +22,7 @@ def parser() -> argparse.ArgumentParser:
         prog="vlcq", description="Folder-first deterministic VLC queue"
     )
     result.add_argument("--database", type=Path, default=None, help=argparse.SUPPRESS)
-    sub = result.add_subparsers(dest="command", required=True)
+    sub = result.add_subparsers(dest="command")
     for command in ("play", "add"):
         item = sub.add_parser(command, help=f"{command} a folder or explicit videos")
         item.add_argument("paths", nargs="+", type=Path)
@@ -51,6 +52,24 @@ def _resolve_paths(values: list[Path]) -> tuple[Path, list[Path]]:
     return root, [validate_video(value, root) for value in values]
 
 
+def _choose_root() -> Path | None:
+    """Open the native macOS folder chooser for a commandless first run."""
+    script = 'POSIX path of (choose folder with prompt "Choose the vlcq library folder")'
+    try:
+        result = subprocess.run(
+            ["/usr/bin/osascript", "-e", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return Path(result.stdout.strip())
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
     db_path: Path = args.database if args.database is not None else database_path()
@@ -75,7 +94,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             try:
                 root: Path
                 selected: list[Path]
-                if args.command == "resume":
+                if args.command is None:
+                    saved_root = database.get_root()
+                    if saved_root is not None and saved_root.is_dir():
+                        root = saved_root.resolve()
+                    else:
+                        chosen_root = _choose_root()
+                        if chosen_root is None:
+                            raise PathError("no library folder was selected")
+                        root = canonical_root(chosen_root)
+                    selected = []
+                elif args.command == "resume":
                     saved_root = database.get_root()
                     if saved_root is None or not saved_root.is_dir():
                         raise PathError("there is no resumable library root")
@@ -92,7 +121,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 app = VLCQApp(
                     root=root,
                     database=database,
-                    no_vlc=args.no_vlc,
+                    no_vlc=getattr(args, "no_vlc", False),
                     autoplay=args.command == "play" and bool(selected),
                 )
                 app.run()
