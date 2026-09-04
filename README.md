@@ -74,8 +74,8 @@ directory and files are private to the user; SQLite uses WAL and a busy timeout.
 An advisory lock prevents a second controller from independently mutating the
 queue. A second process exits clearly rather than risking corruption.
 
-VLC is launched as a dedicated process with an authenticated HTTP interface
-bound to `127.0.0.1`. The generated password, Authorization header, raw VLC
+VLC is launched as a dedicated process with its normal macOS video interface
+visible and an authenticated HTTP interface bound to `127.0.0.1`. The generated password, Authorization header, raw VLC
 responses, and media history are not logged. `vlcq` performs no non-loopback
 network requests and never deletes, moves, copies, or modifies media files.
 

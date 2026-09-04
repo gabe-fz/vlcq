@@ -5,7 +5,15 @@ from pathlib import Path
 import httpx
 import pytest
 
-from vlcq.vlc import VLCClient, VLCError, parse_status
+from vlcq.vlc import VLCClient, VLCError, VLCProcess, parse_status
+
+
+def test_process_uses_visible_macos_interface() -> None:
+    process = VLCProcess("/Applications/VLC.app/Contents/MacOS/VLC")
+    arguments = process.launch_arguments()
+    assert "--intf=macosx" in arguments
+    assert "--intf=dummy" not in arguments
+    assert "--extraintf=http" in arguments
 
 
 def test_parse_status_is_tolerant_and_rejects_remote_media(tmp_path: Path) -> None:

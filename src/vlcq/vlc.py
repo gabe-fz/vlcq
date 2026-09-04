@@ -133,13 +133,10 @@ class VLCProcess:
         if "VLC version 3." not in first_line:
             raise VLCError("vlcq requires a compatible VLC 3 executable")
 
-    async def start(self, timeout: float = 10) -> VLCClient:
-        if not Path(self.executable).is_file():
-            raise VLCError("VLC executable not found; install VLC 3 or configure its path")
-        await self._validate_version()
-        args = [
+    def launch_arguments(self) -> list[str]:
+        return [
             self.executable,
-            "--intf=dummy",
+            "--intf=macosx",
             "--no-media-library",
             "--extraintf=http",
             "--http-host=127.0.0.1",
@@ -147,8 +144,15 @@ class VLCProcess:
             f"--http-password={self.password}",
             "--no-video-title-show",
         ]
+
+    async def start(self, timeout: float = 10) -> VLCClient:
+        if not Path(self.executable).is_file():
+            raise VLCError("VLC executable not found; install VLC 3 or configure its path")
+        await self._validate_version()
         self.process = await asyncio.create_subprocess_exec(
-            *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+            *self.launch_arguments(),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
         self.client = VLCClient(self.port, self.password)
         deadline = asyncio.get_running_loop().time() + timeout
