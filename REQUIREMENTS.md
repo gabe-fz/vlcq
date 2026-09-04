@@ -31,6 +31,8 @@ It must not depend on VLC's incomplete `recentlyPlayedMedia` preferences.
 - Synchronizing history between computers.
 - Editing, moving, copying, or deleting media files.
 - Supporting Windows or Linux in the first release.
+- Requiring a particular macOS Finder extension architecture in the initial
+  release.
 - Inferring episodes by title through fuzzy matching.
 
 ## 4. Target environment and stack
@@ -49,18 +51,22 @@ initial runtime dependencies are Textual and an async HTTP client such as
 
 ## 5. User workflows
 
-### 5.1 Start a queue
+### 5.1 Open a library root and select videos
 
 ```sh
 vlcq play ./Odd\ Taxi/
-vlcq play episode-01.mkv episode-02.mkv
 ```
 
-- Directories are scanned recursively for supported video extensions.
-- Discovered files are naturally sorted, so episode 9 precedes episode 10.
-- Duplicate canonical files are included only once.
-- The TUI opens with the resulting queue and begins playback unless disabled by
-  an explicit option.
+The primary workflow opens one canonical library/root folder and then opens the
+TUI. Opening the folder alone must not enqueue or start every video discovered
+under it, recursively or otherwise. The TUI presents the root and its
+subfolders for browsing; users explicitly select one or more supported videos
+to add to the queue or play.
+
+Selected videos are deterministically naturally ordered, so episode 9 precedes
+episode 10, and canonical-path deduplication includes a file only once.
+Unsupported, missing, and out-of-root entries are clearly reported and cannot
+be played or added.
 
 ### 5.2 Add items to an existing or new queue
 
@@ -69,12 +75,32 @@ vlcq add ./next-season/
 vlcq add movie.mkv
 ```
 
-If an active `vlcq` controller exists, the command forwards additions to it. If
-none exists, it creates a queue and opens the TUI. Inter-process communication
-must be local to the current user and authenticated or protected by filesystem
-permissions.
+A directory operand opens or changes the library root; it never recursively
+auto-enqueues its contents. Explicit local video operands represent a user
+selection and enter the same validated add/play workflow as TUI selections.
+They must be validated against a canonical root before they can be added or
+played; a file operand cannot bypass root confinement. When no controller or
+root exists, the canonical explicit video operands establish their nearest
+common parent directory as the root; a single file uses its parent directory.
+When a root already exists, explicit operands outside it are rejected with a
+clear error. If an active `vlcq` controller exists, the command forwards the
+root change or valid explicit additions to it. If none exists, it creates a
+queue and opens the TUI. Inter-process communication must be local to the
+current user and authenticated or protected by filesystem permissions.
 
-### 5.3 Resume
+### 5.3 Optional macOS context-menu entry points
+
+An optional macOS right-click/context-menu action may pass either a folder or
+selected local video files to `vlcq`. A folder opens or changes the library root
+without recursively enqueueing its contents; selected files are explicit
+candidates. Context-menu file selections use the same nearest-common-parent
+root-establishment rule when no root exists and the same out-of-root rejection
+when one does. Both forms use the same canonicalization, root-confinement,
+supported-extension, missing-file, and non-destructive validation as the CLI
+and TUI. The initial release does not require a particular Finder extension
+architecture.
+
+### 5.4 Resume
 
 ```sh
 vlcq resume
@@ -83,7 +109,7 @@ vlcq resume
 This restores the most recent unfinished queue and offers to resume the current
 item at its last persisted position.
 
-### 5.4 Export progress
+### 5.5 Export progress
 
 ```sh
 vlcq progress --root /Users/final/plex-tv --json
@@ -103,6 +129,9 @@ The initial UI should be deliberately simple and usable in an ordinary terminal.
 Display:
 
 - VLC/controller connection state.
+- The active library/root folder and a browser for that root and its subfolders.
+- Supported videos with explicit-selection state; unsupported, missing, and
+  out-of-root entries with clear status.
 - Current filename (not the full absolute path by default).
 - Playing, paused, stopped, or unavailable state.
 - Elapsed time, duration, and percentage when available.
@@ -119,9 +148,14 @@ user explicitly requests it.
 
 | Key | Action |
 | --- | --- |
+| `o` | Open or change the library/root folder |
+| Up/Down | Browse entries in the root or an opened subfolder |
+| `Backspace` | Return to the parent folder; at the library root, remain at the root |
+| `Enter` | Open a highlighted subfolder, or play a highlighted video now |
+| `v` | Toggle the highlighted supported video in the selection |
+| `a` | Add selected video(s) to the queue |
+| `A` | Add selected video(s) and play the first in natural order |
 | `Space` | Play/pause |
-| `Enter` | Play highlighted item now |
-| `a` | Open an add-path prompt |
 | `d` / `Delete` | Remove highlighted item from the queue only |
 | `J` / `K` | Move highlighted item down/up |
 | `n` | Skip to next item |
@@ -137,16 +171,20 @@ underlying media file.
 
 ### 6.3 Responsiveness
 
-- TUI input must remain responsive while HTTP polling, VLC startup, filesystem
-  scanning, and database writes occur.
-- Slow operations run asynchronously.
-- Resize events must preserve a usable queue viewport.
+- TUI input must remain responsive while HTTP polling, VLC startup, root and
+  subfolder browsing, filesystem validation, and database writes occur.
+- Root browsing, path validation, and other slow operations run asynchronously.
+- Resize events must preserve usable browser and queue viewports.
 - Recoverable errors appear in the UI without closing the application.
 
 ## 7. Queue semantics
 
 - `vlcq`, not VLC, is authoritative for queue order.
 - VLC receives one active item at a time.
+- Opening or changing a library/root folder never implicitly enqueues files;
+  only explicit video selections enter the queue.
+- A multiple-video selection is naturally ordered and canonical-path deduplicated
+  before it is added or played.
 - When natural completion is observed, persist final progress and start the
   next queued item.
 - Manual `next` marks the current queue entry as skipped, not completed, unless
@@ -238,17 +276,28 @@ Suggested intervals:
 
 ## 10. Media identity and path safety
 
-For every observed or queued item:
+Root opening and video selection are local, root-confined, asynchronous, and
+non-destructive. For every opened root and selected, observed, or queued item:
 
-1. Accept only local `file:` URIs or explicit local CLI paths.
+1. Accept only a local folder for the root, and only local `file:` URIs or
+   explicit local TUI/CLI/context-menu paths for videos. When explicit CLI or
+   context-menu file operands arrive without an existing root, establish the
+   canonical nearest common parent as the root; otherwise enforce the existing
+   root and reject out-of-root operands.
 2. Reject remote hosts, credentials, query strings, fragments, malformed
    escapes, NULs, and non-file schemes.
-3. Resolve the canonical path and require a regular file before playback.
-4. Store a file fingerprint containing device, inode, size, and modification
+3. Resolve canonical paths. Require the root to be a regular directory and
+   every selected or queued video to be a regular file beneath that root.
+   Containment must be checked on canonical paths, including symlink traversal,
+   rather than by string-prefix matching.
+4. Do not follow a queue/cache/database symlink into an unsafe location.
+5. Report unsupported extensions, missing paths, invalid roots, and
+   out-of-root paths clearly; never add or play them.
+6. Do not modify, delete, move, or copy anything while browsing or selecting.
+7. Store a file fingerprint containing device, inode, size, and modification
    time.
-5. Treat a changed fingerprint as a replacement rather than applying old
+8. Treat a changed fingerprint as a replacement rather than applying old
    progress silently.
-6. Do not follow a queue/cache/database symlink into an unsafe location.
 
 Renames on the same filesystem may be recognized by device/inode while the
 controller can still observe the file. Content-based hashing and fuzzy title
@@ -344,26 +393,42 @@ VLC cache using maximum valid progress.
 
 ## 15. Initial acceptance criteria
 
-1. `vlcq play <directory>` naturally sorts videos and displays them in the TUI.
-2. The application launches an owned VLC instance with HTTP bound only to
+1. `vlcq play <directory>` opens that folder as the library/root in the TUI
+   without recursively auto-enqueueing or starting every discovered video.
+2. The TUI browses the root and subfolders and supports explicit individual and
+   multiple-video selection, natural ordering, and canonical-path
+   deduplication for add/play actions.
+3. Open/change-root, parent-navigation, and selection keybindings are visible
+   and usable; unsupported, missing, and out-of-root paths receive clear errors
+   without filesystem mutation.
+4. An optional macOS right-click/context-menu entry, if provided, passes a
+   folder or selected local videos through the same validated workflow; no
+   particular Finder extension architecture is required for the initial
+   release.
+5. The application launches an owned VLC instance with HTTP bound only to
    loopback and authenticated.
-3. Playing one item to the next automatically records both items, including the
+6. Playing one item to the next automatically records both items, including the
    autoplay transition that VLC preferences currently omit.
-4. Pause, resume, seek, skip, and play-now controls work from the TUI.
-5. Queue order and progress survive restarting both `vlcq` and VLC.
-6. A later zero or stale observation cannot reduce stored progress.
-7. Replaced files do not inherit previous progress.
-8. Concurrent `vlcq` invocations cannot corrupt or independently mutate the
-   same queue.
-9. `vlcq progress --root ... --json` returns only validated relative records
-   beneath that root.
-10. HTTP credentials and unrelated media paths do not appear in normal output,
+7. Pause, resume, seek, skip, and play-now controls work from the TUI.
+8. Queue order and progress survive restarting both `vlcq` and VLC.
+9. A later zero or stale observation cannot reduce stored progress.
+10. Replaced files do not inherit previous progress.
+11. Concurrent `vlcq` invocations cannot corrupt or independently mutate
+    the same queue.
+12. `vlcq progress --root ... --json` returns only validated relative records
+    beneath that root.
+13. HTTP credentials and unrelated media paths do not appear in normal output,
     logs, exceptions, or tests.
-11. Unit tests cover natural sorting, queue transitions, progress merging,
-    path/URI validation, database migrations, malformed HTTP responses, and
-    replacement detection.
-12. A macOS integration test verifies VLC 3 startup, loopback binding, status
-    polling, one autoplay transition, and clean shutdown.
+14. Unit tests cover folder opening without auto-enqueue, root/subfolder
+    browsing and parent navigation, explicit selection, standalone-file root
+    establishment, natural ordering, canonical deduplication,
+    unsupported/missing/out-of-root handling, queue transitions, progress
+    merging, path/URI validation, database migrations, malformed HTTP
+    responses, and replacement detection.
+15. A macOS integration test verifies VLC 3 startup, loopback binding, status
+    polling, one autoplay transition, and clean shutdown. If an optional
+    context-menu entry is implemented, its folder and selected-file handoff is
+    also tested.
 
 ## 16. Deferred decisions
 
@@ -373,7 +438,7 @@ Resolve during design/implementation:
 - Whether quitting the TUI should stop VLC, leave it running, or prompt by
   default.
 - Default completion threshold and natural-end inference tolerance.
-- Whether manually selected media outside the managed queue should be observed,
-  ignored, or offered for import.
+- Whether an optional context-menu video selection should preselect videos in
+  the TUI or add them directly when a controller already exists.
 - Whether a later release should support a detached background controller.
 - VLC 4 compatibility strategy.
