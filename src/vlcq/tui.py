@@ -92,7 +92,9 @@ class VLCQApp(App[None]):
         Binding("n", "next", "Next"),
         Binding("p", "previous", "Previous"),
         Binding("left", "seek(-10)", "Back 10s"),
-        Binding("right", "seek(10)", "Forward 10s"),
+        Binding("right", "right", "Open/forward"),
+        Binding("[", "seek(-10)", "Back 10s", show=False),
+        Binding("]", "seek(10)", "Forward 10s", show=False),
         Binding("r", "retry", "Retry"),
         Binding("c", "clear_completed", "Clear completed"),
         Binding("?", "help", "Help"),
@@ -154,16 +156,21 @@ class VLCQApp(App[None]):
             await self.controller.stop()
 
     def update_status(self, message: str) -> None:
-        self.query_one("#status", Static).update(
-            f"Root: {self.root.name}  Folder: {self.browser_path.relative_to(self.root) or '.'}  {message}"
-        )
+        for widget in self.query("#status"):
+            if isinstance(widget, Static):
+                widget.update(
+                    f"Root: {self.root.name}  "
+                    f"Folder: {self.browser_path.relative_to(self.root) or '.'}  {message}"
+                )
 
     def refresh_playback(self) -> None:
         status = self.controller.status
         percent = (
             min(100.0, status.position_ms * 100 / status.duration_ms) if status.duration_ms else 0.0
         )
-        self.query_one("#progress", ProgressBar).update(progress=percent)
+        for widget in self.query("#progress"):
+            if isinstance(widget, ProgressBar):
+                widget.update(progress=percent)
         current = self.queue.current()
         name = current.path.name if current else "none"
         elapsed = status.position_ms // 1000
@@ -286,6 +293,14 @@ class VLCQApp(App[None]):
         else:
             await self.controller.previous()
         self.refresh_queue()
+
+    async def action_right(self) -> None:
+        browser = self.query_one("#browser", ListView)
+        entry = self._browser_entry()
+        if self.focused is browser and entry is not None and entry.is_dir:
+            await self.action_activate()
+        elif not self.no_vlc:
+            await self.controller.seek(10)
 
     async def action_seek(self, seconds: int) -> None:
         if not self.no_vlc:

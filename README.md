@@ -38,14 +38,15 @@ vlcq progress --root ~/Videos --json
 | Key | Action |
 | --- | --- |
 | `o` | Open/change library root |
-| arrows | Browse |
+| Up/Down | Browse |
+| Right | Enter highlighted folder; seek forward when the queue has focus |
 | `Enter` | Enter folder or play video now |
 | `Backspace` | Parent folder (confined to root) |
 | `v` | Toggle video selection |
 | `a` / `A` | Add selection / add and play |
 | `Space` | Pause/resume |
 | `n` / `p` | Next/previous |
-| Left/Right | Seek -/+ 10 seconds |
+| Left / `[` / `]` | Seek backward / backward / forward 10 seconds |
 | `d` | Remove queue entry (never the media file) |
 | `J` / `K` | Move queue entry down/up |
 | `r` | Retry selected queue entry |

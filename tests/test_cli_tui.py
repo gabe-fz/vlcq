@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
-from textual.widgets import ListView
+from textual.widgets import ListView, ProgressBar
 
 import vlcq.cli
 from vlcq.cli import main
@@ -105,8 +105,9 @@ async def test_tui_browse_select_add_and_parent_without_auto_enqueue(tmp_path: P
     async with app.run_test(size=(120, 40)) as pilot:
         assert db.queue_entries() == []
         browser = app.query_one("#browser", ListView)
+        browser.focus()
         browser.index = 0
-        await pilot.press("enter")
+        await pilot.press("right")
         assert app.browser_path == season.resolve()
         browser.index = 0
         await pilot.press("v")
@@ -114,4 +115,6 @@ async def test_tui_browse_select_add_and_parent_without_auto_enqueue(tmp_path: P
         assert [e.path.name for e in app.queue.entries()] == ["e1.mkv"]
         await pilot.press("backspace")
         assert app.browser_path == root.resolve()
+        await app.query_one("#progress", ProgressBar).remove()
+        app.refresh_playback()  # timers may race safely with screen teardown
     db.close()

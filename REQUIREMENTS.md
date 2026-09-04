@@ -152,6 +152,7 @@ user explicitly requests it.
 | --- | --- |
 | `o` | Open or change the library/root folder |
 | Up/Down | Browse entries in the root or an opened subfolder |
+| Right | Open the highlighted subfolder; outside the browser, seek forward |
 | `Backspace` | Return to the parent folder; at the library root, remain at the root |
 | `Enter` | Open a highlighted subfolder, or play a highlighted video now |
 | `v` | Toggle the highlighted supported video in the selection |
@@ -162,7 +163,7 @@ user explicitly requests it.
 | `J` / `K` | Move highlighted item down/up |
 | `n` | Skip to next item |
 | `p` | Return to previous item |
-| Left/Right | Seek backward/forward by a configurable interval |
+| Left / `[` / `]` | Seek backward, or explicitly backward/forward, by a configurable interval |
 | `r` | Resume/retry highlighted item |
 | `c` | Clear completed queue entries after confirmation |
 | `?` | Show help |
