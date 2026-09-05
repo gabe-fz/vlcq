@@ -374,6 +374,60 @@ async def test_tui_direct_enter_consumes_only_activated_selection(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_play_when_client_missing_shows_retry_status(tmp_path: Path) -> None:
+    root = tmp_path / "show"
+    root.mkdir()
+    video = root / "episode.mkv"
+    video.write_bytes(b"video")
+    db = Database(tmp_path / "db.sqlite3")
+    app = VLCQApp(root=root, database=db, no_vlc=True)
+    async with app.run_test(size=(120, 40)) as pilot:
+        app.queue.add([video])
+        app.refresh_queue()
+        await pilot.pause()
+        queue = app.query_one("#queue", ListView)
+        queue.focus()
+        queue.index = 0
+        app.no_vlc = False
+
+        await app.action_activate()
+
+        rendered = str(app.query_one("#status", Static).renderable)
+        assert "VLC unavailable — press r to retry" in rendered
+        assert "VLC is not connected" not in rendered
+        app.no_vlc = True
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_periodic_queue_refresh_reuses_and_updates_existing_rows(tmp_path: Path) -> None:
+    root = tmp_path / "show"
+    root.mkdir()
+    video = root / "episode.mkv"
+    video.write_bytes(b"video")
+    db = Database(tmp_path / "db.sqlite3")
+    app = VLCQApp(root=root, database=db, no_vlc=True)
+    async with app.run_test(size=(120, 40)) as pilot:
+        app.queue.add([video])
+        app.refresh_queue()
+        await pilot.pause()
+        view = app.query_one("#queue", ListView)
+        original_row = view.children[0]
+
+        app.refresh_queue()
+        await pilot.pause()
+        assert view.children[0] is original_row
+
+        entry = app.queue.entries()[0]
+        db.set_state(entry.id, "playing")
+        app.refresh_queue()
+        await pilot.pause()
+        assert view.children[0] is original_row
+        assert "PLAYING" in str(original_row.query_one(Label).renderable)
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_tui_retry_reconnects_when_vlc_is_disconnected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

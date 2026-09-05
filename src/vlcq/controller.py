@@ -144,8 +144,9 @@ class PlaybackController:
     async def _poll(self) -> None:
         delay = 1.0
         while self._running and self.client:
+            client = self.client
             try:
-                status = await self.client.status()
+                status = await client.status()
                 await self._observe(status)
                 delay = (
                     1.0
@@ -155,8 +156,21 @@ class PlaybackController:
                     else min(5.0, delay * 1.5)
                 )
             except (VLCError, OSError):
+                # A failed poll means this client can no longer be trusted.
+                # Retire it directly instead of calling ``stop`` here: this
+                # coroutine is itself the polling task and must not await
+                # itself. Clearing the reference also makes the UI retry
+                # path reconnect on the next attempt.
+                if self.client is client:
+                    self.client = None
                 self.status = VLCStatus("unavailable")
-                delay = min(5.0, delay * 2)
+                try:
+                    await client.close()
+                except (VLCError, OSError, RuntimeError):
+                    pass
+                # Do not leave an old polling task alive while retry creates a
+                # new one; the retry path will start a fresh polling task.
+                break
             await asyncio.sleep(delay)
 
     async def stop(self, stop_vlc: bool = True) -> None:

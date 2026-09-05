@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -14,6 +15,61 @@ def test_process_uses_visible_macos_interface() -> None:
     assert "--intf=macosx" in arguments
     assert "--intf=dummy" not in arguments
     assert "--extraintf=http" in arguments
+
+
+@pytest.mark.parametrize(
+    "banner",
+    [b"VLC media player 3.0.21 Vetinari\n", b"VLC version 3.0.17.3 Vetinari\n"],
+)
+@pytest.mark.asyncio
+async def test_validate_version_accepts_standard_vlc_media_player_banner(
+    monkeypatch: pytest.MonkeyPatch, banner: bytes
+) -> None:
+    class FakeStdout:
+        async def readline(self) -> bytes:
+            return banner
+
+    class FakeProbe:
+        stdout = FakeStdout()
+        returncode: int | None = None
+
+        def terminate(self) -> None:
+            self.returncode = 0
+
+        async def wait(self) -> int:
+            return 0
+
+    async def create_probe(*_args: object, **_kwargs: object) -> Any:
+        return FakeProbe()
+
+    monkeypatch.setattr("vlcq.vlc.asyncio.create_subprocess_exec", create_probe)
+    await VLCProcess("/Applications/VLC.app/Contents/MacOS/VLC")._validate_version()
+
+
+@pytest.mark.asyncio
+async def test_validate_version_rejects_unsupported_major(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeStdout:
+        async def readline(self) -> bytes:
+            return b"VLC media player 4.0.0\n"
+
+    class FakeProbe:
+        stdout = FakeStdout()
+        returncode: int | None = None
+
+        def terminate(self) -> None:
+            self.returncode = 0
+
+        async def wait(self) -> int:
+            return 0
+
+    async def create_probe(*_args: object, **_kwargs: object) -> Any:
+        return FakeProbe()
+
+    monkeypatch.setattr("vlcq.vlc.asyncio.create_subprocess_exec", create_probe)
+    with pytest.raises(VLCError, match="requires a compatible VLC 3"):
+        await VLCProcess("/Applications/VLC.app/Contents/MacOS/VLC")._validate_version()
 
 
 def test_parse_status_is_tolerant_and_rejects_remote_media(tmp_path: Path) -> None:

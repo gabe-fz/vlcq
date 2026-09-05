@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import secrets
 import shutil
 import socket
@@ -129,8 +130,13 @@ class VLCProcess:
             if probe.returncode is None:
                 probe.terminate()
                 await probe.wait()
-        first_line = output.decode("utf-8", "replace")
-        if "VLC version 3." not in first_line:
+        first_line = output.decode("utf-8", "replace").strip()
+        # VLC has used both "VLC media player" and "VLC version" prefixes
+        # in its version banner. Match the version number rather than one
+        # literal banner so supported VLC 3 builds are accepted while newer
+        # major versions are rejected.
+        version_match = re.match(r"^VLC (?:media player|version) (\d+)(?:\.|\s|$)", first_line)
+        if version_match is None or version_match.group(1) != "3":
             raise VLCError("vlcq requires a compatible VLC 3 executable")
 
     def launch_arguments(self) -> list[str]:
@@ -146,6 +152,8 @@ class VLCProcess:
         ]
 
     async def start(self, timeout: float = 10) -> VLCClient:
+        if self.process is not None or self.client is not None:
+            await self.stop()
         if not Path(self.executable).is_file():
             raise VLCError("VLC executable not found; install VLC 3 or configure its path")
         await self._validate_version()
@@ -171,7 +179,7 @@ class VLCProcess:
         if self.client:
             try:
                 await self.client.command("pl_stop")
-            except VLCError:
+            except (VLCError, OSError, RuntimeError):
                 pass
             await self.client.close()
             self.client = None

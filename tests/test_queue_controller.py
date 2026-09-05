@@ -8,6 +8,7 @@ from vlcq.controller import PlaybackController
 from vlcq.database import Database
 from vlcq.models import VLCStatus
 from vlcq.queue import QueueService
+from vlcq.vlc import VLCError
 
 
 class FakeClient:
@@ -87,6 +88,33 @@ async def test_manual_transitions_reset_near_end_completion_evidence(tmp_path: P
     controller._near_end_seen = True
     await controller.previous()
     assert not controller._near_end_seen
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_poll_failure_retires_stale_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db, queue, _videos = setup_queue(tmp_path)
+    process = FakeProcess()
+    controller = PlaybackController(queue, process=process)  # type: ignore[arg-type]
+
+    class FailedClient(FakeClient):
+        async def status(self) -> VLCStatus:
+            raise VLCError("connection dropped")
+
+    client = FailedClient()
+    controller.client = client  # type: ignore[assignment]
+    controller._running = True
+
+    async def stop_after_failure(_delay: float) -> None:
+        controller._running = False
+
+    monkeypatch.setattr("vlcq.controller.asyncio.sleep", stop_after_failure)
+    await controller._poll()
+
+    assert controller.client is None
+    assert controller.status.state == "unavailable"
     db.close()
 
 

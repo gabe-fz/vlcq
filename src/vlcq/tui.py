@@ -24,7 +24,7 @@ from textual.widgets import (
 
 from .controller import PlaybackController
 from .database import Database
-from .models import BrowserEntry
+from .models import BrowserEntry, QueueEntry
 from .paths import PathError, canonical_root, list_folder, natural_key
 from .queue import QueueService
 from .vlc import VLCError
@@ -39,6 +39,12 @@ _QUEUE_STATE_LABELS: dict[str, str] = {
     "missing": "! MISSING",
     "failed": "× FAILED",
 }
+
+
+class QueueListItem(ListItem):
+    """A queue row carrying its database identity independently of its label."""
+
+    entry_id: int
 
 
 class RootPrompt(ModalScreen[str | None]):
@@ -240,7 +246,9 @@ class VLCQApp(App[None]):
         self.set_interval(1, self.refresh_playback)
 
     async def on_unmount(self) -> None:
-        if not self.no_vlc and self.controller.client is not None:
+        # Poll failures retire the client reference, but the VLC process may
+        # still be alive and must be stopped when the app exits.
+        if not self.no_vlc:
             await self.controller.stop()
 
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
@@ -359,6 +367,28 @@ class VLCQApp(App[None]):
             browser.index = 0
         self._refresh_controls()
 
+    @staticmethod
+    def _queue_state_class(state: str) -> str:
+        return {
+            "queued": "queue-queued",
+            "playing": "queue-playing",
+            "paused": "queue-paused",
+            "stopped": "queue-stopped",
+            "skipped": "queue-skipped",
+            "completed": "queue-completed",
+            "missing": "queue-missing",
+            "failed": "queue-failed",
+        }.get(state, "queue-failed")
+
+    def _update_queue_row(
+        self, row: QueueListItem, entry: QueueEntry, current_id: int | None
+    ) -> None:
+        is_current = current_id == entry.id
+        state_label = _QUEUE_STATE_LABELS.get(entry.state, f"? {entry.state.upper()}")
+        marker = "◆" if is_current else " "
+        row.query_one(Label).update(f"{marker} {entry.path.name} — {state_label}")
+        row.set_classes(self._queue_state_class(entry.state))
+
     def refresh_queue(
         self, selected_path: Path | None = None, *, selection_captured: bool = False
     ) -> None:
@@ -374,32 +404,36 @@ class VLCQApp(App[None]):
                 if selected_index is not None and 0 <= selected_index < len(old_entries)
                 else None
             )
-        view.clear()
         entries = self.queue.entries()
         current = self.queue.current()
+        current_id = current.id if current is not None else None
         empty = self.query_one("#queue-empty", Static)
         empty.display = not bool(entries)
-        if entries:
+
+        # Polling changes row state frequently, but do not replace widgets when
+        # queue identity and order are unchanged. Replacing only for a
+        # structural change keeps highlight and scroll state stable while the
+        # status label and CSS class update in place.
+        rows = list(view.children)
+        reuse_rows = len(rows) == len(entries) and all(
+            isinstance(row, QueueListItem) and row.entry_id == entry.id
+            for row, entry in zip(rows, entries)
+        )
+        if reuse_rows:
+            for row, entry in zip(rows, entries, strict=True):
+                assert isinstance(row, QueueListItem)
+                self._update_queue_row(row, entry, current_id)
+        else:
+            view.clear()
             for entry in entries:
-                is_current = current is not None and current.id == entry.id
                 state_label = _QUEUE_STATE_LABELS.get(entry.state, f"? {entry.state.upper()}")
-                marker = "◆" if is_current else " "
-                state_class = {
-                    "queued": "queue-queued",
-                    "playing": "queue-playing",
-                    "paused": "queue-paused",
-                    "stopped": "queue-stopped",
-                    "skipped": "queue-skipped",
-                    "completed": "queue-completed",
-                    "missing": "queue-missing",
-                    "failed": "queue-failed",
-                }.get(entry.state, "queue-failed")
-                view.append(
-                    ListItem(
-                        Label(f"{marker} {entry.path.name} — {state_label}"),
-                        classes=state_class,
-                    )
+                marker = "◆" if current_id == entry.id else " "
+                row = QueueListItem(
+                    Label(f"{marker} {entry.path.name} — {state_label}"),
+                    classes=self._queue_state_class(entry.state),
                 )
+                row.entry_id = entry.id
+                view.append(row)
         if selected_path is not None:
             restored_index = next(
                 (index for index, entry in enumerate(entries) if entry.path == selected_path),
@@ -472,6 +506,21 @@ class VLCQApp(App[None]):
         entries = self.queue.entries()
         return entries[index].path
 
+    def _require_vlc_for_play(self) -> bool:
+        if not self.no_vlc and self.controller.client is None:
+            self.update_status("VLC unavailable — press r to retry")
+            return False
+        return True
+
+    async def _play_queue_index(self, index: int) -> bool:
+        if self.no_vlc:
+            self.queue.play_now(index)
+        else:
+            if not self._require_vlc_for_play():
+                return False
+            await self.controller.play_index(index)
+        return True
+
     async def action_activate(self) -> None:
         if isinstance(self.screen, RootPrompt):
             # The app-level priority binding runs before Input.Submitted. Handle
@@ -494,14 +543,12 @@ class VLCQApp(App[None]):
                 self.update_status("Nothing is highlighted in the queue")
                 return
             try:
-                if self.no_vlc:
-                    self.queue.play_now(index)
-                else:
-                    await self.controller.play_index(index)
+                played = await self._play_queue_index(index)
             except (IndexError, VLCError, OSError) as exc:
                 self.update_status(f"Play failed: {exc}")
             else:
-                self.update_status("Playing highlighted queue item")
+                if played:
+                    self.update_status("Playing highlighted queue item")
             self.refresh_queue()
             return
         entry = self._browser_entry()
@@ -513,19 +560,21 @@ class VLCQApp(App[None]):
             await self.refresh_browser()
             self.update_status("Browsing")
             return
+        if not self._require_vlc_for_play():
+            return
         try:
             self.queue.add([entry.path])
             index = self._queue_path_index(entry.path)
             if index is None:
                 raise RuntimeError("video was not added to the queue")
-            if self.no_vlc:
-                self.queue.play_now(index)
-            else:
-                await self.controller.play_index(index)
+            played = await self._play_queue_index(index)
         except (IndexError, OSError, PathError, RuntimeError, VLCError) as exc:
             self.update_status(f"Play failed: {exc}")
         else:
-            # Enter is a one-item play action.  If that item was selected for
+            if not played:
+                self.refresh_queue()
+                return
+            # Enter is a one-item play action. If that item was selected for
             # a batch earlier, consume only that selection while preserving
             # any other explicit selections for a later Add action.
             self.selected_paths.discard(entry.path)
@@ -580,18 +629,20 @@ class VLCQApp(App[None]):
         if not paths:
             self.update_status("Nothing to play — highlight a playable video or press v to select")
             return
+        if not self._require_vlc_for_play():
+            return
         target = paths[0]
         try:
             self.queue.add(paths)
             index = self._queue_path_index(target)
             if index is None:
                 raise RuntimeError("video was not added to the queue")
-            if self.no_vlc:
-                self.queue.play_now(index)
-            else:
-                await self.controller.play_index(index)
+            played = await self._play_queue_index(index)
         except (IndexError, OSError, PathError, RuntimeError, VLCError) as exc:
             self.update_status(f"Add and play failed: {exc}")
+            self.refresh_queue()
+            return
+        if not played:
             self.refresh_queue()
             return
         self.selected_paths.clear()
@@ -832,14 +883,12 @@ class VLCQApp(App[None]):
                 self.update_status("Nothing is highlighted in the queue")
                 return
             try:
-                if self.no_vlc:
-                    self.queue.play_now(index)
-                else:
-                    await self.controller.play_index(index)
+                played = await self._play_queue_index(index)
             except (IndexError, OSError, VLCError) as exc:
                 self.update_status(f"Play failed: {exc}")
             else:
-                self.update_status("Playing highlighted queue item")
+                if played:
+                    self.update_status("Playing highlighted queue item")
             self.refresh_queue()
         elif button_id == "queue-sort":
             selected_path = self._queue_selected_path()
