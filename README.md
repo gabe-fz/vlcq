@@ -43,21 +43,26 @@ vlcq progress --root ~/Videos --json
 | `Enter` | Enter folder or play video now |
 | Left / `Backspace` | Parent folder; Left seeks backward outside the browser |
 | `v` | Toggle video selection |
-| `a` / `A` | Add selection / add and play |
+| `a` / `A` | Add / add and play the highlighted video, or use the explicit `v` selection |
 | `Space` | Pause/resume |
 | `n` / `p` | Next/previous |
-| Left / `[` / `]` | Seek backward / backward / forward 10 seconds |
+| Left / `[` / `]` | Seek backward / forward 10 seconds |
 | `d` | Remove queue entry (never the media file) |
 | `J` / `K` | Move queue entry down/up |
 | `r` | Retry selected queue entry |
 | `c` | Clear completed entries |
-| `q` | Stop the owned VLC process and quit |
+| `q` | Quit after choosing whether to stop or keep the owned VLC process |
 
-The browser toolbar provides **Open**, **Up**, **Select**, and **Sort**. The queue
-toolbar provides **Add**, **Play**, **Sort**, and **Clear**; Clear confirms before
-removing queue entries and never deletes media. Focused panes receive a distinct
-highlight, while folders, playable videos, selections, and queue states use
-separate colors. Hidden dotfiles and unsupported file types are not shown.
+The browser toolbar provides **Open**, **Up**, **Select**, **Add & play**, and
+**Sort**. The queue toolbar provides **Add**, **Play**, **Sort**, and **Clear**;
+Add and add-and-play use the highlighted playable browser item when there is no
+`v` selection. An explicit multi-selection takes precedence and is naturally
+ordered. Clear confirms before removing queue entries and never deletes media.
+Empty panes show
+the next useful action, focused panes receive a distinct highlight, and every
+queue row displays state indicators (`▶ PLAYING`, `Ⅱ PAUSED`, `✓ COMPLETED`,
+`! MISSING`, and `× FAILED`). Hidden dotfiles and unsupported file
+types are not shown.
 
 ## Finder / right-click handoff
 

@@ -54,7 +54,10 @@ class QueueService:
         start = -1
         if current:
             start = next(i for i, item in enumerate(entries) if item.id == current.id)
-            self.database.set_state(current.id, "completed" if completed else "skipped")
+            # Missing/failed entries are already terminal; retain that useful
+            # diagnosis while advancing rather than relabeling it as skipped.
+            if current.state not in {"missing", "failed", "completed", "skipped"}:
+                self.database.set_state(current.id, "completed" if completed else "skipped")
         for entry in entries[start + 1 :]:
             if entry.path.is_file():
                 self.database.set_current(entry.id)
@@ -88,8 +91,11 @@ class QueueService:
         self.database.remove(entry.id)
 
     def clear_completed(self) -> None:
+        current_id = self.database.get_current_id()
         for entry in self.entries():
             if entry.state == "completed":
+                if entry.id == current_id:
+                    self.database.set_current(None)
                 self.database.remove(entry.id)
 
     def clear_all(self) -> None:

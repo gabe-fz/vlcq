@@ -43,12 +43,21 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
-def _resolve_paths(values: list[Path]) -> tuple[Path, list[Path]]:
+def _resolve_paths(
+    values: list[Path], existing_root: Path | None = None
+) -> tuple[Path, list[Path]]:
+    """Resolve command operands without allowing files to escape an open root.
+
+    A directory operand is an intentional root change. Explicit files are
+    different: once a library root exists they must be validated beneath that
+    root, rather than allowing their nearest common parent to silently replace
+    the active queue.
+    """
     if len(values) == 1 and values[0].is_dir():
         return canonical_root(values[0]), []
     if any(value.is_dir() for value in values):
         raise PathError("open a folder separately from explicit video files")
-    root = common_root(values)
+    root = canonical_root(existing_root) if existing_root is not None else common_root(values)
     return root, [validate_video(value, root) for value in values]
 
 
@@ -94,10 +103,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             try:
                 root: Path
                 selected: list[Path]
+                saved_root = database.get_root()
+                active_saved_root = (
+                    saved_root.resolve() if saved_root is not None and saved_root.is_dir() else None
+                )
                 if args.command is None:
-                    saved_root = database.get_root()
-                    if saved_root is not None and saved_root.is_dir():
-                        root = saved_root.resolve()
+                    if active_saved_root is not None:
+                        root = active_saved_root
                     else:
                         chosen_root = _choose_root()
                         if chosen_root is None:
@@ -112,8 +124,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                     selected = []
                 elif args.command == "finder-handoff":
                     root, selected = resolve_handoff(args.paths)
+                    # Finder folders intentionally change the root, but an
+                    # explicit file selection must stay inside an existing
+                    # library.  Validate before queue.open so a rejected
+                    # selection cannot replace the active root.
+                    if selected and active_saved_root is not None:
+                        root = active_saved_root
+                        selected = [validate_video(path, root) for path in selected]
                 else:
-                    root, selected = _resolve_paths(args.paths)
+                    root, selected = _resolve_paths(args.paths, active_saved_root)
                 queue = QueueService(database)
                 queue.open(root)
                 if selected:

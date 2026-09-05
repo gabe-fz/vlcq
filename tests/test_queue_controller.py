@@ -53,6 +53,59 @@ def setup_queue(tmp_path: Path) -> tuple[Database, QueueService, list[Path]]:
 
 
 @pytest.mark.asyncio
+async def test_controller_state_observation_updates_visible_queue_state(tmp_path: Path) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    process = FakeProcess()
+    controller = PlaybackController(queue, process=process)  # type: ignore[arg-type]
+    controller.client = process.client
+    await controller.play_index(0)
+    assert queue.entries()[0].state == "playing"
+    await controller.toggle_pause()
+    assert queue.entries()[0].state == "paused"
+    await controller._observe(VLCStatus("playing", path=videos[0].resolve()))
+    assert queue.entries()[0].state == "playing"
+    await controller._observe(VLCStatus("stopped", path=videos[0].resolve()))
+    assert queue.entries()[0].state == "stopped"
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_transitions_reset_near_end_completion_evidence(tmp_path: Path) -> None:
+    db, queue, _videos = setup_queue(tmp_path)
+    process = FakeProcess()
+    controller = PlaybackController(queue, process=process)  # type: ignore[arg-type]
+    controller.client = process.client
+
+    controller._near_end_seen = True
+    await controller.seek(-10)
+    assert not controller._near_end_seen
+
+    controller._near_end_seen = True
+    await controller.next()
+    assert not controller._near_end_seen
+
+    controller._near_end_seen = True
+    await controller.previous()
+    assert not controller._near_end_seen
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_controller_keeps_missing_media_visible_during_stale_poll(tmp_path: Path) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    process = FakeProcess()
+    controller = PlaybackController(queue, process=process)  # type: ignore[arg-type]
+    controller.client = process.client
+    queue.play_now(0)
+    videos[0].unlink()
+
+    await controller._observe(VLCStatus("playing", path=videos[0]))
+
+    assert queue.entries()[0].state == "missing"
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_controller_controls_and_conservative_completion(tmp_path: Path) -> None:
     db, queue, videos = setup_queue(tmp_path)
     process = FakeProcess()
@@ -68,6 +121,27 @@ async def test_controller_controls_and_conservative_completion(tmp_path: Path) -
     assert queue.entries()[0].state == "completed"
     assert queue.current() is not None and queue.current().path == videos[1].resolve()
     assert db.progress_for(videos[0])["completion_observed"] == 1
+    db.close()
+
+
+def test_missing_entry_keeps_its_terminal_state_when_advancing(tmp_path: Path) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    queue.play_now(0)
+    videos[0].unlink()
+    assert queue.next() is not None
+    assert queue.entries()[0].state == "missing"
+    db.close()
+
+
+def test_clear_completed_current_entry_clears_current_pointer(tmp_path: Path) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    current = queue.play_now(0)
+    db.set_state(current.id, "completed")
+
+    queue.clear_completed()
+
+    assert db.get_current_id() is None
+    assert queue.entries()[0].path == videos[1].resolve()
     db.close()
 
 

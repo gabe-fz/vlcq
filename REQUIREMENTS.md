@@ -136,7 +136,9 @@ Display:
   unsupported file types are filtered out of the browser; invalid explicit
   operands still receive clear errors.
 - Distinct colors for folders, videos, selected items, playback states, and the
-  currently focused browser or queue pane.
+  currently focused browser or queue pane. Empty browser and queue panes explain
+  the next useful action, and each queue row includes a textual state indicator
+  for queued, playing, paused, stopped, skipped, completed, failed, or missing.
 - Current filename (not the full absolute path by default).
 - Playing, paused, stopped, or unavailable state.
 - Elapsed time, duration, and percentage when available.
@@ -159,8 +161,8 @@ user explicitly requests it.
 | Left / `Backspace` | Return to the parent folder while browsing; at the library root, remain at the root. Left seeks backward outside the browser |
 | `Enter` | Open a highlighted subfolder, or play a highlighted video now |
 | `v` | Toggle the highlighted supported video in the selection |
-| `a` | Add selected video(s) to the queue |
-| `A` | Add selected video(s) and play the first in natural order |
+| `a` | Add the highlighted playable video, or explicit `v` selection(s), to the queue |
+| `A` | Add and play the highlighted playable video, or the first explicit selection in natural order |
 | `Space` | Play/pause |
 | `d` / `Delete` | Remove highlighted item from the queue only |
 | `J` / `K` | Move highlighted item down/up |
@@ -174,8 +176,8 @@ user explicitly requests it.
 
 Destructive-looking actions affect queue state only. They must never delete the
 underlying media file. Each pane also exposes visible buttons for its primary
-actions: open/up/select/sort for the browser and add/play/sort/clear for the
-queue. Clearing the full queue requires confirmation.
+actions: open/up/select/add-and-play/sort for the browser and add/play/sort/clear
+for the queue. Clearing the full queue requires confirmation.
 
 ### 6.3 Responsiveness
 
