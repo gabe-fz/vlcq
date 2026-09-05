@@ -58,6 +58,9 @@ The browser toolbar provides **Open**, **Up**, **Select**, **Add & play**, and
 Add and add-and-play use the highlighted playable browser item when there is no
 `v` selection. An explicit multi-selection takes precedence and is naturally
 ordered. Clear confirms before removing queue entries and never deletes media.
+When either list overflows, use its vertical scrollbar or mouse wheel to reach
+all rows, and drag the horizontal scrollbar at the bottom to reveal long names.
+Left and Right remain app shortcuts for navigation and seeking.
 Empty panes show
 the next useful action, focused panes receive a distinct highlight, and every
 queue row displays state indicators (`▶ PLAYING`, `Ⅱ PAUSED`, `✓ COMPLETED`,

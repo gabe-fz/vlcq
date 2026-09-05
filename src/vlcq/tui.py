@@ -125,7 +125,15 @@ class VLCQApp(App[None]):
     .pane-title { height: 1; text-style: bold; content-align: center middle; }
     .toolbar { height: 3; align-horizontal: center; }
     .toolbar Button { min-width: 8; width: 1fr; margin: 0 1; }
-    #browser, #queue { height: 1fr; }
+    #browser, #queue {
+        height: 1fr;
+        overflow-x: auto;
+        overflow-y: auto;
+    }
+    #browser > ListItem, #queue > ListItem {
+        width: auto;
+        min-width: 100%;
+    }
     .folder-entry { color: $primary-lighten-2; text-style: bold; }
     .video-entry { color: $success-lighten-1; }
     .selected-video { color: $warning; text-style: bold; }
@@ -155,8 +163,8 @@ class VLCQApp(App[None]):
         Binding("K", "move_up", "Move up"),
         Binding("n", "next", "Next"),
         Binding("p", "previous", "Previous"),
-        Binding("left", "left", "Up/back"),
-        Binding("right", "right", "Open/forward"),
+        Binding("left", "left", "Up/back", priority=True),
+        Binding("right", "right", "Open/forward", priority=True),
         Binding("[", "seek(-10)", "Back 10s", show=False),
         Binding("]", "seek(10)", "Forward 10s", show=False),
         Binding("r", "retry", "Retry"),

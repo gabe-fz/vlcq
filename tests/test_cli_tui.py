@@ -220,6 +220,42 @@ async def test_tui_browse_select_add_and_parent_without_auto_enqueue(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_tui_lists_scroll_to_show_long_names_and_all_rows(tmp_path: Path) -> None:
+    root = tmp_path / "show"
+    root.mkdir()
+    long_name = f"{'long-episode-name-' * 6}.mkv"
+    paths = [root / long_name, *(root / f"episode-{index:02}.mkv" for index in range(40))]
+    for path in paths:
+        path.write_bytes(b"video")
+    db = Database(tmp_path / "db.sqlite3")
+    app = VLCQApp(root=root, database=db, no_vlc=True)
+    app.queue.add(paths)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        for selector in ("#browser", "#queue"):
+            view = app.query_one(selector, ListView)
+            assert view.styles.overflow_x == "auto"
+            assert view.styles.overflow_y == "auto"
+            assert view.show_horizontal_scrollbar
+            assert view.show_vertical_scrollbar
+            assert view.max_scroll_x > 0
+            assert view.max_scroll_y > 0
+            view.scroll_to(x=view.max_scroll_x, animate=False)
+            await pilot.pause()
+            assert view.scroll_x == view.max_scroll_x
+
+        browser = app.query_one("#browser", ListView)
+        rendered_names = [str(row.query_one(Label).renderable) for row in browser.children]
+        assert f"[ ] {long_name}" in rendered_names
+
+        left = next(binding for binding in app.BINDINGS if binding.key == "left")
+        right = next(binding for binding in app.BINDINGS if binding.key == "right")
+        assert left.priority and right.priority
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_tui_root_prompt_and_reorder_keep_keyboard_workflow(tmp_path: Path) -> None:
     first_root = tmp_path / "first"
     second_root = tmp_path / "second"
