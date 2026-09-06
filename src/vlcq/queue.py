@@ -1,20 +1,37 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from .database import Database
 from .models import QueueEntry
-from .paths import deduplicate_natural, natural_key, validate_video
+from .paths import deduplicate_natural, is_beneath, natural_key, validate_video
+
+
+class ActivePlaybackError(RuntimeError):
+    """Raised when queue mutation would abandon owned active playback."""
+
+
+@dataclass
+class QueueUndoSnapshot:
+    rows: list[dict[str, int | str]]
+    ordered_ids: list[int]
+    fingerprints: dict[int, tuple[int, int, int, int]]
 
 
 class QueueService:
     def __init__(self, database: Database) -> None:
         self.database = database
         self.root = database.get_root()
+        self._undo: QueueUndoSnapshot | None = None
+
+    def _invalidate_undo(self) -> None:
+        self._undo = None
 
     def open(self, root: str | Path) -> Path:
         self.root = self.database.set_root(root)
+        self._invalidate_undo()
         return self.root
 
     def entries(self) -> list[QueueEntry]:
@@ -26,12 +43,24 @@ class QueueService:
                 changed = True
         return self.database.queue_entries() if changed else entries
 
-    def add(self, paths: Sequence[str | Path]) -> list[QueueEntry]:
+    def _validated(self, paths: Sequence[str | Path]) -> list[Path]:
         if self.root is None:
             raise ValueError("open a library root first")
         valid = [validate_video(path, self.root) for path in paths]
-        for path in deduplicate_natural(valid):
-            self.database.add_entry(path)
+        return deduplicate_natural(valid)
+
+    def add(self, paths: Sequence[str | Path]) -> list[QueueEntry]:
+        valid = self._validated(paths)
+        self.database.append_entries(valid)
+        self._invalidate_undo()
+        return self.entries()
+
+    add_to_end = add
+
+    def play_next(self, paths: Sequence[str | Path]) -> list[QueueEntry]:
+        valid = self._validated(paths)
+        self.database.play_next_entries(valid)
+        self._invalidate_undo()
         return self.entries()
 
     def current(self) -> QueueEntry | None:
@@ -46,9 +75,11 @@ class QueueService:
             self.database.set_state(current.id, "queued")
         self.database.set_current(entry.id)
         self.database.set_state(entry.id, "playing")
+        self._invalidate_undo()
         return next(item for item in self.entries() if item.id == entry.id)
 
     def next(self, completed: bool = False) -> QueueEntry | None:
+        self._invalidate_undo()
         entries = self.entries()
         current = self.current()
         start = -1
@@ -68,6 +99,7 @@ class QueueService:
         return None
 
     def previous(self) -> QueueEntry | None:
+        self._invalidate_undo()
         entries = self.entries()
         current = self.current()
         if not entries:
@@ -79,33 +111,130 @@ class QueueService:
 
     def move(self, index: int, delta: int) -> None:
         entries = self.entries()
+        if not 0 <= index < len(entries):
+            raise IndexError("queue index out of range")
         target = max(0, min(len(entries) - 1, index + delta))
         item = entries.pop(index)
         entries.insert(target, item)
         self.database.reorder([entry.id for entry in entries])
+        self._invalidate_undo()
 
-    def remove(self, index: int) -> None:
-        entry = self.entries()[index]
-        if self.database.get_current_id() == entry.id:
-            self.database.set_current(None)
-        self.database.remove(entry.id)
+    def _snapshot(self, selected: list[QueueEntry]) -> QueueUndoSnapshot:
+        all_entries = self.entries()
+        selected_ids = {entry.id for entry in selected}
+        selected = [entry for entry in all_entries if entry.id in selected_ids]
+        rows: list[dict[str, int | str]] = []
+        fingerprints: dict[int, tuple[int, int, int, int]] = {}
+        for entry in selected:
+            rows.append(
+                {
+                    "id": entry.id,
+                    "queue_id": self.database.active_queue_id(),
+                    "position": entry.position,
+                    "media_id": entry.media_id,
+                    "state": entry.state,
+                }
+            )
+            fingerprints[entry.id] = self.database.media_fingerprint(entry.media_id)
+        return QueueUndoSnapshot(
+            rows=rows,
+            ordered_ids=[entry.id for entry in all_entries],
+            fingerprints=fingerprints,
+        )
 
-    def clear_completed(self) -> None:
-        current_id = self.database.get_current_id()
-        for entry in self.entries():
-            if entry.state == "completed":
-                if entry.id == current_id:
-                    self.database.set_current(None)
-                self.database.remove(entry.id)
+    def remove(self, index: int, *, stop_confirmed: bool = False) -> None:
+        entries = self.entries()
+        if not 0 <= index < len(entries):
+            raise IndexError("queue index out of range")
+        entry = entries[index]
+        current = self.current()
+        if (
+            current is not None
+            and current.id == entry.id
+            and current.state in {"playing", "paused"}
+            and not stop_confirmed
+        ):
+            raise ActivePlaybackError("stop VLC playback before removing the active entry")
+        if current is not None and current.id == entry.id and stop_confirmed:
+            self.database.set_state(entry.id, "stopped")
+        self._undo = self._snapshot([entry])
+        self.database.remove_entries([entry.id])
 
-    def clear_all(self) -> None:
-        self.database.set_current(None)
-        for entry in self.entries():
-            self.database.remove(entry.id)
+    def clear_completed(self, *, stop_confirmed: bool = False) -> None:
+        selected = [entry for entry in self.entries() if entry.state == "completed"]
+        if not selected:
+            return
+        current = self.current()
+        if (
+            current is not None
+            and current in selected
+            and current.state in {"playing", "paused"}
+            and not stop_confirmed
+        ):
+            raise ActivePlaybackError("stop VLC playback before clearing the active entry")
+        if current is not None and current in selected and stop_confirmed:
+            self.database.set_state(current.id, "stopped")
+        self._undo = self._snapshot(selected)
+        self.database.remove_entries([entry.id for entry in selected])
+
+    def clear_all(self, *, stop_confirmed: bool = False) -> None:
+        selected = self.entries()
+        if not selected:
+            return
+        current = self.current()
+        if (
+            current is not None
+            and current.state in {"playing", "paused"}
+            and not stop_confirmed
+        ):
+            raise ActivePlaybackError("stop VLC playback before clearing the active entry")
+        if current is not None and current.state in {"playing", "paused"} and stop_confirmed:
+            self.database.set_state(current.id, "stopped")
+        self._undo = self._snapshot(selected)
+        self.database.remove_entries([entry.id for entry in selected])
+
+    def undo(self) -> bool:
+        snapshot = self._undo
+        if snapshot is None:
+            return False
+        try:
+            if self.root is None:
+                raise RuntimeError("open a library root first")
+            for row in snapshot.rows:
+                path_row = self.database.connection.execute(
+                    "SELECT path FROM media WHERE id=?", (int(row["media_id"]),)
+                ).fetchone()
+                if path_row is None:
+                    raise RuntimeError("undo media record is missing")
+                path = Path(path_row[0]).resolve(strict=False)
+                if not is_beneath(path, self.root):
+                    raise ValueError("undo refused a path outside the library root")
+                try:
+                    stat = path.stat()
+                except FileNotFoundError:
+                    # Missing media is restored as a visible missing queue row.
+                    continue
+                fingerprint = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+                if fingerprint != snapshot.fingerprints[int(row["id"])]:
+                    raise ValueError("undo refused a replaced media file")
+            self.database.restore_entries(snapshot.rows, snapshot.ordered_ids)
+        except (OSError, RuntimeError, ValueError):
+            self._undo = None
+            raise
+        self._undo = None
+        return True
+
+    @property
+    def undo_available(self) -> bool:
+        return self._undo is not None
+
+    def invalidate_undo(self) -> None:
+        self._invalidate_undo()
 
     def sort_natural(self) -> None:
         entries = sorted(self.entries(), key=lambda entry: natural_key(entry.path.name))
         self.database.reorder([entry.id for entry in entries])
+        self._invalidate_undo()
 
     def retry(self, index: int) -> QueueEntry:
         entry = self.entries()[index]
@@ -115,6 +244,22 @@ class QueueService:
         return self.play_now(index)
 
     def update_progress(
-        self, path: Path, position_ms: int, duration_ms: int, completed: bool = False
+        self,
+        path: Path,
+        position_ms: int,
+        duration_ms: int,
+        completed: bool = False,
+        *,
+        trustworthy: bool = True,
+        resume_position_ms: int | None = None,
+        allow_resume_reset: bool = False,
     ) -> None:
-        self.database.merge_progress(path.resolve(), position_ms, duration_ms, completed)
+        self.database.merge_progress(
+            path.resolve(),
+            position_ms,
+            duration_ms,
+            completed,
+            trustworthy=trustworthy,
+            resume_position_ms=resume_position_ms,
+            allow_resume_reset=allow_resume_reset,
+        )

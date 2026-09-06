@@ -143,6 +143,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     no_vlc=getattr(args, "no_vlc", False),
                     autoplay=args.command == "play" and bool(selected),
                 )
+                if args.command == "resume":
+                    # Keep the constructor compatible with integrations that
+                    # provide their own app class while still making the
+                    # command's interactive resume policy explicit.
+                    app.resume_command = True
                 app.run()
             finally:
                 database.close()

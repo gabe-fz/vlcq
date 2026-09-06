@@ -3,7 +3,7 @@
 `vlcq` is a folder-first Textual interface for a deterministic, persistent VLC 3
 video queue on macOS. It browses local folders without automatically enqueueing
 their contents, sends VLC one selected item at a time, and records monotonic
-playback progress in SQLite.
+playback history plus a separate trustworthy resume position in SQLite.
 
 ## Install
 
@@ -33,6 +33,30 @@ vlcq resume
 vlcq progress --root ~/Videos --json
 ```
 
+## TUI controls and playback choices
+
+Library rows show **No recorded progress**, **In progress**, or **Completed** independently
+from queue state, plus known furthest progress and queued membership. The percentage in
+`vlcq progress --json` is furthest-position progress, not measured watch-time coverage.
+Missing durations and last-played times are shown as unknown. Replaced files are matched
+by fingerprint and never inherit the old file's history.
+
+Selecting an incomplete item with a trustworthy resume point opens **Resume**, **Start
+over**, or **Cancel**. Legacy version-1 rows use the explicitly labeled **Resume from
+furthest recorded progress** fallback; their last-played time remains unknown. Start over
+preserves the historical maximum and completion evidence. Automatic queue advancement
+uses a trustworthy resume without opening a modal.
+
+The library pane provides mouse buttons for **Add to end**, **Play next**, and **Play now**;
+the queue pane provides queue-targeted play, reorder, removal, undo, and clear controls.
+Rows highlight without starting playback, and video checkboxes select a batch. Search and
+history filters apply only to the current folder while selections remain preserved.
+
+The active-player bar shows elapsed, total, and remaining time, with pause, previous/next,
+relative seek, reconnect, and known-duration click-to-seek controls. Reconnect never
+selects or autoplays a queue item. Essential controls remain available in the compact
+80x24 layout.
+
 ## TUI keys
 
 | Key | Action |
@@ -53,11 +77,18 @@ vlcq progress --root ~/Videos --json
 | `c` | Clear completed entries |
 | `q` | Quit after choosing whether to stop or keep the owned VLC process |
 
-The browser toolbar provides **Open**, **Up**, **Select**, **Add & play**, and
-**Sort**. The queue toolbar provides **Add**, **Play**, **Sort**, and **Clear**;
-Add and add-and-play use the highlighted playable browser item when there is no
-`v` selection. An explicit multi-selection takes precedence and is naturally
-ordered. Clear confirms before removing queue entries and never deletes media.
+The browser toolbar provides **Open**, **Up**, **Select**, **Add to end**, **Play next**,
+**Play now**, search, and history filters. The queue toolbar targets the highlighted queue
+entry. Add-to-end is idempotent; Play next moves existing entries without duplication and
+never restarts the active entry. Add-and-play commits a batch only after its resume choice,
+so Cancel cannot insert or reorder media. Clear confirms before removing queue entries and
+never deletes media.
+
+Removing active playback first requires a confirmed stop and never starts a successor.
+Successful removal or clear offers one in-memory undo. Undo restores order and retained
+history but does not restart playback; another queue mutation, automatic advancement,
+root change, or shutdown expires it. Missing media can be restored as visibly missing,
+while unsafe or replaced paths are rejected.
 When either list overflows, use its vertical scrollbar or mouse wheel to reach
 all rows, and drag the horizontal scrollbar at the bottom to reveal long names.
 Left and Right remain app shortcuts for navigation and seeking.
@@ -92,6 +123,26 @@ VLC is launched as a dedicated process with its normal macOS video interface
 visible and an authenticated HTTP interface bound to `127.0.0.1`. The generated password, Authorization header, raw VLC
 responses, and media history are not logged. `vlcq` performs no non-loopback
 network requests and never deletes, moves, copies, or modifies media files.
+
+## Private backup and rollback
+
+Before testing a new binary against an important queue, make a private SQLite backup with
+the SQLite backup API (including WAL state), for example:
+
+```sh
+.venv/bin/python - <<'PY'
+import sqlite3
+from pathlib import Path
+source = Path.home() / "Library/Application Support/vlcq/vlcq.sqlite3"
+backup = source.with_name("vlcq.sqlite3.before-change")
+with sqlite3.connect(source) as src, sqlite3.connect(backup) as dst:
+    src.backup(dst)
+PY
+```
+
+Schema v2 is preservation-first. Do not decrement `PRAGMA user_version`, delete the new
+resume columns, or downgrade in place. To roll back to a version-1 binary, close vlcq and
+restore the private backup; observations recorded after that backup are intentionally lost.
 
 ## Development and tests
 
