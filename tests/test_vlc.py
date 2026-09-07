@@ -80,7 +80,7 @@ def test_parse_status_is_tolerant_and_rejects_remote_media(tmp_path: Path) -> No
             "state": "playing",
             "time": 12,
             "length": 30,
-            "information": {"category": {"meta": {"url": video.as_uri()}}},
+            "information": {"category": {"meta": {"uri": video.as_uri()}}},
         }
     )
     assert (
@@ -90,8 +90,56 @@ def test_parse_status_is_tolerant_and_rejects_remote_media(tmp_path: Path) -> No
     )
     with pytest.raises(VLCError):
         parse_status(
-            {"state": "playing", "information": {"category": {"meta": {"url": "https://x/a"}}}}
+            {"state": "playing", "information": {"category": {"meta": {"uri": "https://x/a"}}}}
         )
+
+
+@pytest.mark.asyncio
+async def test_client_resolves_current_media_from_playlist(tmp_path: Path) -> None:
+    video = tmp_path / "episode [01].mkv"
+    video.write_bytes(b"x")
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("status.json"):
+            return httpx.Response(
+                200,
+                json={"state": "playing", "time": 2, "length": 10, "currentplid": 42},
+                headers={"content-type": "application/json"},
+            )
+        if request.url.path.endswith("playlist.json"):
+            return httpx.Response(
+                200,
+                json={
+                    "children": [
+                        {
+                            "name": "Playlist",
+                            "children": [
+                                {"id": "42", "type": "leaf", "uri": video.as_uri()}
+                            ],
+                        }
+                    ]
+                },
+                headers={"content-type": "application/json"},
+            )
+        return httpx.Response(404)
+
+    client = VLCClient(9999, "secret", transport=httpx.MockTransport(handler))
+    status = await client.play(video)
+    assert status.path == video.resolve()
+    assert requests[0].url.params["command"] == "in_play"
+    assert requests[0].url.params["input"] == video.as_uri()
+    assert [request.url.path for request in requests] == [
+        "/requests/status.json",
+        "/requests/playlist.json",
+    ]
+
+    # The stable playlist id is cached, so normal polling does not double the
+    # number of HTTP requests once the media identity has been established.
+    assert (await client.status()).path == video.resolve()
+    assert [request.url.path for request in requests].count("/requests/playlist.json") == 1
+    await client.close()
 
 
 @pytest.mark.asyncio

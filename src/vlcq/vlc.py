@@ -7,6 +7,7 @@ import secrets
 import shutil
 import socket
 from pathlib import Path
+from typing import cast
 
 import httpx
 
@@ -40,7 +41,11 @@ def parse_status(payload: object) -> VLCStatus:
         if isinstance(category, dict):
             meta = category.get("meta")
             if isinstance(meta, dict):
-                uri = meta.get("url") or meta.get("uri")
+                # ``url`` is ordinary media metadata (for example, a web
+                # page embedded in a file), not the input's MRL.  Some VLC
+                # builds expose an actual URI here, but current media identity
+                # normally comes from currentplid + playlist.json.
+                uri = meta.get("uri")
     path = None
     if uri:
         try:
@@ -50,6 +55,38 @@ def parse_status(payload: object) -> VLCStatus:
     return VLCStatus(
         state, _number(payload.get("time")) * 1000, _number(payload.get("length")) * 1000, path
     )
+
+
+def _current_playlist_id(payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("currentplid")
+    if not isinstance(value, (str, int)) or isinstance(value, bool):
+        return None
+    playlist_id = str(value)
+    return None if playlist_id == "-1" else playlist_id
+
+
+def _playlist_item_path(payload: object, playlist_id: str) -> Path | None:
+    """Find a current item's MRL in VLC's nested playlist response."""
+    pending = [payload]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, list):
+            pending.extend(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("id")) == playlist_id:
+            uri = item.get("uri")
+            if not isinstance(uri, str) or not uri:
+                return None
+            try:
+                return file_uri_to_path(uri)
+            except PathError as exc:
+                raise VLCError("VLC reported unsafe media") from exc
+        pending.extend(cast(object, value) for value in item.values())
+    return None
 
 
 class VLCClient:
@@ -64,15 +101,36 @@ class VLCClient:
             timeout=2,
             transport=transport,
         )
+        self._playlist_paths: dict[str, Path] = {}
+
+    @staticmethod
+    def _response_payload(response: httpx.Response) -> object:
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", "").split(";", 1)[0].strip()
+        if content_type not in {"application/json", "text/json", "text/plain"}:
+            raise VLCError("VLC returned unexpected content")
+        return response.json()
+
+    async def _status_from_payload(self, payload: object) -> VLCStatus:
+        status = parse_status(payload)
+        playlist_id = _current_playlist_id(payload)
+        if status.path is not None or playlist_id is None:
+            return status
+        path = self._playlist_paths.get(playlist_id)
+        if path is None:
+            response = await self._client.get("/requests/playlist.json")
+            playlist = self._response_payload(response)
+            path = _playlist_item_path(playlist, playlist_id)
+            if path is not None:
+                self._playlist_paths[playlist_id] = path
+        if path is None:
+            return status
+        return VLCStatus(status.state, status.position_ms, status.duration_ms, path)
 
     async def status(self) -> VLCStatus:
         try:
             response = await self._client.get("/requests/status.json")
-            response.raise_for_status()
-            content_type = response.headers.get("content-type", "").split(";", 1)[0].strip()
-            if content_type not in {"application/json", "text/json", "text/plain"}:
-                raise VLCError("VLC returned unexpected content")
-            return parse_status(response.json())
+            return await self._status_from_payload(self._response_payload(response))
         except (httpx.HTTPError, json.JSONDecodeError) as exc:
             raise VLCError("VLC is unavailable") from exc
 
@@ -83,12 +141,8 @@ class VLCClient:
         params: dict[str, str | int] = {"command": command, **parameters}
         try:
             response = await self._client.get("/requests/status.json", params=params)
-            response.raise_for_status()
-            content_type = response.headers.get("content-type", "").split(";", 1)[0].strip()
-            if content_type not in {"application/json", "text/json", "text/plain"}:
-                raise VLCError("VLC returned unexpected content")
-            return parse_status(response.json())
-        except httpx.HTTPError as exc:
+            return await self._status_from_payload(self._response_payload(response))
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
             raise VLCError("VLC command failed") from exc
 
     async def play(self, path: Path) -> VLCStatus:
