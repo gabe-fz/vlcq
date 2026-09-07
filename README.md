@@ -35,29 +35,35 @@ vlcq progress --root ~/Videos --json
 
 ## TUI controls and playback choices
 
-Library rows show **No recorded progress**, **In progress**, or **Completed** independently
-from queue state, plus known furthest progress and queued membership. The percentage in
-`vlcq progress --json` is furthest-position progress, not measured watch-time coverage.
-Missing durations and last-played times are shown as unknown. Replaced files are matched
-by fingerprint and never inherit the old file's history.
+The main screen is a stacked **Files** section above a **Queue** section. Both start
+expanded and share the available list space; click `▾`/`▸` to collapse or restore either
+section. Each header remains visible and its `…` menu provides the section’s actions.
+Right-clicking a row opens the same contextual actions, and `Shift+F10` is the keyboard
+fallback. Menus remain inside the terminal and scroll when needed.
+
+Rows are one line: filenames are rendered literally, including bracketed release tags.
+Checkboxes select library videos, queued membership is shown inline, and positive history
+is shown as **In progress** or **Completed** with furthest progress. Unplayed rows omit a
+history badge. Click a video or queue row to highlight it without starting playback; click
+a folder to open it. Full paths, resume/furthest positions, durations, fingerprints, and
+missing history are available through **Details**.
+
+Search and **All / In progress / Not completed** filters open from the Files menu. The
+Files header keeps the active search/filter and selected/hidden counts visible. Selections
+remain explicit across filtering and subfolder navigation; batch menu labels include their
+counts. **Play now** always targets the highlighted item, while **Add to end**, **Play next**,
+and **Add & play** explicitly use the selected batch when one exists.
 
 Selecting an incomplete item with a trustworthy resume point opens **Resume**, **Start
-over**, or **Cancel**. Legacy version-1 rows use the explicitly labeled **Resume from
-furthest recorded progress** fallback; their last-played time remains unknown. Start over
-preserves the historical maximum and completion evidence. Automatic queue advancement
-uses a trustworthy resume without opening a modal.
+over**, or **Cancel**. Legacy rows use **Resume from furthest recorded progress**; their
+last-played time remains unknown. Start over preserves maximum history and completion.
+Automatic advancement uses a trustworthy resume without opening a modal.
 
-The library pane provides mouse buttons for **Add to end**, **Play next**, and **Play now**;
-the queue pane provides highlighted-entry **Play next**, **Play now**, reorder, removal, undo,
-and clear controls. The selected-item details bar provides direct **Resume** and **Start
-over** actions without opening a dialog.
-Rows highlight without starting playback, and video checkboxes select a batch. Search and
-history filters apply only to the current folder while selections remain preserved.
-
-The active-player bar shows elapsed, total, and remaining time, with pause, previous/next,
-relative seek, reconnect, and known-duration click-to-seek controls. Reconnect never
-selects or autoplays a queue item. Essential controls remain available in the compact
-80x24 layout.
+The bottom area is limited to a player summary, a one-line progress track/percentage, and
+a bounded notice. The player menu contains pause/resume, previous/next, relative seek,
+reconnect, active-player details, full notice access, Help, and Quit. Reconnect never
+selects or autoplays a queue item. Absolute seek is available only for connected matching
+media with a known positive duration.
 
 ## TUI keys
 
@@ -77,28 +83,21 @@ selects or autoplays a queue item. Essential controls remain available in the co
 | `J` / `K` | Move queue entry down/up |
 | `r` | Retry selected queue entry |
 | `c` | Clear completed entries |
+| `Shift+F10` | Open contextual actions for the focused section |
+| `?` | Help |
 | `q` | Quit after choosing whether to stop or keep the owned VLC process |
 
-The browser toolbar provides **Open**, **Up**, **Select**, **Add to end**, **Play next**,
-**Play now**, search, and history filters. The queue toolbar targets the highlighted queue
-entry. Add-to-end is idempotent; Play next moves existing entries without duplication and
-never restarts the active entry. Add-and-play commits a batch only after its resume choice,
-so Cancel cannot insert or reorder media. Clear confirms before removing queue entries and
-never deletes media.
+Add-to-end is idempotent; Play next moves existing entries without duplication and never
+restarts the active entry. Add-and-play commits a batch only after its resume choice, so
+Cancel cannot insert or reorder media. Clear confirms before removing queue entries and
+never deletes media. Removing active playback first requires a confirmed stop and never
+starts a successor. Successful removal or clear offers one in-memory undo; another queue
+mutation, automatic advancement, root change, or shutdown expires it. Missing media can
+be restored as visibly missing, while unsafe or replaced paths are rejected.
 
-Removing active playback first requires a confirmed stop and never starts a successor.
-Successful removal or clear offers one in-memory undo. Undo restores order and retained
-history but does not restart playback; another queue mutation, automatic advancement,
-root change, or shutdown expires it. Missing media can be restored as visibly missing,
-while unsafe or replaced paths are rejected.
-When either list overflows, use its vertical scrollbar or mouse wheel to reach
-all rows, and drag the horizontal scrollbar at the bottom to reveal long names.
-Left and Right remain app shortcuts for navigation and seeking.
-Empty panes show
-the next useful action, focused panes receive a distinct highlight, and every
-queue row displays state indicators (`▶ PLAYING`, `Ⅱ PAUSED`, `✓ COMPLETED`,
-`! MISSING`, and `× FAILED`). Hidden dotfiles and unsupported file
-types are not shown.
+Empty sections show one short next-action hint, focused sections receive a distinct
+highlight, and queue rows display state indicators (`▶ PLAYING`, `Ⅱ PAUSED`, `✓ COMPLETED`,
+`! MISSING`, and `× FAILED`). Hidden dotfiles and unsupported file types are not shown.
 
 ## Finder / right-click handoff
 

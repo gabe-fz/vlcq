@@ -1,32 +1,24 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar, Literal
 
+from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
-from textual.widgets import (
-    Button,
-    Footer,
-    Header,
-    Input,
-    Label,
-    ListItem,
-    ListView,
-    ProgressBar,
-    Static,
-)
-from textual.widgets._progress_bar import Bar
+from textual.widget import Widget
+from textual.widgets import Button, Input, Label, ListItem, ListView, ProgressBar, Static
 
 from .controller import PlaybackController, ResumeChoiceRequired, ResumeOffer
 from .database import Database
 from .models import BrowserEntry, HistoryProjection, QueueEntry
-from .paths import PathError, canonical_root, is_beneath, list_folder, natural_key
+from .paths import VIDEO_EXTENSIONS, PathError, canonical_root, is_beneath, list_folder, natural_key
 from .queue import QueueService
 from .vlc import VLCError
 
@@ -56,17 +48,94 @@ def _file_identity(
     return path, (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
 
 
+@dataclass(frozen=True)
+class FileTarget:
+    path: Path
+    root_generation: int
+    selected_paths: tuple[Path, ...] = ()
+
+
+@dataclass(frozen=True)
+class QueueTarget:
+    entry_id: int
+    root_generation: int
+
+
+@dataclass(frozen=True)
+class SectionTarget:
+    section: Literal["files", "queue"]
+    root_generation: int
+
+
+@dataclass(frozen=True)
+class PlayerTarget:
+    path: Path | None
+    root_generation: int
+
+
+type ContextTarget = FileTarget | QueueTarget | SectionTarget | PlayerTarget
+
+
+@dataclass(frozen=True)
+class ContextAction:
+    key: str
+    label: str
+    target: ContextTarget
+    enabled: bool = True
+
+
+class CompactButton(Button):
+    """A one-cell-friendly button without a delay between fast mouse clicks."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.active_effect_duration = 0
+
+
+class BrowserListItem(ListItem):
+    path: Path
+    is_dir: bool
+
+    def __init__(self, entry: BrowserEntry, renderable: Text, selected: bool = False) -> None:
+        self.path = entry.path
+        self.is_dir = entry.is_dir
+        classes = "folder-entry" if entry.is_dir else "video-entry"
+        if selected:
+            classes += " selected-video"
+        if entry.is_dir:
+            super().__init__(Label(renderable, classes="row-label", markup=False), classes=classes)
+        else:
+            marker = "☑" if selected else "☐"
+            super().__init__(
+                Horizontal(
+                    CompactButton(
+                        marker,
+                        classes="browser-check",
+                        tooltip="Deselect video" if selected else "Select video",
+                    ),
+                    Label(renderable, classes="row-label", markup=False),
+                    classes="browser-row",
+                ),
+                classes=classes,
+            )
+
+
 class QueueListItem(ListItem):
     """A queue row carrying its database identity independently of its label."""
 
     entry_id: int
 
+    def __init__(self, entry: QueueEntry, current_id: int | None, renderable: Text) -> None:
+        self.entry_id = entry.id
+        super().__init__(Label(renderable, classes="row-label", markup=False))
+        self.set_classes(VLCQApp._queue_state_class(entry.state))
+
 
 class RootPrompt(ModalScreen[str | None]):
-    BINDINGS: ClassVar = [("escape", "cancel", "Cancel")]
+    BINDINGS: ClassVar = [Binding("escape", "cancel", "Cancel")]
 
     def compose(self) -> ComposeResult:
-        yield Label("Open library folder")
+        yield Static("Open library folder", classes="dialog-title")
         yield Input(placeholder="/path/to/folder", id="root-input")
         with Horizontal(classes="dialog-actions"):
             yield Button("Open", id="root-open", variant="primary")
@@ -85,6 +154,48 @@ class RootPrompt(ModalScreen[str | None]):
             self.dismiss(None)
 
 
+class SearchFilterPrompt(ModalScreen[tuple[str, str] | None]):
+    BINDINGS: ClassVar = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, query: str, history_filter: str) -> None:
+        super().__init__()
+        self.initial_query = query
+        self.history_filter = history_filter
+
+    def compose(self) -> ComposeResult:
+        yield Static("Search and filter Files", classes="dialog-title")
+        yield Input(value=self.initial_query, placeholder="filename contains…", id="search-input")
+        with Horizontal(classes="dialog-actions search-filters"):
+            yield Button("All", id="search-filter-all")
+            yield Button("In progress", id="search-filter-progress")
+            yield Button("Not completed", id="search-filter-not-completed")
+        with Horizontal(classes="dialog-actions"):
+            yield Button("Apply", id="search-apply", variant="primary")
+            yield Button("Clear", id="search-clear")
+            yield Button("Cancel", id="search-cancel")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss((event.value, self.history_filter))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id
+        if button_id in {"search-filter-all", "search-filter-progress", "search-filter-not-completed"}:
+            self.history_filter = {
+                "search-filter-all": "all",
+                "search-filter-progress": "progress",
+                "search-filter-not-completed": "not-completed",
+            }[button_id]
+        elif button_id == "search-apply":
+            self.dismiss((self.query_one("#search-input", Input).value, self.history_filter))
+        elif button_id == "search-clear":
+            self.dismiss(("", "all"))
+        elif button_id == "search-cancel":
+            self.dismiss(None)
+
+
 class ResumePrompt(ModalScreen[str | None]):
     BINDINGS: ClassVar = [
         Binding("escape", "cancel", "Cancel"),
@@ -98,7 +209,7 @@ class ResumePrompt(ModalScreen[str | None]):
 
     def compose(self) -> ComposeResult:
         label = "Resume from furthest recorded progress" if self.offer.legacy_fallback else "Resume"
-        yield Label(f"{label}? Start over preserves history.")
+        yield Static(f"{label}? Start over preserves history.", classes="dialog-title")
         with Horizontal(classes="dialog-actions"):
             yield Button(label, id="resume-choice", variant="primary")
             yield Button("Start over", id="start-over-choice")
@@ -114,13 +225,100 @@ class ResumePrompt(ModalScreen[str | None]):
         self.dismiss(None)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        choices = {
+        choices: dict[str, str | None] = {
             "resume-choice": "resume",
             "start-over-choice": "start_over",
             "resume-cancel": None,
         }
         if event.button.id in choices:
             self.dismiss(choices[event.button.id])
+
+
+class DetailsPrompt(ModalScreen[str | None]):
+    BINDINGS: ClassVar = [Binding("escape", "cancel", "Close")]
+
+    def __init__(self, text: str, can_resume: bool, can_start_over: bool) -> None:
+        super().__init__()
+        self.details_text = text
+        self.can_resume = can_resume
+        self.can_start_over = can_start_over
+
+    def compose(self) -> ComposeResult:
+        yield Static(self.details_text, id="details-content", classes="details-content", markup=False)
+        with Horizontal(classes="dialog-actions"):
+            yield Button("Resume", id="details-resume", variant="primary", disabled=not self.can_resume)
+            yield Button("Start over", id="details-start-over", disabled=not self.can_start_over)
+            yield Button("Close", id="details-close")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "details-resume" and self.can_resume:
+            self.dismiss("resume")
+        elif event.button.id == "details-start-over" and self.can_start_over:
+            self.dismiss("start_over")
+        elif event.button.id == "details-close":
+            self.dismiss(None)
+
+
+class ActionMenu(ModalScreen[ContextAction | None]):
+    BINDINGS: ClassVar = [Binding("escape", "cancel", "Close")]
+
+    def __init__(self, actions: list[ContextAction], source: Widget | None, x: int, y: int) -> None:
+        super().__init__()
+        self.actions = actions
+        self.source = source
+        self.menu_x = x
+        self.menu_y = y
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="context-menu"):
+            for index, action in enumerate(self.actions):
+                yield Button(
+                    action.label,
+                    id=f"context-action-{index}",
+                    disabled=not action.enabled,
+                    classes="context-action",
+                )
+
+    def on_mount(self) -> None:
+        menu = self.query_one("#context-menu")
+        menu_width = min(40, max(24, self.app.size.width - 2))
+        menu_height = min(max(4, len(self.actions) + 2), max(5, self.app.size.height - 2))
+        menu.styles.width = menu_width
+        menu.styles.height = menu_height
+        menu.styles.offset = (
+            max(0, min(self.menu_x, self.app.size.width - menu_width)),
+            max(0, min(self.menu_y, self.app.size.height - menu_height)),
+        )
+        first = next((button for button, action in zip(menu.query(Button), self.actions) if action.enabled), None)
+        if first is not None:
+            first.focus()
+
+    def on_click(self, event: events.Click) -> None:
+        if (
+            self.source is not None
+            and event.screen_x is not None
+            and event.screen_y is not None
+            and self.source.region.contains(event.screen_x, event.screen_y)
+        ):
+            return
+        menu = self.query_one("#context-menu")
+        if event.widget is None or menu not in event.widget.ancestors_with_self:
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.disabled or event.button.id is None:
+            return
+        try:
+            index = int(event.button.id.rsplit("-", 1)[1])
+            self.dismiss(self.actions[index])
+        except (IndexError, ValueError):
+            self.dismiss(None)
 
 
 class ConfirmClear(ModalScreen[bool]):
@@ -130,7 +328,7 @@ class ConfirmClear(ModalScreen[bool]):
     ]
 
     def compose(self) -> ComposeResult:
-        yield Label("Clear completed queue entries? Media files will not be changed.")
+        yield Static("Clear completed queue entries? Media files will not be changed.", classes="dialog-title")
         with Horizontal(classes="dialog-actions"):
             yield Button("Clear", id="clear-confirm", variant="error")
             yield Button("Cancel", id="clear-cancel")
@@ -138,14 +336,14 @@ class ConfirmClear(ModalScreen[bool]):
     def action_confirm(self) -> None:
         self.dismiss(True)
 
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "clear-confirm":
             self.dismiss(True)
         elif event.button.id == "clear-cancel":
             self.dismiss(False)
-
-    def action_cancel(self) -> None:
-        self.dismiss(False)
 
 
 class ConfirmClearAll(ModalScreen[bool]):
@@ -155,7 +353,7 @@ class ConfirmClearAll(ModalScreen[bool]):
     ]
 
     def compose(self) -> ComposeResult:
-        yield Label("Clear every queue entry? Media files will not be changed.")
+        yield Static("Clear every queue entry? Media files will not be changed.", classes="dialog-title")
         with Horizontal(classes="dialog-actions"):
             yield Button("Clear all", id="clear-all-confirm", variant="error")
             yield Button("Cancel", id="clear-all-cancel")
@@ -163,14 +361,14 @@ class ConfirmClearAll(ModalScreen[bool]):
     def action_confirm(self) -> None:
         self.dismiss(True)
 
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "clear-all-confirm":
             self.dismiss(True)
         elif event.button.id == "clear-all-cancel":
             self.dismiss(False)
-
-    def action_cancel(self) -> None:
-        self.dismiss(False)
 
 
 class QuitPrompt(ModalScreen[str | None]):
@@ -181,7 +379,7 @@ class QuitPrompt(ModalScreen[str | None]):
     ]
 
     def compose(self) -> ComposeResult:
-        yield Label("Quit: stop VLC, keep VLC running, or cancel")
+        yield Static("Quit: stop VLC, keep VLC running, or cancel", classes="dialog-title")
         with Horizontal(classes="dialog-actions"):
             yield Button("Stop VLC", id="quit-stop", variant="warning")
             yield Button("Keep VLC", id="quit-keep")
@@ -197,69 +395,102 @@ class QuitPrompt(ModalScreen[str | None]):
         self.dismiss(None)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        choices = {"quit-stop": "stop", "quit-keep": "keep", "quit-cancel": None}
+        choices: dict[str, str | None] = {
+            "quit-stop": "stop",
+            "quit-keep": "keep",
+            "quit-cancel": None,
+        }
         if event.button.id in choices:
             self.dismiss(choices[event.button.id])
+
+
+class NoticePrompt(ModalScreen[None]):
+    BINDINGS: ClassVar = [Binding("escape", "cancel", "Close")]
+
+    def __init__(self, notice: str) -> None:
+        super().__init__()
+        self.notice = notice
+
+    def compose(self) -> ComposeResult:
+        yield Static(self.notice, id="details-content", classes="details-content", markup=False)
+        yield Button("Close", id="notice-close")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "notice-close":
+            self.dismiss(None)
+
+
+class HelpPrompt(ModalScreen[None]):
+    BINDINGS: ClassVar = [Binding("escape", "cancel", "Close")]
+
+    def compose(self) -> ComposeResult:
+        yield Static(
+            "Keys: o open · arrows/backspace browse · Enter play/open · v select · "
+            "a add · A add & play · Space pause · n/p next/previous · [ ] seek · "
+            "d remove · J/K reorder · r retry · ? help · q quit · Shift+F10 menu",
+            classes="help-content",
+            markup=False,
+        )
+        yield Button("Close", id="help-close")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "help-close":
+            self.dismiss(None)
 
 
 class VLCQApp(App[None]):
     TITLE = "vlcq"
     CSS = """
-    #status { height: 3; padding: 0 1; color: $text; background: $boost; }
-    #panes { height: 1fr; }
-    #browser-pane { width: 1fr; border: solid $primary; background: $surface; }
-    #queue-pane { width: 1fr; border: solid $secondary; background: $surface-darken-1; }
-    #browser-pane.focused { border: heavy $warning; background: $primary-background; }
-    #queue-pane.focused { border: heavy $warning; background: $secondary-background; }
-    .pane-title { height: 1; text-style: bold; content-align: center middle; }
-    .toolbar { height: 3; align-horizontal: center; }
-    .toolbar Button { min-width: 8; width: 1fr; margin: 0 1; }
-    .compact .toolbar { width: 100%; height: 2; }
-    .compact Footer { display: none; }
-    .compact .toolbar Button {
-        min-width: 0;
-        width: 1fr;
-        min-height: 2;
-        height: 2;
-        margin: 0;
-        padding: 0;
-        content-align: center middle;
+    #sections { height: 1fr; width: 1fr; }
+    .section { height: 1fr; min-height: 1; background: $surface; }
+    #queue-section { background: $surface-darken-1; }
+    .section.collapsed { height: 1; min-height: 1; }
+    .section.focused { background: $primary-background; }
+    #queue-section.focused { background: $secondary-background; }
+    .section-header { height: 1; min-height: 1; width: 1fr; }
+    .section-header Button, #player-line Button {
+        width: 3; min-width: 3; height: 1; min-height: 1; margin: 0; padding: 0;
+        border: none; content-align: center middle;
     }
-    .compact .pane-help { height: 1; padding: 0; }
-    .compact #browser-search { min-width: 8; width: 1fr; margin: 0; }
-    .dialog-actions { height: auto; align-horizontal: center; }
-    .dialog-actions Button { margin: 0 1; min-width: 12; }
-    #browser-search { width: 1fr; margin: 0 1; }
-    #selection-summary, #selected-details, #player { height: auto; padding: 0 1; color: $text-muted; }
-    #player { color: $text; background: $boost; }
-    .history-none { color: $text-muted; }
-    .history-progress { color: $warning; }
-    .history-completed { color: $success; }
-    .queued-badge { color: $accent; }
-    #browser, #queue {
-        height: 1fr;
-        overflow-x: auto;
-        overflow-y: auto;
-    }
-    #browser > ListItem, #queue > ListItem {
-        width: auto;
-        min-width: 100%;
-    }
+    .section-title { width: 1fr; height: 1; overflow-x: hidden; }
+    .section-body { height: 1fr; min-height: 1; }
+    .section.collapsed .section-body { display: none; }
+    #browser, #queue { height: 1fr; min-height: 1; overflow-x: auto; overflow-y: auto; }
+    #browser > ListItem, #queue > ListItem { width: auto; min-width: 100%; height: 1; min-height: 1; }
+    .browser-row { width: 1fr; height: 1; min-height: 1; }
+    .browser-check { width: 3; min-width: 3; height: 1; min-height: 1; margin: 0; padding: 0; border: none; }
+    .row-label { width: 1fr; height: 1; min-height: 1; overflow-x: hidden; }
     .folder-entry { color: $primary-lighten-2; text-style: bold; }
-    .video-entry { color: $success-lighten-1; }
+    .video-entry { color: $text; }
     .selected-video { color: $warning; text-style: bold; }
     .queue-playing, .queue-paused { color: $warning; text-style: bold; }
     .queue-completed { color: $success; }
     .queue-missing, .queue-failed { color: $error; text-style: bold; }
     .queue-stopped, .queue-skipped { color: $text-muted; }
     .queue-queued { color: $text; }
-    .pane-help { height: 2; padding: 0 1; color: $text-muted; }
-    .empty-state { height: auto; padding: 1; color: $text-muted; }
-    RootPrompt, ResumePrompt, ConfirmClear, ConfirmClearAll, QuitPrompt { align: center middle; }
-    RootPrompt > Label, RootPrompt > Input, ResumePrompt > Label,
-    ConfirmClear > Label, ConfirmClearAll > Label, QuitPrompt > Label {
-        width: 70%; padding: 1; background: $surface; border: solid $accent;
-    }
+    .history-progress { color: $warning; }
+    .history-completed { color: $success; }
+    .queued-badge { color: $accent; }
+    #player-line { height: 1; min-height: 1; background: $boost; }
+    #player { width: 1fr; height: 1; min-height: 1; padding: 0 1; overflow-x: hidden; }
+    #progress-line { height: 1; min-height: 1; }
+    #progress { width: 1fr; height: 1; min-height: 1; }
+    #progress-percent { width: 7; height: 1; min-height: 1; content-align: right middle; padding: 0 1; }
+    #notice { height: 1; min-height: 1; padding: 0 1; color: $text-muted; overflow-x: hidden; }
+    #context-menu { position: absolute; background: $surface; border: round $accent; padding: 0; overflow-y: auto; }
+    .context-action { width: 1fr; min-width: 20; height: 1; min-height: 1; margin: 0; padding: 0 1; border: none; content-align: left middle; }
+    .dialog-actions { height: 1; min-height: 1; align-horizontal: center; }
+    .dialog-actions Button { height: 1; min-height: 1; min-width: 10; margin: 0 1; padding: 0 1; }
+    .dialog-title, .details-content, .help-content { width: 80%; max-height: 12; padding: 1; background: $surface; border: solid $accent; }
+    .details-content, .help-content { height: auto; overflow-y: auto; }
+    RootPrompt, SearchFilterPrompt, ResumePrompt, DetailsPrompt, ConfirmClear, ConfirmClearAll, QuitPrompt, NoticePrompt, HelpPrompt { align: center middle; }
+    RootPrompt > Input, SearchFilterPrompt > Input { width: 80%; background: $surface; }
     """
     BINDINGS: ClassVar = [
         Binding("o", "open_root", "Open folder"),
@@ -283,6 +514,7 @@ class VLCQApp(App[None]):
         Binding("R", "resume_highlighted", "Resume", show=False),
         Binding("S", "start_over_highlighted", "Start over", show=False),
         Binding("c", "clear_completed", "Clear completed"),
+        Binding("shift+f10", "context_menu", "Actions"),
         Binding("?", "help", "Help"),
         Binding("q", "quit_app", "Quit"),
     ]
@@ -301,6 +533,7 @@ class VLCQApp(App[None]):
         self.root = self.queue.open(root)
         self.browser_path = self.root
         self.browser_entries: list[BrowserEntry] = []
+        self._browser_source_entries: list[BrowserEntry] = []
         self.selected_paths: set[Path] = set()
         self.history: dict[Path, HistoryProjection] = {}
         self._history_cache: dict[
@@ -308,6 +541,7 @@ class VLCQApp(App[None]):
         ] = {}
         self._history_tasks: dict[str, asyncio.Task[None]] = {}
         self._browser_refresh_token = 0
+        self._root_generation = 0
         self.search_query = ""
         self.history_filter = "all"
         self.browser_reverse = False
@@ -318,91 +552,42 @@ class VLCQApp(App[None]):
         self.resume_command = False
         self._last_pane = "browser"
         self._notice = "Ready"
-        self._playback_summary = ""
+        self._source_focus: Widget | None = None
 
     def compose(self) -> ComposeResult:
-        yield Header()
-        yield Static(id="status")
-        with Horizontal(id="panes"):
-            with Vertical(id="browser-pane"):
-                yield Label("LIBRARY", classes="pane-title")
-                with Horizontal(classes="toolbar"):
-                    yield Button("Open", id="browser-open", variant="primary")
-                    yield Button("Up", id="browser-up")
-                    yield Button("Select", id="browser-select")
-                with Horizontal(classes="toolbar"):
-                    yield Button("Add to end", id="browser-add", variant="success")
-                    yield Button("Play next", id="browser-next")
-                    yield Button("Play now", id="browser-add-play", variant="warning")
-                    yield Button("Sort", id="browser-sort")
-                with Horizontal(classes="toolbar"):
-                    yield Input(placeholder="Search filenames", id="browser-search")
-                    yield Button("All", id="filter-all")
-                    yield Button("In progress", id="filter-progress")
-                    yield Button("Not completed", id="filter-not-completed")
-                    yield Button("Clear selection", id="browser-clear-selection")
-                yield Static(
-                    "Click a row to highlight; click its checkbox to select. Add actions never modify media.",
-                    id="browser-help",
-                    classes="pane-help",
-                )
-                yield Static(
-                    "No folders or playable videos here.", id="browser-empty", classes="empty-state"
-                )
-                yield ListView(id="browser")
-            with Vertical(id="queue-pane"):
-                yield Label("QUEUE", classes="pane-title")
-                with Horizontal(classes="toolbar"):
-                    yield Button("Play next", id="queue-next")
-                    yield Button("Play now", id="queue-play", variant="warning")
-                    yield Button("Up", id="queue-up")
-                    yield Button("Down", id="queue-down")
-                    yield Button("Remove", id="queue-remove", variant="error")
-                    yield Button("Undo", id="queue-undo")
-                with Horizontal(classes="toolbar"):
-                    yield Button("Sort", id="queue-sort")
-                    yield Button("Clear completed", id="queue-clear-completed", variant="error")
-                    yield Button("Clear", id="queue-clear", variant="error")
-                yield Static(
-                    "Queue is empty — highlight a playable video and press Add or A.",
-                    id="queue-empty",
-                    classes="empty-state",
-                )
-                yield ListView(id="queue")
-        yield Static("No selection", id="selection-summary")
-        yield Static("No item highlighted", id="selected-details")
-        with Horizontal(id="details-actions", classes="toolbar"):
-            yield Button("Resume", id="details-resume", variant="primary")
-            yield Button("Start over", id="details-start-over")
-        with Horizontal(id="player-controls", classes="toolbar"):
-            yield Button("Previous", id="player-previous")
-            yield Button("-10s", id="player-back")
-            yield Button("Pause", id="player-pause", variant="primary")
-            yield Button("+10s", id="player-forward")
-            yield Button("Next", id="player-next")
-            yield Button("Reconnect", id="player-reconnect")
-            yield Button("Help", id="app-help")
-            yield Button("Quit", id="app-quit", variant="error")
-        yield Static("Player disconnected", id="player")
-        yield ProgressBar(total=100, id="progress")
-        yield Footer()
+        with Vertical(id="sections"):
+            with Vertical(id="files-section", classes="section"):
+                with Horizontal(id="files-header", classes="section-header"):
+                    yield CompactButton("▾", id="files-toggle", tooltip="Collapse Files")
+                    yield Static("Files", id="files-title", classes="section-title")
+                    yield CompactButton("…", id="files-actions", tooltip="Files actions")
+                with Vertical(id="files-body", classes="section-body"):
+                    yield Static("No folders or playable videos here — use Files actions to open a root.", id="files-empty")
+                    yield ListView(id="browser")
+            with Vertical(id="queue-section", classes="section"):
+                with Horizontal(id="queue-header", classes="section-header"):
+                    yield CompactButton("▾", id="queue-toggle", tooltip="Collapse Queue")
+                    yield Static("Queue", id="queue-title", classes="section-title")
+                    yield CompactButton("…", id="queue-actions", tooltip="Queue actions")
+                with Vertical(id="queue-body", classes="section-body"):
+                    yield Static("Queue is empty — use Files actions to add a video.", id="queue-empty")
+                    yield ListView(id="queue")
+        with Horizontal(id="player-line"):
+            yield Static("Idle · disconnected", id="player")
+            yield CompactButton("…", id="player-menu", tooltip="Player and application actions")
+        with Horizontal(id="progress-line"):
+            yield ProgressBar(total=100, id="progress", show_eta=False)
+            yield Static("?", id="progress-percent")
+        yield Static("Ready", id="notice")
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        del parameters
-        # Character bindings must never leak into a text-entry widget.  The
-        # The root dialog keeps only its explicit Enter handling for
-        # compatibility with the priority app binding; all other fields use
-        # Input's normal editing and submission behavior exclusively.
-        if isinstance(self.focused, Input):
-            return isinstance(self.screen, RootPrompt) and action == "activate"
-        return True
+        del action, parameters
+        # Text input owns ordinary typing and shortcut characters, including
+        # Enter submission.  Modal buttons and Input.Submitted remain active.
+        return not isinstance(self.focused, Input)
 
     async def on_mount(self) -> None:
-        if self.size.width <= 90:
-            self.add_class("compact")
         await self.refresh_browser()
-        # Start in the folder-first workflow: the first browser item is ready
-        # for keyboard actions without requiring an extra focus/tab step.
         self.query_one("#browser", ListView).focus()
         self.refresh_queue()
         self.update_status("Ready")
@@ -416,54 +601,72 @@ class VLCQApp(App[None]):
             target = self._startup_target_index()
             if target is not None:
                 try:
-                    # Startup for an explicit command uses the same choice
-                    # policy as a visible Play now action.  Automatic queue
-                    # advancement calls the controller's automatic path
-                    # directly and never opens a modal.
                     if self.no_vlc or self.controller.client is not None:
-                        await self._play_queue_index(
-                            target, automatic=self.autoplay and not self.resume_command
-                        )
+                        await self._play_queue_index(target, automatic=self.autoplay and not self.resume_command)
                 except (IndexError, OSError, VLCError):
                     self.update_status("Automatic resume failed")
                 self.refresh_queue()
         self.set_interval(1, self.refresh_playback)
 
     async def on_unmount(self) -> None:
-        # Poll failures retire the client reference, but the VLC process may
-        # still be alive and must be stopped when the app exits.
         for task in self._history_tasks.values():
             task.cancel()
         self._history_tasks.clear()
         if not self.no_vlc:
             await self.controller.stop()
 
+    def on_resize(self, event: events.Resize) -> None:
+        del event
+        # Section CSS allocates all available space on every resize.  No
+        # rebuild is performed, so list identity, selection and scroll remain.
+        self._refresh_headers()
+
+    def _row_ancestor(self, widget: Widget | None) -> BrowserListItem | QueueListItem | None:
+        if widget is None:
+            return None
+        return next(
+            (
+                item
+                for item in widget.ancestors_with_self
+                if isinstance(item, (BrowserListItem, QueueListItem))
+            ),
+            None,
+        )
+
     def on_click(self, event: events.Click) -> None:
         widget = event.widget
         if widget is None:
             return
-        ancestors = widget.ancestors_with_self
-        progress = next((item for item in ancestors if isinstance(item, ProgressBar)), None)
-        track = next((item for item in ancestors if isinstance(item, Bar)), None)
+        row = self._row_ancestor(widget)
+        if row is not None:
+            if isinstance(row, BrowserListItem):
+                try:
+                    browser = self.query_one("#browser", ListView)
+                except NoMatches:
+                    return
+                if row in browser.children:
+                    browser.index = list(browser.children).index(row)
+                if event.button == 3:
+                    event.stop()
+                    self._open_row_menu(row, event.screen_x, event.screen_y)
+                elif event.button == 1 and row.is_dir:
+                    self.run_worker(self._open_browser_folder(row.path), exclusive=True)
+            else:
+                try:
+                    queue = self.query_one("#queue", ListView)
+                except NoMatches:
+                    return
+                if row in queue.children:
+                    queue.index = list(queue.children).index(row)
+                if event.button == 3:
+                    event.stop()
+                    self._open_row_menu(row, event.screen_x, event.screen_y)
+            return
+        if event.button == 3:
+            event.stop()
+            return
+        progress = next((item for item in widget.ancestors_with_self if isinstance(item, ProgressBar)), None)
         if progress is None:
-            browser_view = self.query_one("#browser", ListView)
-            queue_view = self.query_one("#queue", ListView)
-            row = next((item for item in ancestors if isinstance(item, ListItem)), None)
-            if row is None:
-                return
-            if row in browser_view.children:
-                index = list(browser_view.children).index(row)
-                browser_view.index = index
-                entry = self.browser_entries[index]
-                # Only directory rows have an activation-on-click contract.
-                # Video rows merely highlight and update details; playback is
-                # always an explicit Play/Open action.
-                if entry.is_dir:
-                    self.run_worker(self.action_activate(), exclusive=True)
-            elif row in queue_view.children:
-                queue_view.index = list(queue_view.children).index(row)
-                self._refresh_details()
-                self._refresh_controls()
             return
         if self.no_vlc or self.controller.client is None:
             self.update_status("Seek unavailable while VLC is disconnected")
@@ -479,9 +682,7 @@ class VLCQApp(App[None]):
         ):
             self.update_status("Seek unavailable because duration is unknown or media is not ready")
             return
-        if track is None and widget is not progress:
-            return
-        region = track.region if track is not None else progress.region
+        region = progress.region
         screen_x = event.screen_x if event.screen_x is not None else region.x
         ratio = max(0.0, min(1.0, (screen_x - region.x) / max(1, region.width - 1)))
         target = int(duration * ratio)
@@ -497,48 +698,67 @@ class VLCQApp(App[None]):
 
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
         try:
-            browser_pane = self.query_one("#browser-pane")
-            queue_pane = self.query_one("#queue-pane")
+            files_section = self.query_one("#files-section")
+            queue_section = self.query_one("#queue-section")
         except NoMatches:
-            # Modal screens replace the main widget tree while they are open.
             return
         ancestors = event.widget.ancestors_with_self
-        in_browser = browser_pane in ancestors
-        in_queue = queue_pane in ancestors
-        browser_pane.set_class(in_browser, "focused")
-        queue_pane.set_class(in_queue, "focused")
-        if in_browser:
+        in_files = files_section in ancestors
+        in_queue = queue_section in ancestors
+        files_section.set_class(in_files, "focused")
+        queue_section.set_class(in_queue, "focused")
+        if in_files:
             self._last_pane = "browser"
         elif in_queue:
             self._last_pane = "queue"
 
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
-        del event
-        self._refresh_details()
-        self._refresh_controls()
+        if event.list_view.id == "browser":
+            self._last_pane = "browser"
+        else:
+            self._last_pane = "queue"
+        self._refresh_headers()
 
-    async def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id == "browser-search":
-            await self.refresh_browser()
-
-    def _render_status(self) -> None:
+    def _render_headers(self) -> None:
         try:
             relative = self.browser_path.relative_to(self.root)
         except ValueError:
             relative = Path(".")
-        message = self._notice
-        if self._playback_summary:
-            message = f"{message} · {self._playback_summary}"
-        for widget in self.query("#status"):
-            if isinstance(widget, Static):
-                widget.update(f"Root: {self.root.name}  Folder: {relative}  {message}")
+        visible_selected = sum(1 for entry in self.browser_entries if entry.path in self.selected_paths)
+        hidden_selected = len(self.selected_paths) - visible_selected
+        selection = ""
+        if self.selected_paths:
+            selection = f" · {len(self.selected_paths)} selected"
+            if hidden_selected:
+                selection += f" ({hidden_selected} hidden)"
+        discovery = []
+        if self.search_query:
+            discovery.append(f"search:{self.search_query}")
+        if self.history_filter != "all":
+            discovery.append(self.history_filter.replace("not-completed", "not completed"))
+        if discovery:
+            selection += " · " + ", ".join(discovery)
+        title = f"Files · {self.root.name} / {relative}{selection}"
+        queue_count = len(self.queue.entries())
+        queue_title = f"Queue · {queue_count} entr{'y' if queue_count == 1 else 'ies'}"
+        try:
+            self.query_one("#files-title", Static).update(title)
+            self.query_one("#queue-title", Static).update(queue_title)
+        except NoMatches:
+            pass
+
+    def _refresh_headers(self) -> None:
+        self._render_headers()
 
     def update_status(self, message: str) -> None:
         if self.queue.undo_expired:
             self.queue.consume_undo_expired()
             message = f"Undo expired after queue mutation · {message}"
         self._notice = message
-        self._render_status()
+        try:
+            self.query_one("#notice", Static).update(message)
+        except NoMatches:
+            pass
 
     @staticmethod
     def _format_time(value_ms: int | None) -> str:
@@ -551,7 +771,6 @@ class VLCQApp(App[None]):
         return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
 
     def _history_for(self, paths: list[Path]) -> dict[Path, HistoryProjection]:
-        """Return only the already-cached portion of a projection request."""
         return {
             path.expanduser().resolve(strict=False): projection
             for path in paths
@@ -561,18 +780,19 @@ class VLCQApp(App[None]):
     async def _load_history(
         self, paths: list[Path], *, force: bool = False
     ) -> dict[Path, HistoryProjection]:
-        """Validate identities off-loop, then query SQLite in its owner thread."""
-        normalized = list(dict.fromkeys(path.expanduser().resolve(strict=False) for path in paths))
+        normalized = list(dict.fromkeys(path.expanduser().resolve(strict=False) for path in paths))[:250]
         if not normalized:
             return {}
+        root = self.root
         identities = await asyncio.gather(
-            *(asyncio.to_thread(_file_identity, path, self.root) for path in normalized)
+            *(asyncio.to_thread(_file_identity, path, root) for path in normalized)
         )
         uncached: list[tuple[Path, tuple[int, int, int, int]]] = []
         result: dict[Path, HistoryProjection] = {}
         for path, identity in zip(normalized, identities, strict=True):
             if identity is None:
                 self._history_cache[path] = (None, None)
+                self.history.pop(path, None)
                 continue
             canonical, fingerprint = identity
             cached = self._history_cache.get(canonical)
@@ -591,9 +811,10 @@ class VLCQApp(App[None]):
                 self._history_cache[path] = (fingerprint, projection)
                 if projection is not None:
                     result[path] = projection
+        if root != self.root:
+            return result
         for path in normalized:
-            canonical = path.expanduser().resolve(strict=False)
-            self.history.pop(canonical, None)
+            self.history.pop(path, None)
         self.history.update(result)
         return result
 
@@ -615,17 +836,21 @@ class VLCQApp(App[None]):
             return
         pending = self._history_tasks.get(target)
         if pending is not None and not pending.done():
-            # Do not cancel a delayed identity check on every polling tick;
-            # otherwise a busy filesystem could starve history refresh forever.
             return
+        generation = self._root_generation
 
         async def refresh() -> None:
             try:
                 await self._load_history(paths, force=force)
+                if generation != self._root_generation:
+                    return
                 if target == "browser":
                     if expected_browser_path != self.browser_path:
                         return
-                    self._apply_browser_history_rows()
+                    if self.search_query or self.history_filter != "all":
+                        self._render_browser_rows()
+                    else:
+                        self._apply_browser_history_rows()
                 elif target == "queue":
                     current_ids = tuple(entry.id for entry in self.queue.entries())
                     if expected_queue_ids != current_ids:
@@ -642,6 +867,55 @@ class VLCQApp(App[None]):
 
         self._history_tasks[target] = asyncio.create_task(refresh())
 
+    def _history_label(self, path: Path) -> str:
+        history = self.history.get(path.expanduser().resolve(strict=False))
+        if history is None:
+            return ""
+        if history.completion_observed:
+            category = "✓ Completed"
+        elif history.position_ms > 0:
+            category = "~ In progress"
+        else:
+            return ""
+        progress = self._format_time(history.position_ms)
+        duration = self._format_time(history.duration_ms) if history.duration_ms > 0 else "?"
+        return f"{category} {progress}/{duration}"
+
+    def _history_class(self, path: Path) -> str:
+        history = self.history.get(path.expanduser().resolve(strict=False))
+        if history is not None and history.completion_observed:
+            return "history-completed"
+        if history is not None and history.position_ms > 0:
+            return "history-progress"
+        return ""
+
+    def _browser_renderable(self, entry: BrowserEntry, selected: bool, queued: bool) -> Text:
+        text = Text(no_wrap=True, overflow="ellipsis")
+        if entry.is_dir:
+            text.append("▸ ", style="cyan bold")
+            text.append(entry.name, style="cyan bold")
+            return text
+        text.append(entry.name, style="yellow bold" if selected else "white")
+        if queued:
+            text.append(" · queued", style="magenta")
+        history = self._history_label(entry.path)
+        if history:
+            text.append(" · " + history, style="green" if "Completed" in history else "yellow")
+        return text
+
+    def _queue_renderable(self, entry: QueueEntry, current_id: int | None) -> Text:
+        text = Text(no_wrap=True, overflow="ellipsis")
+        if current_id == entry.id:
+            text.append("◆ ", style="bold yellow")
+        else:
+            text.append("  ")
+        text.append(entry.path.name, style="white")
+        text.append(" · " + _QUEUE_STATE_LABELS.get(entry.state, entry.state.upper()), style="yellow")
+        history = self._history_label(entry.path)
+        if history:
+            text.append(" · " + history, style="green" if "Completed" in history else "yellow")
+        return text
+
     def _apply_browser_history_rows(self) -> None:
         try:
             view = self.query_one("#browser", ListView)
@@ -649,18 +923,18 @@ class VLCQApp(App[None]):
             return
         if not view.is_attached:
             return
-        for entry, row in zip(self.browser_entries, view.children, strict=False):
-            if entry.is_dir or not entry.supported:
+        queued_paths = {entry.path for entry in self.queue.entries()}
+        for row in view.children:
+            if not isinstance(row, BrowserListItem) or row.is_dir:
                 continue
             try:
-                history_widget = row.query_one(Static)
-                history_widget.update(self._history_label(entry.path))
-                history_widget.set_classes(self._history_class(entry.path))
-            except NoMatches:
-                # A structural refresh can append a row before its children
-                # mount.  The next polling refresh will update it safely.
+                entry = next(item for item in self.browser_entries if item.path == row.path)
+                row.query_one(".row-label", Label).update(
+                    self._browser_renderable(entry, entry.path in self.selected_paths, entry.path in queued_paths)
+                )
+            except (NoMatches, StopIteration):
                 continue
-        self._refresh_details()
+        self._render_headers()
 
     def _apply_queue_history_rows(self) -> None:
         try:
@@ -669,166 +943,92 @@ class VLCQApp(App[None]):
             return
         if not view.is_attached:
             return
+        entries = {entry.id: entry for entry in self.queue.entries()}
+        current = self.queue.current()
+        current_id = current.id if current is not None else None
         for row in view.children:
             if not isinstance(row, QueueListItem):
                 continue
-            try:
-                entry = next(item for item in self.queue.entries() if item.id == row.entry_id)
-                history_widget = row.query_one(".queue-history", Static)
-                history_widget.update(self._history_label(entry.path))
-                history_widget.set_classes(f"queue-history {self._history_class(entry.path)}")
-            except (NoMatches, StopIteration):
+            entry = entries.get(row.entry_id)
+            if entry is None:
                 continue
-        self._refresh_details()
-
-    def _history_label(self, path: Path) -> str:
-        history = self.history.get(path)
-        if history is None:
-            return "No recorded progress"
-        if history.completion_observed:
-            category = "Completed"
-        elif history.position_ms > 0:
-            category = "In progress"
-        else:
-            return "No recorded progress"
-        progress = self._format_time(history.position_ms)
-        duration = self._format_time(history.duration_ms) if history.duration_ms > 0 else "?"
-        return f"{category} {progress}/{duration}"
-
-    def _history_class(self, path: Path) -> str:
-        history = self.history.get(path)
-        if history is not None and history.completion_observed:
-            return "history-completed"
-        if history is not None and history.position_ms > 0:
-            return "history-progress"
-        return "history-none"
-
-    def _refresh_selection_summary(self) -> None:
-        try:
-            summary = self.query_one("#selection-summary", Static)
-        except NoMatches:
-            return
-        visible = {entry.path for entry in self.browser_entries if entry.supported}
-        hidden = self.selected_paths - visible
-        other_folder = sum(1 for path in hidden if path.parent != self.browser_path)
-        if not self.selected_paths:
-            summary.update("No selected videos")
-        else:
-            summary.update(
-                f"Selected: {len(self.selected_paths)} · hidden by filter/folder: {len(hidden)} "
-                f"({other_folder} in other folders)"
-            )
-
-    def _details_target(self) -> BrowserEntry | None:
-        """Return the object targeted by contextual detail actions."""
-        if self._last_pane == "queue":
-            index = self._queue_index()
-            if index is None:
-                return None
-            entry = self.queue.entries()[index]
-            return BrowserEntry(entry.path, entry.path.name, False, True)
-        return self._browser_entry()
-
-    def _refresh_details(self) -> None:
-        try:
-            details = self.query_one("#selected-details", Static)
-        except NoMatches:
-            return
-        entry = self._details_target()
-        if entry is None or entry.is_dir:
-            details.update("No video highlighted")
-            return
-        history = self.history.get(entry.path)
-        queued = next((item for item in self.queue.entries() if item.path == entry.path), None)
-        queue_label = "queued" if queued is not None else "not queued"
-        if history is None:
-            details.update(f"{entry.name} · {queue_label} · No recorded progress")
-            return
-        last_played = history.last_played_at or "unknown last-played time"
-        resume = (
-            self._format_time(history.resume_position_ms)
-            if history.resume_position_ms is not None
-            else (
-                f"{self._format_time(history.fallback_resume_position_ms)} "
-                "(furthest recorded fallback)"
-                if history.fallback_resume_position_ms is not None
-                else "unknown"
-            )
-        )
-        details.update(
-            f"{entry.name} · {queue_label} · resume {resume} · furthest "
-            f"{self._format_time(history.position_ms)} · duration "
-            f"{self._format_time(history.duration_ms) if history.duration_ms else '?'} · "
-            f"last played {last_played}"
-        )
-
-    def refresh_playback(self) -> None:
-        current = self.queue.current()
-        status = self.controller.status
-        if self.no_vlc:
-            state = current.state if current else "offline"
-            status_name = state
-            position_ms = 0
-            duration_ms = 0
-        else:
-            status_name = status.state
-            position_ms = status.position_ms
-            duration_ms = status.duration_ms
-        percent = min(100.0, position_ms * 100 / duration_ms) if duration_ms else 0.0
-        for widget in self.query("#progress"):
-            if isinstance(widget, ProgressBar):
-                widget.update(progress=percent)
-        name = current.path.name if current else "none"
-        remaining = max(0, duration_ms - position_ms) if duration_ms > 0 else None
-        self._playback_summary = (
-            f"{status_name}  {name}  elapsed {self._format_time(position_ms)} / "
-            f"total {self._format_time(duration_ms) if duration_ms else '?'} / "
-            f"remaining {self._format_time(remaining)}"
-        )
-        try:
-            self.query_one("#player", Static).update(
-                f"{status_name.upper()} · {name} · elapsed {self._format_time(position_ms)} · "
-                f"total {self._format_time(duration_ms) if duration_ms else '?'} · "
-                f"remaining {self._format_time(remaining)} · "
-                f"{'connected' if self.controller.client is not None or self.no_vlc else 'disconnected'}"
-            )
-        except NoMatches:
-            pass
-        self._render_status()
-        self._refresh_browser_history()
-        # Controller observations update SQLite; redraw rows even when no user input occurs.
-        try:
-            self.refresh_queue()
-        except NoMatches:
-            # A timer can tick while Textual is tearing down the application.
-            pass
-        if self.queue.undo_expired:
-            self.update_status("Undo expired after queue mutation")
+            try:
+                row.query_one(".row-label", Label).update(self._queue_renderable(entry, current_id))
+            except NoMatches:
+                continue
+        self._render_headers()
 
     def _refresh_browser_history(self) -> None:
-        """Refresh visible history without blocking input or replacing rows."""
-        paths = [entry.path for entry in self.browser_entries if entry.supported]
+        paths = [entry.path for entry in self._browser_source_entries if entry.supported]
         self._schedule_history_refresh(
             paths,
             target="browser",
             expected_browser_path=self.browser_path,
-            force=True,
+            force=False,
         )
 
+    def _filtered_browser_entries(self) -> list[BrowserEntry]:
+        result: list[BrowserEntry] = []
+        for entry in self._browser_source_entries:
+            if entry.is_dir:
+                result.append(entry)
+                continue
+            if self.search_query and self.search_query not in entry.name.casefold():
+                continue
+            history = self.history.get(entry.path)
+            if self.history_filter == "progress" and not (
+                history is not None and history.position_ms > 0 and not history.completion_observed
+            ):
+                continue
+            if self.history_filter == "not-completed" and history is not None and history.completion_observed:
+                continue
+            result.append(entry)
+        return result
+
+    def _render_browser_rows(self) -> None:
+        try:
+            browser = self.query_one("#browser", ListView)
+        except NoMatches:
+            return
+        highlighted_path: Path | None = None
+        if browser.index is not None and 0 <= browser.index < len(self.browser_entries):
+            highlighted_path = self.browser_entries[browser.index].path
+        self.browser_entries = self._filtered_browser_entries()
+        empty = self.query_one("#files-empty", Static)
+        empty.display = not bool(self.browser_entries)
+        if not self.browser_entries:
+            empty.update("No folders or playable videos match the current view — use Files actions to adjust it.")
+        queued_paths = {entry.path for entry in self.queue.entries()}
+        browser.clear()
+        for entry in self.browser_entries:
+            awaitable_row = BrowserListItem(
+                entry,
+                self._browser_renderable(entry, entry.path in self.selected_paths, entry.path in queued_paths),
+                selected=entry.path in self.selected_paths,
+            )
+            browser.append(awaitable_row)
+        if highlighted_path is not None:
+            restored = next(
+                (index for index, entry in enumerate(self.browser_entries) if entry.path == highlighted_path),
+                None,
+            )
+            browser.index = restored if restored is not None else (0 if self.browser_entries else None)
+        elif self.browser_entries and browser.index is None:
+            browser.index = 0
+        self._render_headers()
+
     async def refresh_browser(self) -> None:
-        browser = self.query_one("#browser", ListView)
         self._browser_refresh_token += 1
         refresh_token = self._browser_refresh_token
         self._cancel_history_task("browser")
-        highlighted = self._browser_entry()
-        highlighted_path = highlighted.path if highlighted is not None else None
         try:
             entries = await asyncio.to_thread(list_folder, self.browser_path, self.root)
         except (OSError, PathError) as exc:
+            self._browser_source_entries = []
             self.browser_entries = []
-            self.query_one("#browser-empty", Static).update(f"Unable to read this folder: {exc}")
-            self.query_one("#browser-empty", Static).display = True
-            self._refresh_controls()
+            empty = self.query_one("#files-empty", Static)
+            empty.update(f"Unable to read this folder: {exc}")
+            empty.display = True
             self.update_status(f"Browse failed: {exc}")
             return
         if refresh_token != self._browser_refresh_token:
@@ -845,77 +1045,18 @@ class VLCQApp(App[None]):
                 reverse=True,
             )
             entries = [*folders, *files]
-        await self._load_history([entry.path for entry in entries if entry.supported])
-        if refresh_token != self._browser_refresh_token:
-            return
-        await browser.clear()
         try:
-            self.search_query = self.query_one("#browser-search", Input).value.casefold()
-        except NoMatches:
+            self.search_query = self.search_query.casefold()
+        except AttributeError:
             self.search_query = ""
-        if self.search_query or self.history_filter != "all":
-            filtered: list[BrowserEntry] = []
-            for entry in entries:
-                if entry.is_dir:
-                    filtered.append(entry)
-                    continue
-                if self.search_query and self.search_query not in entry.name.casefold():
-                    continue
-                history = self.history.get(entry.path)
-                if self.history_filter == "progress" and not (
-                    history is not None and history.position_ms > 0 and not history.completion_observed
-                ):
-                    continue
-                if self.history_filter == "not-completed" and history is not None and history.completion_observed:
-                    continue
-                filtered.append(entry)
-            entries = filtered
-        self.browser_entries = entries
-        empty = self.query_one("#browser-empty", Static)
-        empty.display = not bool(entries)
-        if not entries:
-            empty.update("No folders or playable videos match the current view.")
-        queued_paths = {entry.path for entry in self.queue.entries()}
-        for index, entry in enumerate(self.browser_entries):
-            selected = entry.path in self.selected_paths
-            marker = "[x]" if selected else "[ ]"
-            icon = "▸" if entry.is_dir else marker
-            classes = "folder-entry" if entry.is_dir else "video-entry"
-            if selected:
-                classes += " selected-video"
-            label = Label(f"{icon} {entry.name}")
-            if entry.is_dir:
-                await browser.append(ListItem(label, classes=classes))
-            else:
-                queued = " · QUEUED" if entry.path in queued_paths else ""
-                history_class = self._history_class(entry.path)
-                await browser.append(
-                    ListItem(
-                        label,
-                        Button("☑" if selected else "☐", id=f"browser-check-{index}"),
-                        Static(f"{self._history_label(entry.path)}{queued}", classes=history_class),
-                        classes=classes,
-                    )
-                )
-        if highlighted_path is not None:
-            restored_index = next(
-                (
-                    index
-                    for index, entry in enumerate(self.browser_entries)
-                    if entry.path == highlighted_path
-                ),
-                None,
-            )
-            browser.index = (
-                restored_index
-                if restored_index is not None
-                else (0 if self.browser_entries else None)
-            )
-        elif self.browser_entries and browser.index is None:
-            browser.index = 0
-        self._refresh_selection_summary()
-        self._refresh_details()
-        self._refresh_controls()
+        self._browser_source_entries = entries
+        self._render_browser_rows()
+        self._schedule_history_refresh(
+            [entry.path for entry in entries if entry.supported],
+            target="browser",
+            expected_browser_path=self.browser_path,
+            force=False,
+        )
 
     @staticmethod
     def _queue_state_class(state: str) -> str:
@@ -930,20 +1071,12 @@ class VLCQApp(App[None]):
             "failed": "queue-failed",
         }.get(state, "queue-failed")
 
-    def _update_queue_row(
-        self, row: QueueListItem, entry: QueueEntry, current_id: int | None
-    ) -> None:
-        is_current = current_id == entry.id
-        state_label = _QUEUE_STATE_LABELS.get(entry.state, f"? {entry.state.upper()}")
-        marker = "◆" if is_current else " "
-        row.query_one(Label).update(f"{marker} {entry.path.name} — {state_label}")
+    def _update_queue_row(self, row: QueueListItem, entry: QueueEntry, current_id: int | None) -> None:
+        row.set_classes(self._queue_state_class(entry.state))
         try:
-            history_widget = row.query_one(".queue-history", Static)
-            history_widget.update(self._history_label(entry.path))
-            history_widget.set_classes(f"queue-history {self._history_class(entry.path)}")
+            row.query_one(".row-label", Label).update(self._queue_renderable(entry, current_id))
         except NoMatches:
             pass
-        row.set_classes(self._queue_state_class(entry.state))
 
     def refresh_queue(
         self, selected_path: Path | None = None, *, selection_captured: bool = False
@@ -958,7 +1091,7 @@ class VLCQApp(App[None]):
             selected_path = (
                 old_entries[selected_index].path
                 if selected_index is not None and 0 <= selected_index < len(old_entries)
-                else None
+                else selected_path
             )
         entries = self.queue.entries()
         queue_paths = [entry.path for entry in entries]
@@ -966,17 +1099,14 @@ class VLCQApp(App[None]):
             queue_paths,
             target="queue",
             expected_queue_ids=tuple(entry.id for entry in entries),
-            force=True,
+            force=False,
         )
         current = self.queue.current()
         current_id = current.id if current is not None else None
         empty = self.query_one("#queue-empty", Static)
         empty.display = not bool(entries)
-
-        # Polling changes row state frequently, but do not replace widgets when
-        # queue identity and order are unchanged. Replacing only for a
-        # structural change keeps highlight and scroll state stable while the
-        # status label and CSS class update in place.
+        if not entries:
+            empty.update("Queue is empty — use Files actions to add a video.")
         rows = list(view.children)
         reuse_rows = len(rows) == len(entries) and all(
             isinstance(row, QueueListItem) and row.entry_id == entry.id
@@ -989,34 +1119,52 @@ class VLCQApp(App[None]):
         else:
             view.clear()
             for entry in entries:
-                state_label = _QUEUE_STATE_LABELS.get(entry.state, f"? {entry.state.upper()}")
-                marker = "◆" if current_id == entry.id else " "
-                row = QueueListItem(
-                    Label(f"{marker} {entry.path.name} — {state_label}"),
-                    Static(self._history_label(entry.path), classes="queue-history"),
-                    classes=self._queue_state_class(entry.state),
-                )
-                row.entry_id = entry.id
-                view.append(row)
+                view.append(QueueListItem(entry, current_id, self._queue_renderable(entry, current_id)))
         if selected_path is not None:
-            restored_index = next(
+            restored = next(
                 (index for index, entry in enumerate(entries) if entry.path == selected_path),
                 None,
             )
-            if restored_index is not None:
-
-                def restore_queue_highlight() -> None:
-                    if view.is_attached and restored_index < len(view.children):
-                        view.index = restored_index
-
-                # ListView.append mounts on the next refresh; restore in the
-                # following event turn so the new child collection is present.
-                self.call_after_refresh(lambda: self.call_later(restore_queue_highlight))
+            if restored is not None:
+                view.index = restored
             elif entries:
                 view.index = 0
         elif entries and view.index is None:
             view.index = 0
-        self._refresh_controls()
+        self._render_headers()
+
+    def refresh_playback(self) -> None:
+        current = self.queue.current()
+        if self.no_vlc:
+            state = current.state if current else "idle"
+            position_ms = 0
+            duration_ms = 0
+            connected = False
+        else:
+            state = self.controller.status.state if current else "idle"
+            position_ms = self.controller.status.position_ms if current else 0
+            duration_ms = self.controller.status.duration_ms if current else 0
+            connected = self.controller.client is not None
+        if current is None:
+            player_text = f"Idle · {'offline' if self.no_vlc else ('connected' if connected else 'disconnected')}"
+        else:
+            total = self._format_time(duration_ms) if duration_ms > 0 else "?"
+            player_text = (
+                f"{state.upper()} · {current.path.name} · {self._format_time(position_ms)} / {total} · "
+                f"{'offline' if self.no_vlc else ('connected' if connected else 'disconnected')}"
+            )
+        percent = min(100.0, position_ms * 100 / duration_ms) if duration_ms > 0 else 0.0
+        try:
+            self.query_one("#player", Static).update(player_text)
+            self.query_one("#progress", ProgressBar).update(progress=percent)
+            self.query_one("#progress-percent", Static).update(
+                f"{round(percent):d}%" if duration_ms > 0 else "?%"
+            )
+            self.query_one("#notice", Static).update(self._notice)
+        except NoMatches:
+            return
+        self._refresh_browser_history()
+        self.refresh_queue()
 
     def _browser_entry(self) -> BrowserEntry | None:
         try:
@@ -1027,48 +1175,56 @@ class VLCQApp(App[None]):
             return None
         return self.browser_entries[view.index]
 
-    def _refresh_controls(self) -> None:
-        """Keep visible actions honest as browser and queue state changes."""
+    def _queue_index(self) -> int | None:
         try:
-            entry = self._browser_entry()
-            self.query_one("#browser-up", Button).disabled = self.browser_path == self.root
-            self.query_one("#browser-select", Button).disabled = not (
-                entry is not None and entry.supported
-            )
-            can_add = bool(self.selected_paths) or (entry is not None and entry.supported)
-            for button_id in ("#browser-add", "#browser-next", "#browser-add-play"):
-                self.query_one(button_id, Button).disabled = not can_add
-            self.query_one("#browser-clear-selection", Button).disabled = not bool(self.selected_paths)
-            queue_entries = self.queue.entries()
-            queue_view = self.query_one("#queue", ListView)
-            has_queue_target = bool(queue_entries) and queue_view.index is not None
-            self.query_one("#queue-next", Button).disabled = not has_queue_target
-            self.query_one("#queue-play", Button).disabled = not has_queue_target
-            self.query_one("#queue-clear", Button).disabled = not bool(queue_entries)
-            self.query_one("#queue-clear-completed", Button).disabled = not any(
-                item.state == "completed" for item in queue_entries
-            )
-            self.query_one("#queue-remove", Button).disabled = not has_queue_target
-            self.query_one("#queue-up", Button).disabled = not has_queue_target
-            self.query_one("#queue-down", Button).disabled = not has_queue_target
-            self.query_one("#queue-undo", Button).disabled = not self.queue.undo_available
+            view = self.query_one("#queue", ListView)
+        except NoMatches:
+            return None
+        entries = self.queue.entries()
+        if view.index is None or not 0 <= view.index < len(entries):
+            return None
+        return view.index
 
-            target = self._details_target()
-            can_start_over = False
-            can_resume = False
-            if target is not None and target.supported and not target.is_dir:
-                can_start_over = True
-                offer = ResumeOffer(self.history.get(target.path))
-                can_resume = not offer.completed and self._offer_requires_choice(offer)
-            self.query_one("#details-resume", Button).disabled = not can_resume
-            self.query_one("#details-start-over", Button).disabled = not can_start_over
-        except (NoMatches, OSError, PathError, RuntimeError):
-            # Refresh calls can happen before Textual has composed the app or
-            # while a file disappears during an asynchronous identity check.
-            return
+    def _queue_selected_path(self) -> Path | None:
+        index = self._queue_index()
+        if index is None:
+            return None
+        return self.queue.entries()[index].path
+
+    def _browser_has_focus(self) -> bool:
+        try:
+            section = self.query_one("#files-section")
+        except NoMatches:
+            return False
+        return self.focused is not None and section in self.focused.ancestors_with_self
+
+    def _queue_has_focus(self) -> bool:
+        try:
+            section = self.query_one("#queue-section")
+        except NoMatches:
+            return False
+        return self.focused is not None and section in self.focused.ancestors_with_self
+
+    def _section_collapsed(self, section: str) -> bool:
+        return self.query_one(f"#{section}-section").has_class("collapsed")
+
+    def _toggle_section(self, section: Literal["files", "queue"]) -> None:
+        container = self.query_one(f"#{section}-section")
+        collapsed = not container.has_class("collapsed")
+        container.set_class(collapsed, "collapsed")
+        if collapsed:
+            self.query_one(f"#{section}-toggle", Button).label = "▸"
+            self.query_one(f"#{section}-toggle", Button).tooltip = f"Expand {section.title()}"
+            focused = self.focused
+            body = self.query_one(f"#{section}-body")
+            if focused is not None and body in focused.ancestors_with_self:
+                self.query_one(f"#{section}-toggle", Button).focus()
+        else:
+            self.query_one(f"#{section}-toggle", Button).label = "▾"
+            self.query_one(f"#{section}-toggle", Button).tooltip = f"Collapse {section.title()}"
+        self._refresh_headers()
 
     def _paths_for_add(self) -> list[Path]:
-        """Return an explicit selection, or the highlighted playable item."""
         if self.selected_paths:
             return sorted(self.selected_paths, key=lambda path: natural_key(str(path)))
         entry = self._browser_entry()
@@ -1077,17 +1233,7 @@ class VLCQApp(App[None]):
         return []
 
     def _queue_path_index(self, path: Path) -> int | None:
-        return next(
-            (index for index, entry in enumerate(self.queue.entries()) if entry.path == path),
-            None,
-        )
-
-    def _queue_selected_path(self) -> Path | None:
-        index = self._queue_index()
-        if index is None:
-            return None
-        entries = self.queue.entries()
-        return entries[index].path
+        return next((index for index, entry in enumerate(self.queue.entries()) if entry.path == path), None)
 
     def _startup_target_index(self) -> int | None:
         entries = self.queue.entries()
@@ -1111,13 +1257,13 @@ class VLCQApp(App[None]):
     def _resume_offer_for_path(self, path: Path) -> ResumeOffer:
         return ResumeOffer(self.database.history_for(path, root=self.root))
 
-    def _offer_requires_choice(self, offer: ResumeOffer) -> bool:
+    @staticmethod
+    def _offer_requires_choice(offer: ResumeOffer) -> bool:
         return not offer.completed and (offer.usable_resume or offer.legacy_fallback)
 
     async def _play_queue_offline(
         self, index: int, *, choice: str | None = None, automatic: bool = False
     ) -> bool:
-        """Apply playback choice semantics when VLC is deliberately disabled."""
         entries = self.queue.entries()
         if not 0 <= index < len(entries):
             raise IndexError("queue index out of range")
@@ -1127,14 +1273,13 @@ class VLCQApp(App[None]):
             if current.state == "paused":
                 self.queue.database.set_state(current.id, "playing")
             return True
-        offer = self.queue.database.history_for(entry.path, root=self.root)
-        resume_offer = ResumeOffer(offer)
-        if resume_offer.completed:
+        offer = ResumeOffer(self.queue.database.history_for(entry.path, root=self.root))
+        if offer.completed:
             self.queue.play_now(index)
             return True
-        if self._offer_requires_choice(resume_offer):
+        if self._offer_requires_choice(offer):
             if choice is None and not automatic:
-                raise ResumeChoiceRequired(resume_offer)
+                raise ResumeChoiceRequired(offer)
             if choice == "cancel":
                 return False
             if choice not in {None, "resume", "start_over"}:
@@ -1143,11 +1288,7 @@ class VLCQApp(App[None]):
         return True
 
     async def _play_queue_index(
-        self,
-        index: int,
-        choice: str | None = None,
-        *,
-        automatic: bool = False,
+        self, index: int, choice: str | None = None, *, automatic: bool = False
     ) -> bool:
         entries = self.queue.entries()
         if not 0 <= index < len(entries):
@@ -1155,30 +1296,20 @@ class VLCQApp(App[None]):
         entry_id = entries[index].id
         try:
             if self.no_vlc:
-                return await self._play_queue_offline(
-                    index, choice=choice, automatic=automatic
-                )
+                return await self._play_queue_offline(index, choice=choice, automatic=automatic)
             if not self._require_vlc_for_play():
                 return False
-            return await self.controller.play_with_policy(
-                index, choice=choice, automatic=automatic
-            )
+            return await self.controller.play_with_policy(index, choice=choice, automatic=automatic)
         except ResumeChoiceRequired as exc:
             def chosen(value: str | None) -> None:
                 if value is None:
                     return
                 current_index = next(
-                    (
-                        position
-                        for position, entry in enumerate(self.queue.entries())
-                        if entry.id == entry_id
-                    ),
+                    (position for position, entry in enumerate(self.queue.entries()) if entry.id == entry_id),
                     None,
                 )
                 if current_index is not None:
-                    self.run_worker(
-                        self._play_queue_index(current_index, choice=value), exclusive=True
-                    )
+                    self.run_worker(self._play_queue_index(current_index, choice=value), exclusive=True)
 
             self.push_screen(ResumePrompt(exc.offer), chosen)
             return False
@@ -1190,9 +1321,7 @@ class VLCQApp(App[None]):
         if choice is None and self._offer_requires_choice(offer):
             def chosen(value: str | None) -> None:
                 if value is not None:
-                    self.run_worker(
-                        self._activate_browser_video(entry, choice=value), exclusive=True
-                    )
+                    self.run_worker(self._activate_browser_video(entry, choice=value), exclusive=True)
 
             self.push_screen(ResumePrompt(offer), chosen)
             return
@@ -1237,9 +1366,7 @@ class VLCQApp(App[None]):
             self.update_status(f"Play failed: {exc}")
             return
         if played:
-            self.update_status(
-                f"{'Resuming' if choice == 'resume' else 'Starting over'} {entry.path.name}"
-            )
+            self.update_status(f"{'Resuming' if choice == 'resume' else 'Starting over'} {entry.path.name}")
             self.refresh_queue()
 
     async def action_resume_highlighted(self) -> None:
@@ -1248,23 +1375,17 @@ class VLCQApp(App[None]):
     async def action_start_over_highlighted(self) -> None:
         await self._play_details_target("start_over")
 
+    async def _open_browser_folder(self, path: Path) -> None:
+        if not is_beneath(path, self.root) or not path.is_dir():
+            self.update_status("Folder is no longer available inside the library root")
+            return
+        self.browser_path = path
+        await self.refresh_browser()
+        self.update_status("Browsing")
+
     async def action_activate(self) -> None:
-        if isinstance(self.screen, RootPrompt):
-            # The app-level priority binding runs before Input.Submitted. Handle
-            # the root value here so the modal remains keyboard-operable.
-            try:
-                value = self.screen.query_one("#root-input", Input).value
-            except NoMatches:
-                return
-            self.screen.dismiss(value)
-            return
-        try:
-            queue_view = self.query_one("#queue", ListView)
-        except NoMatches:
-            # There is no main-screen action to activate while another modal is
-            # open (for example, a confirmation dialog).
-            return
-        if self._queue_has_focus() and queue_view.index is not None:
+        entry = self._browser_entry()
+        if self._queue_has_focus():
             index = self._queue_index()
             if index is None:
                 self.update_status("Nothing is highlighted in the queue")
@@ -1278,20 +1399,16 @@ class VLCQApp(App[None]):
                     self.update_status("Playing highlighted queue item")
             self.refresh_queue()
             return
-        entry = self._browser_entry()
         if entry is None:
             self.update_status("Nothing is highlighted — open a folder or highlight a video")
-            return
-        if entry.is_dir:
-            self.browser_path = entry.path
-            await self.refresh_browser()
-            self.update_status("Browsing")
-            return
-        await self._activate_browser_video(entry)
+        elif entry.is_dir:
+            await self._open_browser_folder(entry.path)
+        else:
+            await self._activate_browser_video(entry)
 
     async def action_parent(self) -> None:
         if not self._browser_has_focus():
-            self.update_status("Parent navigation is available in the browser pane")
+            self.update_status("Parent navigation is available in the Files section")
             return
         if self.browser_path != self.root:
             self.browser_path = self.browser_path.parent
@@ -1300,7 +1417,7 @@ class VLCQApp(App[None]):
 
     async def action_select(self) -> None:
         if not self._browser_has_focus():
-            self.update_status("Select is available in the browser pane")
+            self.update_status("Select is available in the Files section")
             return
         entry = self._browser_entry()
         if entry is None:
@@ -1312,14 +1429,14 @@ class VLCQApp(App[None]):
             else:
                 self.selected_paths.add(entry.path)
                 self.update_status(f"Selected {entry.path.name} ({len(self.selected_paths)} total)")
-            await self.refresh_browser()
+            self._render_browser_rows()
         else:
             self.update_status("Folders cannot be selected; highlight a playable video")
 
     async def action_add_selected(self) -> None:
         paths = self._paths_for_add()
         if not paths:
-            self.update_status("Nothing to add — highlight a playable video or press v to select")
+            self.update_status("Nothing to add — highlight a playable video or select one")
             return
         try:
             self.queue.add(paths)
@@ -1348,7 +1465,7 @@ class VLCQApp(App[None]):
 
     async def action_clear_selection(self) -> None:
         self.selected_paths.clear()
-        await self.refresh_browser()
+        self._render_browser_rows()
         self.update_status("Selection cleared")
 
     async def action_undo(self) -> None:
@@ -1383,7 +1500,7 @@ class VLCQApp(App[None]):
     async def action_add_and_play(self) -> None:
         paths = self._paths_for_add()
         if not paths:
-            self.update_status("Nothing to play — highlight a playable video or press v to select")
+            self.update_status("Nothing to play — highlight a playable video or select one")
             return
         if not self._require_vlc_for_play():
             return
@@ -1391,9 +1508,7 @@ class VLCQApp(App[None]):
         if self._offer_requires_choice(offer):
             def chosen(value: str | None) -> None:
                 if value is not None:
-                    self.run_worker(
-                        self._finish_add_and_play(paths, choice=value), exclusive=True
-                    )
+                    self.run_worker(self._finish_add_and_play(paths, choice=value), exclusive=True)
 
             self.push_screen(ResumePrompt(offer), chosen)
             return
@@ -1406,7 +1521,10 @@ class VLCQApp(App[None]):
             try:
                 self.root = self.queue.open(canonical_root(value))
                 self.browser_path = self.root
+                self._root_generation += 1
                 self.selected_paths.clear()
+                self._history_cache.clear()
+                self.history.clear()
                 self.call_later(self.refresh_browser)
             except PathError as exc:
                 self.update_status(str(exc))
@@ -1466,20 +1584,6 @@ class VLCQApp(App[None]):
             self.update_status(f"Playing {entry.path.name}" if entry else "Queue is empty")
         self.refresh_queue()
 
-    def _browser_has_focus(self) -> bool:
-        try:
-            browser_pane = self.query_one("#browser-pane")
-        except NoMatches:
-            return False
-        return self.focused is not None and browser_pane in self.focused.ancestors_with_self
-
-    def _queue_has_focus(self) -> bool:
-        try:
-            queue_pane = self.query_one("#queue-pane")
-        except NoMatches:
-            return False
-        return self.focused is not None and queue_pane in self.focused.ancestors_with_self
-
     async def action_left(self) -> None:
         if self._browser_has_focus():
             await self.action_parent()
@@ -1495,6 +1599,7 @@ class VLCQApp(App[None]):
 
     async def action_seek(self, seconds: int) -> None:
         if self.no_vlc:
+            self.update_status("Seek unavailable in offline mode")
             return
         if self.controller.client is None:
             self.update_status("VLC unavailable — press r to retry")
@@ -1504,18 +1609,9 @@ class VLCQApp(App[None]):
         except (OSError, VLCError) as exc:
             self.update_status(f"Seek failed: {exc}")
 
-    def _queue_index(self) -> int | None:
-        try:
-            view = self.query_one("#queue", ListView)
-        except NoMatches:
-            return None
-        if view.index is None or not 0 <= view.index < len(self.queue.entries()):
-            return None
-        return view.index
-
     async def action_remove(self) -> None:
         if not self._queue_has_focus():
-            self.update_status("Remove is available in the queue pane")
+            self.update_status("Remove is available in the Queue section")
             return
         index = self._queue_index()
         if index is None:
@@ -1539,7 +1635,7 @@ class VLCQApp(App[None]):
 
     def action_move_down(self) -> None:
         if not self._queue_has_focus():
-            self.update_status("Move is available in the queue pane")
+            self.update_status("Move is available in the Queue section")
             return
         index = self._queue_index()
         if index is None:
@@ -1556,7 +1652,7 @@ class VLCQApp(App[None]):
 
     def action_move_up(self) -> None:
         if not self._queue_has_focus():
-            self.update_status("Move is available in the queue pane")
+            self.update_status("Move is available in the Queue section")
             return
         index = self._queue_index()
         if index is None:
@@ -1573,21 +1669,15 @@ class VLCQApp(App[None]):
 
     async def action_retry(self) -> None:
         if not self._queue_has_focus():
-            self.update_status("Retry is available in the queue pane")
+            self.update_status("Retry is available in the Queue section")
             return
         index = self._queue_index()
         if index is None:
             self.update_status("Nothing is highlighted in the queue")
             return
         try:
-            # Reconnect before changing queue state.  A failed startup should
-            # leave the selected row untouched and make the retry actionable
-            # rather than merely reporting that VLC is disconnected.
             if not self.no_vlc and self.controller.client is None:
                 await self.controller.start()
-            # Validate the file before asking a real VLC client to play it.  The
-            # queue service also preserves a useful ``missing`` state when the
-            # file disappeared, instead of silently advancing to another item.
             entry = self.queue.retry(index)
             if not self.no_vlc:
                 await self.controller.play_index(index)
@@ -1630,112 +1720,513 @@ class VLCQApp(App[None]):
 
         self.push_screen(ConfirmClearAll(), confirmed)
 
-    async def on_button_pressed(self, event: Button.Pressed) -> None:
-        button_id = event.button.id
-        if button_id is None:
-            return
-        if button_id.startswith("browser-check-"):
-            try:
-                row_index = int(button_id.rsplit("-", 1)[1])
-                view = self.query_one("#browser", ListView)
-                view.index = row_index
-                await self.action_select()
-            except (ValueError, IndexError):
-                self.update_status("Selection target is no longer visible")
-        elif button_id == "browser-open":
-            self.action_open_root()
-        elif button_id == "browser-up":
-            await self.action_parent()
-        elif button_id == "browser-select":
-            await self.action_select()
-        elif button_id == "browser-add":
-            await self.action_add_selected()
-        elif button_id == "browser-next":
-            await self.action_play_next_selected()
-        elif button_id == "browser-add-play":
-            await self.action_add_and_play()
-        elif button_id == "browser-clear-selection":
-            await self.action_clear_selection()
-        elif button_id in {"filter-all", "filter-progress", "filter-not-completed"}:
-            self.history_filter = {
-                "filter-all": "all",
-                "filter-progress": "progress",
-                "filter-not-completed": "not-completed",
-            }[button_id]
-            await self.refresh_browser()
-        elif button_id == "browser-sort":
-            self.browser_reverse = not self.browser_reverse
-            await self.refresh_browser()
-        elif button_id == "queue-next":
-            path = self._queue_selected_path()
-            if path is None:
-                self.update_status("Nothing is highlighted in the queue")
-            else:
-                try:
-                    self.queue.play_next([path])
-                except (OSError, PathError, RuntimeError, ValueError) as exc:
-                    self.update_status(f"Play next failed: {exc}")
-                else:
-                    self.refresh_queue(path, selection_captured=True)
-                    self.update_status("Highlighted queue item placed next")
-        elif button_id == "queue-play":
+    def _details_target(self) -> BrowserEntry | None:
+        if self._last_pane == "queue":
             index = self._queue_index()
             if index is None:
-                self.update_status("Nothing is highlighted in the queue")
+                return None
+            entry = self.queue.entries()[index]
+            return BrowserEntry(entry.path, entry.path.name, False, True)
+        return self._browser_entry()
+
+    def _details_text(self, entry: BrowserEntry, history: HistoryProjection | None) -> str:
+        queued = any(item.path == entry.path for item in self.queue.entries())
+        queue_label = "queued" if queued else "not queued"
+        if history is None:
+            return (
+                f"{entry.name}\nFull path: {entry.path}\n{queue_label}\n"
+                "No recorded progress\nResume position: unknown\nFurthest progress: unknown\n"
+                "Duration: unknown\nLast played: unknown"
+            )
+        last_played = history.last_played_at or "unknown"
+        if history.resume_position_ms is not None:
+            resume = self._format_time(history.resume_position_ms)
+        elif history.fallback_resume_position_ms is not None:
+            resume = f"{self._format_time(history.fallback_resume_position_ms)} (furthest recorded fallback)"
+        else:
+            resume = "unknown"
+        return (
+            f"{entry.name}\nFull path: {entry.path}\n{queue_label}\n"
+            f"Resume position: {resume}\nFurthest progress: {self._format_time(history.position_ms)}\n"
+            f"Duration: {self._format_time(history.duration_ms) if history.duration_ms else 'unknown'}\n"
+            f"Last played: {last_played}"
+        )
+
+    async def _open_details(
+        self, entry: BrowserEntry | None = None, *, pane: Literal["browser", "queue"] | None = None
+    ) -> None:
+        target = entry or self._details_target()
+        if pane is not None:
+            details_pane: Literal["browser", "queue"] = pane
+        elif self._last_pane == "queue":
+            details_pane = "queue"
+        else:
+            details_pane = "browser"
+        if target is None or target.is_dir:
+            self.update_status("Nothing playable is highlighted")
+            return
+        await self._load_history([target.path], force=True)
+        history = self.history.get(target.path.resolve(strict=False))
+        offer = ResumeOffer(history)
+
+        def chosen(value: str | None) -> None:
+            if value is not None:
+                self.run_worker(self._dispatch_details_choice(target, value, details_pane), exclusive=True)
+
+        self.push_screen(
+            DetailsPrompt(
+                self._details_text(target, history),
+                can_resume=self._offer_requires_choice(offer),
+                can_start_over=True,
+            ),
+            chosen,
+        )
+
+    async def _dispatch_details_choice(
+        self, entry: BrowserEntry, choice: str, pane: Literal["browser", "queue"]
+    ) -> None:
+        if pane == "queue":
+            index = self._queue_path_index(entry.path)
+            if index is None:
+                self.update_status("Queue item is no longer available")
                 return
-            try:
-                played = await self._play_queue_index(index)
-            except (IndexError, OSError, VLCError) as exc:
-                self.update_status(f"Play failed: {exc}")
-            else:
-                if played:
-                    self.update_status("Playing highlighted queue item")
+            await self._play_queue_index(index, choice=choice)
             self.refresh_queue()
-        elif button_id == "queue-up":
-            self.action_move_up()
-        elif button_id == "queue-down":
-            self.action_move_down()
-        elif button_id == "queue-remove":
-            await self.action_remove()
-        elif button_id == "queue-undo":
-            await self.action_undo()
-        elif button_id == "details-resume":
-            await self.action_resume_highlighted()
-        elif button_id == "details-start-over":
-            await self.action_start_over_highlighted()
-        elif button_id == "queue-sort":
+        else:
+            self._last_pane = "browser"
+            await self._activate_browser_video(entry, choice=choice)
+
+    def _context_library_target(self, entry: BrowserEntry | None = None) -> FileTarget | None:
+        highlighted = entry or self._browser_entry()
+        if highlighted is None:
+            return None
+        selected = tuple(sorted(self.selected_paths, key=lambda path: natural_key(str(path))))
+        return FileTarget(highlighted.path, self._root_generation, selected)
+
+    def _target_batch_label(self, target: FileTarget, verb: str) -> str:
+        paths = target.selected_paths or (target.path,)
+        if len(paths) == 1 and not target.selected_paths:
+            return verb
+        hidden = len(paths) - sum(path in {entry.path for entry in self.browser_entries} for path in paths)
+        suffix = f" ({len(paths)} selected"
+        if hidden:
+            suffix += f", {hidden} hidden"
+        return verb + suffix + ")"
+
+    def _context_actions_for_file(self, target: FileTarget) -> list[ContextAction]:
+        entry = next((item for item in self._browser_source_entries if item.path == target.path), None)
+        if entry is None:
+            entry = BrowserEntry(target.path, target.path.name, target.path.is_dir(), target.path.is_file())
+        actions: list[ContextAction] = []
+        if entry.is_dir:
+            actions.append(ContextAction("open-folder", "Open folder", target))
+        else:
+            offer = self._resume_offer_for_path(entry.path)
+            actions.extend(
+                [
+                    ContextAction("play-now-file", f"Play now · {entry.name}", target),
+                    ContextAction("resume-file", "Resume", target, self._offer_requires_choice(offer)),
+                    ContextAction("start-over-file", "Start over", target),
+                    ContextAction("select-file", "Deselect" if entry.path in self.selected_paths else "Select", target),
+                    ContextAction("add-end-file", self._target_batch_label(target, "Add to end"), target),
+                    ContextAction("play-next-file", self._target_batch_label(target, "Play next"), target),
+                    ContextAction("add-play-file", self._target_batch_label(target, "Add & play"), target),
+                    ContextAction("details-file", "Details", target),
+                ]
+            )
+        return actions
+
+    def _context_actions_for_files_section(self, target: SectionTarget) -> list[ContextAction]:
+        entry = self._browser_entry()
+        file_target = self._context_library_target(entry)
+        actions: list[ContextAction] = []
+        if file_target is not None:
+            actions.extend(self._context_actions_for_file(file_target))
+        actions.extend(
+            [
+                ContextAction("open-root", "Open/change root", target),
+                ContextAction("parent", "Up", target, self.browser_path != self.root),
+                ContextAction("search-filter", "Search / filters…", target),
+                ContextAction("sort-files", "Reverse filename order", target),
+                ContextAction("add-selection", self._batch_label("Add to end"), target, bool(self._paths_for_add())),
+                ContextAction("next-selection", self._batch_label("Play next"), target, bool(self._paths_for_add())),
+                ContextAction("add-play-selection", self._batch_label("Add & play"), target, bool(self._paths_for_add())),
+                ContextAction("clear-selection", "Clear selection", target, bool(self.selected_paths)),
+            ]
+        )
+        return actions
+
+    def _batch_label(self, verb: str) -> str:
+        paths = self._paths_for_add()
+        if not paths:
+            return verb
+        hidden = len(self.selected_paths) - sum(path in {entry.path for entry in self.browser_entries} for path in self.selected_paths)
+        suffix = f" ({len(paths)} selected"
+        if hidden:
+            suffix += f", {hidden} hidden"
+        return verb + suffix + ")"
+
+    def _context_actions_for_queue_section(self, target: SectionTarget) -> list[ContextAction]:
+        actions = [
+            ContextAction("sort-queue", "Sort naturally", target, bool(self.queue.entries())),
+            ContextAction("clear-completed", "Clear completed", target, any(item.state == "completed" for item in self.queue.entries())),
+            ContextAction("clear-all", "Clear queue", target, bool(self.queue.entries())),
+            ContextAction("undo", "Undo latest removal", target, self.queue.undo_available),
+        ]
+        queue_target = self._context_queue_target()
+        if queue_target is not None:
+            actions.extend(self._context_actions_for_queue(queue_target))
+        return actions
+
+    def _context_queue_target(self) -> QueueTarget | None:
+        index = self._queue_index()
+        if index is None:
+            return None
+        return QueueTarget(self.queue.entries()[index].id, self._root_generation)
+
+    def _context_actions_for_queue(self, target: QueueTarget) -> list[ContextAction]:
+        entry = next((item for item in self.queue.entries() if item.id == target.entry_id), None)
+        if entry is None:
+            return []
+        offer = ResumeOffer(self.database.history_for(entry.path, root=self.root))
+        return [
+            ContextAction("play-now-queue", f"Play now · {entry.path.name}", target),
+            ContextAction("resume-queue", "Resume", target, self._offer_requires_choice(offer)),
+            ContextAction("start-over-queue", "Start over", target),
+            ContextAction("play-next-queue", "Play next", target),
+            ContextAction("move-up", "Move up", target),
+            ContextAction("move-down", "Move down", target),
+            ContextAction("remove-queue", "Remove from queue", target),
+            ContextAction("details-queue", "Details", target),
+        ]
+
+    def _context_actions_for_player(self, target: PlayerTarget) -> list[ContextAction]:
+        current = self.queue.current()
+        connected = self.no_vlc or self.controller.client is not None
+        return [
+            ContextAction("pause", "Pause / resume", target, current is not None and connected),
+            ContextAction("previous", "Previous", target, bool(self.queue.entries())),
+            ContextAction("seek-back", "Seek back 10s", target, connected and current is not None),
+            ContextAction("seek-forward", "Seek forward 10s", target, connected and current is not None),
+            ContextAction("next", "Next", target, bool(self.queue.entries())),
+            ContextAction("reconnect", "Reconnect", target, not self.no_vlc),
+            ContextAction("active-details", "Active player details", target, current is not None),
+            ContextAction("last-notice", "Show full last notice", target, len(self._notice) > 0),
+            ContextAction("help", "Help", target),
+            ContextAction("quit", "Quit", target),
+        ]
+
+    def _open_context_menu(
+        self, actions: list[ContextAction], source: Widget | None, x: int | None, y: int | None
+    ) -> None:
+        if not actions:
+            self.update_status("No actions are available here")
+            return
+        self._source_focus = source
+        self.push_screen(
+            ActionMenu(actions, source, x or 1, y or 1),
+            self._context_menu_result,
+        )
+
+    def _open_row_menu(self, row: BrowserListItem | QueueListItem, x: int | None, y: int | None) -> None:
+        if isinstance(row, BrowserListItem):
+            file_target = self._context_library_target(
+                next((entry for entry in self._browser_source_entries if entry.path == row.path), None)
+            )
+            actions = self._context_actions_for_file(file_target) if file_target is not None else []
+        else:
+            queue_target = QueueTarget(row.entry_id, self._root_generation)
+            actions = self._context_actions_for_queue(queue_target)
+        self._open_context_menu(actions, row, x, y)
+
+    def _open_section_menu(self, section: Literal["files", "queue"], source: Widget | None, x: int, y: int) -> None:
+        target = SectionTarget(section, self._root_generation)
+        actions = (
+            self._context_actions_for_files_section(target)
+            if section == "files"
+            else self._context_actions_for_queue_section(target)
+        )
+        self._open_context_menu(actions, source, x, y)
+
+    def _context_menu_result(self, result: ContextAction | None) -> None:
+        source = self._source_focus
+        self._source_focus = None
+        if source is not None and source.is_attached:
+            source.focus()
+        if result is not None:
+            self.run_worker(self._dispatch_context_action(result), exclusive=True)
+
+    def _valid_file_target(self, target: FileTarget) -> bool:
+        if target.root_generation != self._root_generation:
+            self.update_status("Action expired after the library root changed")
+            return False
+        try:
+            path = target.path.resolve(strict=False)
+        except RuntimeError:
+            self.update_status("Action target is no longer valid")
+            return False
+        if not is_beneath(path, self.root):
+            self.update_status("Action refused a path outside the library root")
+            return False
+        if not path.exists():
+            self.update_status("Action target is no longer available")
+            return False
+        if not path.is_file() and not path.is_dir():
+            self.update_status("Action target is not a regular file or folder")
+            return False
+        if path.is_file() and path.suffix.casefold() not in VIDEO_EXTENSIONS:
+            self.update_status("Action target is not a supported video")
+            return False
+        return True
+
+    def _valid_queue_target(self, target: QueueTarget) -> QueueEntry | None:
+        if target.root_generation != self._root_generation:
+            self.update_status("Action expired after the library root changed")
+            return None
+        entry = next((item for item in self.queue.entries() if item.id == target.entry_id), None)
+        if entry is None:
+            self.update_status("Queue action expired because that entry was removed")
+            return None
+        try:
+            stat = entry.path.stat()
+            fingerprint = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+            if fingerprint != self.database.media_fingerprint(entry.media_id):
+                self.update_status("Queue action refused a replaced media file")
+                return None
+        except (OSError, RuntimeError):
+            self.database.set_state(entry.id, "missing")
+            self.update_status("Queue action refused missing media")
+            return None
+        return entry
+
+    async def _dispatch_context_action(self, action: ContextAction) -> None:
+        target = action.target
+        if isinstance(target, FileTarget) and not self._valid_file_target(target):
+            return
+        queue_entry: QueueEntry | None = None
+        if isinstance(target, QueueTarget):
+            queue_entry = self._valid_queue_target(target)
+            if queue_entry is None:
+                return
+        if isinstance(target, SectionTarget) and target.root_generation != self._root_generation:
+            self.update_status("Action expired after the library root changed")
+            return
+        if isinstance(target, PlayerTarget) and target.root_generation != self._root_generation:
+            self.update_status("Player action expired after the library root changed")
+            return
+        key = action.key
+        if key == "files-toggle":
+            self._toggle_section("files")
+        elif key == "queue-toggle":
+            self._toggle_section("queue")
+        elif key == "open-root":
+            self.action_open_root()
+        elif key == "parent":
+            await self.action_parent()
+        elif key == "search-filter":
+            self.action_search_filter()
+        elif key == "sort-files":
+            self.browser_reverse = not self.browser_reverse
+            await self.refresh_browser()
+        elif key in {"add-selection", "add-end-file"}:
+            paths = list(target.selected_paths) if isinstance(target, FileTarget) and target.selected_paths else [target.path] if isinstance(target, FileTarget) else []
+            await self._add_paths(paths)
+        elif key in {"next-selection", "play-next-file", "play-next-queue"}:
+            if isinstance(target, QueueTarget):
+                assert queue_entry is not None
+                paths = [queue_entry.path]
+            elif isinstance(target, FileTarget):
+                paths = list(target.selected_paths) if target.selected_paths else [target.path]
+            else:
+                paths = []
+            await self._play_next_paths(paths)
+        elif key in {"add-play-selection", "add-play-file"}:
+            paths = list(target.selected_paths) if isinstance(target, FileTarget) and target.selected_paths else [target.path] if isinstance(target, FileTarget) else []
+            await self._add_and_play_paths(paths)
+        elif key == "open-folder" and isinstance(target, FileTarget):
+            await self._open_browser_folder(target.path)
+        elif key in {"play-now-file", "resume-file", "start-over-file"} and isinstance(target, FileTarget):
+            browser_entry = BrowserEntry(target.path, target.path.name, False, True)
+            choice = {"resume-file": "resume", "start-over-file": "start_over"}.get(key)
+            if choice == "resume" and not self._offer_requires_choice(self._resume_offer_for_path(browser_entry.path)):
+                self.update_status("No trustworthy resume point is recorded for this video")
+            elif key == "play-now-file":
+                await self._activate_browser_video(browser_entry)
+            else:
+                await self._activate_browser_video(browser_entry, choice=choice)
+        elif key == "select-file" and isinstance(target, FileTarget):
+            if target.path in self.selected_paths:
+                self.selected_paths.remove(target.path)
+            else:
+                self.selected_paths.add(target.path)
+            self._render_browser_rows()
+        elif key == "clear-selection":
+            await self.action_clear_selection()
+        elif key == "details-file" and isinstance(target, FileTarget):
+            await self._open_details(BrowserEntry(target.path, target.path.name, False, True), pane="browser")
+        elif key == "sort-queue":
             selected_path = self._queue_selected_path()
             self.queue.sort_natural()
             self.refresh_queue(selected_path, selection_captured=True)
             self.update_status("Queue sorted naturally")
-        elif button_id == "queue-clear-completed":
+        elif key == "clear-completed":
             self.action_clear_completed()
-        elif button_id == "queue-clear":
+        elif key == "clear-all":
             self.action_clear_all()
-        elif button_id == "player-pause":
+        elif key == "undo":
+            await self.action_undo()
+        elif key in {"play-now-queue", "resume-queue", "start-over-queue"} and isinstance(target, QueueTarget):
+            index = next((i for i, item in enumerate(self.queue.entries()) if item.id == target.entry_id), None)
+            if index is None:
+                return
+            choice = {"resume-queue": "resume", "start-over-queue": "start_over"}.get(key)
+            await self._play_queue_index(index, choice=choice)
+            self.refresh_queue()
+        elif key == "move-up":
+            self.action_move_up()
+        elif key == "move-down":
+            self.action_move_down()
+        elif key == "remove-queue":
+            await self.action_remove_target(target)
+        elif key == "details-queue" and isinstance(target, QueueTarget):
+            current_entry = next((item for item in self.queue.entries() if item.id == target.entry_id), None)
+            if current_entry is not None:
+                await self._open_details(BrowserEntry(current_entry.path, current_entry.path.name, False, True), pane="queue")
+        elif key == "pause":
             await self.action_pause()
-        elif button_id == "player-back":
-            await self.action_seek(-10)
-        elif button_id == "player-forward":
-            await self.action_seek(10)
-        elif button_id == "player-next":
-            await self.action_next()
-        elif button_id == "player-previous":
+        elif key == "previous":
             await self.action_previous()
-        elif button_id == "player-reconnect":
-            if self.no_vlc:
-                self.update_status("VLC controls are disabled in offline mode")
-            else:
-                try:
-                    await self.controller.reconnect()
-                except (OSError, VLCError) as exc:
-                    self.update_status(f"Reconnect failed: {exc}")
-                else:
-                    self.update_status("VLC reconnected; playback was not restarted")
-        elif button_id == "app-help":
+        elif key == "next":
+            await self.action_next()
+        elif key == "seek-back":
+            await self.action_seek(-10)
+        elif key == "seek-forward":
+            await self.action_seek(10)
+        elif key == "reconnect":
+            await self.action_reconnect()
+        elif key == "active-details":
+            current = self.queue.current()
+            if current is not None:
+                await self._open_details(BrowserEntry(current.path, current.path.name, False, True), pane="queue")
+        elif key == "last-notice":
+            self.push_screen(NoticePrompt(self._notice))
+        elif key == "help":
             self.action_help()
-        elif button_id == "app-quit":
+        elif key == "quit":
             self.action_quit_app()
+
+    async def _add_paths(self, paths: list[Path]) -> None:
+        if not paths:
+            self.update_status("Nothing to add")
+            return
+        try:
+            self.queue.add(paths)
+        except (OSError, PathError, RuntimeError, ValueError) as exc:
+            self.update_status(f"Add failed: {exc}")
+            return
+        self.selected_paths.difference_update(paths)
+        await self.refresh_browser()
+        self.refresh_queue()
+        self.update_status(f"Added {len(paths)} video{'s' if len(paths) != 1 else ''} to queue")
+
+    async def _play_next_paths(self, paths: list[Path]) -> None:
+        if not paths:
+            self.update_status("Nothing to place next")
+            return
+        try:
+            self.queue.play_next(paths)
+        except (OSError, PathError, RuntimeError, ValueError) as exc:
+            self.update_status(f"Play next failed: {exc}")
+            return
+        self.selected_paths.difference_update(paths)
+        await self.refresh_browser()
+        self.refresh_queue()
+        self.update_status(f"Placed {len(paths)} video{'s' if len(paths) != 1 else ''} next")
+
+    async def _add_and_play_paths(self, paths: list[Path]) -> None:
+        if not paths:
+            self.update_status("Nothing to play")
+            return
+        if not self._require_vlc_for_play():
+            return
+        offer = self._resume_offer_for_path(paths[0])
+        if self._offer_requires_choice(offer):
+            def chosen(value: str | None) -> None:
+                if value is not None:
+                    self.run_worker(self._finish_add_and_play(paths, choice=value), exclusive=True)
+
+            self.push_screen(ResumePrompt(offer), chosen)
+            return
+        await self._finish_add_and_play(paths)
+
+    def action_search_filter(self) -> None:
+        def chosen(value: tuple[str, str] | None) -> None:
+            if value is None:
+                return
+            self.search_query, self.history_filter = value[0].casefold(), value[1]
+            self.run_worker(self.refresh_browser(), exclusive=True)
+
+        self.push_screen(SearchFilterPrompt(self.search_query, self.history_filter), chosen)
+
+    async def action_remove_target(self, target: ContextTarget) -> None:
+        if not isinstance(target, QueueTarget):
+            return
+        entries = self.queue.entries()
+        index = next((i for i, item in enumerate(entries) if item.id == target.entry_id), None)
+        if index is None:
+            self.update_status("Queue action expired because that entry was removed")
+            return
+        queue = self.query_one("#queue", ListView)
+        queue.index = index
+        await self.action_remove()
+
+    async def action_reconnect(self) -> None:
+        if self.no_vlc:
+            self.update_status("VLC controls are disabled in offline mode")
+            return
+        try:
+            await self.controller.reconnect()
+        except (OSError, VLCError) as exc:
+            self.update_status(f"Reconnect failed: {exc}")
+        else:
+            self.update_status("VLC reconnected; playback was not restarted")
+
+    def action_context_menu(self) -> None:
+        if self._browser_has_focus():
+            source = self.focused
+            self._open_section_menu("files", source, source.region.x if source else 1, source.region.y if source else 1)
+        elif self._queue_has_focus():
+            source = self.focused
+            self._open_section_menu("queue", source, source.region.x if source else 1, source.region.y if source else 1)
+        else:
+            source = self.query_one("#player-menu", Button)
+            current = self.queue.current()
+            self._open_context_menu(
+                self._context_actions_for_player(PlayerTarget(current.path if current else None, self._root_generation)),
+                source,
+                source.region.x,
+                source.region.y,
+            )
+
+    def action_toggle_files(self) -> None:
+        self._toggle_section("files")
+
+    def action_toggle_queue(self) -> None:
+        self._toggle_section("queue")
+
+    def action_help(self) -> None:
+        self.push_screen(HelpPrompt())
+
+    async def _finish_quit(self, choice: str) -> None:
+        await self.controller.stop(stop_vlc=choice == "stop")
+        self.exit()
+
+    def action_quit_app(self) -> None:
+        def chosen(value: str | None) -> None:
+            if value:
+                self.run_worker(self._finish_quit(value), exclusive=True)
+
+        self.push_screen(QuitPrompt(), chosen)
 
     def action_clear_completed(self) -> None:
         if not any(entry.state == "completed" for entry in self.queue.entries()):
@@ -1746,6 +2237,7 @@ class VLCQApp(App[None]):
             if not value:
                 self.update_status("Clear cancelled")
                 return
+
             async def clear() -> None:
                 try:
                     current = self.queue.current()
@@ -1768,25 +2260,33 @@ class VLCQApp(App[None]):
 
         self.push_screen(ConfirmClear(), confirmed)
 
-    def action_help(self) -> None:
-        self.notify(
-            "o open · Enter open/play · Backspace parent · v select · a add · A add/play · "
-            "Space pause · n/p next/previous · arrows seek · d remove · J/K reorder",
-            title="vlcq keys",
-            timeout=8,
-        )
-
-    async def _finish_quit(self, choice: str) -> None:
-        await self.controller.stop(stop_vlc=choice == "stop")
-        self.exit()
-
-    def action_quit_app(self) -> None:
-        if self.no_vlc:
-            self.exit()
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        button = event.button
+        button_id = button.id
+        if button.has_class("browser-check"):
+            row = self._row_ancestor(button)
+            if isinstance(row, BrowserListItem):
+                view = self.query_one("#browser", ListView)
+                view.index = list(view.children).index(row)
+                await self.action_select()
             return
+        if button_id == "files-toggle":
+            self.action_toggle_files()
+        elif button_id == "queue-toggle":
+            self.action_toggle_queue()
+        elif button_id == "files-actions":
+            self._open_section_menu("files", button, button.region.x, button.region.y)
+        elif button_id == "queue-actions":
+            self._open_section_menu("queue", button, button.region.x, button.region.y)
+        elif button_id == "player-menu":
+            current = self.queue.current()
+            self._open_context_menu(
+                self._context_actions_for_player(PlayerTarget(current.path if current else None, self._root_generation)),
+                button,
+                button.region.x,
+                button.region.y,
+            )
 
-        def chosen(value: str | None) -> None:
-            if value:
-                self.run_worker(self._finish_quit(value), exclusive=True)
-
-        self.push_screen(QuitPrompt(), chosen)
+    async def action_open_root_from_menu(self) -> None:
+        self.action_open_root()

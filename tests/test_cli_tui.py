@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 import pytest
-from textual.widgets import Button, Input, Label, ListView, ProgressBar, Static
+from textual.widgets import Button, Input, Label, ListView, Static
 
 import vlcq.cli
 import vlcq.tui as tui_module
@@ -192,13 +192,11 @@ async def test_tui_browse_select_add_and_parent_without_auto_enqueue(tmp_path: P
     async with app.run_test(size=(120, 40)) as pilot:
         assert db.queue_entries() == []
         browser = app.query_one("#browser", ListView)
-        assert app.query_one("#browser-up", Button)
-        assert app.query_one("#browser-sort", Button)
-        assert app.query_one("#queue-clear", Button)
-        assert app.query_one("#queue-sort", Button)
+        assert app.query_one("#files-actions", Button)
+        assert app.query_one("#queue-actions", Button)
         browser.focus()
         await pilot.pause()
-        assert app.query_one("#browser-pane").has_class("focused")
+        assert app.query_one("#files-section").has_class("focused")
         browser.index = 0
         await pilot.press("right")
         assert app.browser_path == season.resolve()
@@ -208,17 +206,22 @@ async def test_tui_browse_select_add_and_parent_without_auto_enqueue(tmp_path: P
         assert [e.path.name for e in app.queue.entries()] == ["e1.mkv"]
         await pilot.press("left")
         assert app.browser_path == root.resolve()
-        await pilot.click("#browser-sort")
+        await pilot.click("#files-actions")
+        await pilot.pause()
+        reverse = next(button for button in app.screen.query(Button) if str(button.label) == "Reverse filename order")
+        await pilot.click(reverse)
         assert app.browser_reverse is True
-        await pilot.click("#queue-sort")
-        assert app.query_one("#queue-pane").has_class("focused")
-        await pilot.click("#queue-play")
-        assert app.queue.current() is not None
-        await pilot.click("#queue-clear")
+        await pilot.click("#queue-actions")
+        await pilot.pause()
+        queue_sort = next(button for button in app.screen.query(Button) if str(button.label) == "Sort naturally")
+        await pilot.click(queue_sort)
+        assert app.query_one("#queue-section").has_class("focused")
+        await pilot.click("#queue-actions")
+        await pilot.pause()
+        clear = next(button for button in app.screen.query(Button) if str(button.label) == "Clear queue")
+        await pilot.click(clear)
         await pilot.press("y")
         assert app.queue.entries() == []
-        await app.query_one("#progress", ProgressBar).remove()
-        app.refresh_playback()  # timers may race safely with screen teardown
     db.close()
 
 
@@ -240,17 +243,15 @@ async def test_tui_lists_scroll_to_show_long_names_and_all_rows(tmp_path: Path) 
             view = app.query_one(selector, ListView)
             assert view.styles.overflow_x == "auto"
             assert view.styles.overflow_y == "auto"
-            assert view.show_horizontal_scrollbar
             assert view.show_vertical_scrollbar
-            assert view.max_scroll_x > 0
             assert view.max_scroll_y > 0
-            view.scroll_to(x=view.max_scroll_x, animate=False)
-            await pilot.pause()
-            assert view.scroll_x == view.max_scroll_x
+            assert len(view.displayed_children) >= 5
+            assert all(row.region.height == 1 for row in view.displayed_children[:5])
 
         browser = app.query_one("#browser", ListView)
         rendered_names = [str(row.query_one(Label).renderable) for row in browser.children]
-        assert f"[ ] {long_name}" in rendered_names
+        assert any(long_name in rendered_name for rendered_name in rendered_names)
+        assert browser.children[0].query_one(".browser-check", Button).region.width <= 3
 
         left = next(binding for binding in app.BINDINGS if binding.key == "left")
         right = next(binding for binding in app.BINDINGS if binding.key == "right")
@@ -407,8 +408,7 @@ async def test_tui_direct_enter_consumes_only_activated_selection(tmp_path: Path
         assert app.queue.current().path == second.resolve()
         assert second.resolve() not in app.selected_paths
         await pilot.pause()
-        selected_label = str(browser.children[1].query_one(Label).renderable)
-        assert selected_label.startswith("[ ]")
+        assert str(browser.children[1].query_one(".browser-check", Button).label) == "☐"
     db.close()
 
 
@@ -431,7 +431,7 @@ async def test_play_when_client_missing_shows_retry_status(tmp_path: Path) -> No
 
         await app.action_activate()
 
-        rendered = str(app.query_one("#status", Static).renderable)
+        rendered = str(app.query_one("#notice", Static).renderable)
         assert "VLC unavailable — press r to retry" in rendered
         assert "VLC is not connected" not in rendered
         app.no_vlc = True
@@ -510,7 +510,7 @@ async def test_tui_retry_reconnects_when_vlc_is_disconnected(
 
         monkeypatch.setattr(app.controller, "start", failed_reconnect)
         await app.action_retry()
-        assert "Retry failed" in str(app.query_one("#status", Static).renderable)
+        assert "Retry failed" in str(app.query_one("#notice", Static).renderable)
         app.no_vlc = True
     db.close()
 
@@ -528,18 +528,32 @@ async def test_tui_search_filters_without_queueing_or_shortcut_leakage(tmp_path:
     app = VLCQApp(root=root, database=db, no_vlc=True)
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
-        search = app.query_one("#browser-search", Input)
+        app.action_search_filter()
+        await pilot.pause()
+        search = app.query_one("#search-input", Input)
         search.focus()
         await pilot.press("a", "1")
+        await pilot.click("#search-apply")
         await pilot.pause()
-        assert search.value == "a1"
+        assert app.search_query == "a1"
         assert [entry.name for entry in app.browser_entries] == ["alpha1.mkv"]
         assert app.queue.entries() == []
 
-        search.value = ""
-        await pilot.click("#filter-progress")
+        app.action_search_filter()
+        await pilot.pause()
+        await pilot.click("#search-clear")
+        await pilot.pause()
+        app.action_search_filter()
+        await pilot.pause()
+        await pilot.click("#search-filter-progress")
+        await pilot.click("#search-apply")
+        await pilot.pause()
         assert [entry.name for entry in app.browser_entries] == ["alpha1.mkv"]
-        await pilot.click("#filter-not-completed")
+        app.action_search_filter()
+        await pilot.pause()
+        await pilot.click("#search-filter-not-completed")
+        await pilot.click("#search-apply")
+        await pilot.pause()
         assert {entry.name for entry in app.browser_entries} == {"alpha1.mkv", "episode2.mkv"}
     db.close()
 
@@ -648,12 +662,18 @@ async def test_tui_direct_resume_and_start_over_target_highlighted_item(tmp_path
     app = VLCQApp(root=root, database=db, no_vlc=True)
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
+        await app._open_details()
+        await pilot.pause()
         assert not app.query_one("#details-resume", Button).disabled
         await pilot.click("#details-resume")
+        await pilot.pause()
         assert app.queue.current() is not None
         assert app.queue.current().path == video.resolve()
         app.queue.database.set_state(app.queue.current().id, "paused")
+        await app._open_details()
+        await pilot.pause()
         await pilot.click("#details-start-over")
+        await pilot.pause()
         assert app.queue.current() is not None
         assert app.queue.current().state == "playing"
     db.close()
@@ -666,11 +686,10 @@ async def test_tui_empty_feedback_and_queue_state_indicators(tmp_path: Path) -> 
     db = Database(tmp_path / "db.sqlite3")
     app = VLCQApp(root=root, database=db, no_vlc=True)
     async with app.run_test(size=(120, 40)) as pilot:
-        assert app.query_one("#browser-empty", Static).display
+        assert app.query_one("#files-empty", Static).display
         assert app.query_one("#queue-empty", Static).display
-        assert app.query_one("#browser-add", Button).disabled
         await pilot.press("a")
-        assert "Nothing to add" in str(app.query_one("#status", Static).renderable)
+        assert "Nothing to add" in str(app.query_one("#notice", Static).renderable)
 
         paths = []
         for index in range(8):

@@ -8,6 +8,7 @@ Observed implementation:
 - `PlaybackController.play_index()` sends `in_play` without seeking to saved progress. CLI `resume` restores the saved root but does not implement the resume-position offer required by the existing spec. This change closes that gap rather than treating the spec as proof of existing behavior.
 - Queue removal and clear mutate the database without coordinating with VLC. Polling and UI commands can interleave. `start()` can create another polling task; process lifecycle needs an idempotent recovery boundary.
 - Textual toolbars exist, but dialogs are label-and-keybinding screens, Add lives in the queue pane while targeting the browser, and the app has no explicit row activation mouse contract.
+- Verification found that `resume` targets queue index zero rather than the persisted current entry, queue-row clicks can activate playback, and an eager mount-time queue refresh can reuse rows before their children mount. Rendering also synchronously validates each file and reads history per path, so it can block input despite the intended projection design.
 
 ## Goals / Non-Goals
 
@@ -29,7 +30,7 @@ Alternative rejected: reinterpret `position_ms` as last position. That would bre
 
 ### 2. Use bulk, non-mutating history projections
 
-Add a typed history projection keyed by canonical path and fingerprint, and a batch SELECT path that never calls `ensure_media()`. Validate browser file identities asynchronously, then perform SQLite access on its owning thread; do not move the existing connection into arbitrary worker threads. Fetch only relevant displayed-folder and active-queue history, with bounded batches. Cache projections for the current view and invalidate on actual progress changes or file identity changes.
+Add a typed history projection keyed by canonical path and fingerprint, and a batch SELECT path that never calls `ensure_media()`. Validate browser file identities asynchronously, then perform SQLite access on its owning thread; do not move the existing connection into arbitrary worker threads. Fetch only relevant displayed-folder and active-queue history in bounded batches. Cache projections for the current view and invalidate on actual progress changes or file identity changes. Queue and browser refreshes must defer row reuse until mounted children exist; unchanged projections update existing labels without replacing row widgets.
 
 History categories are derived: Completed takes precedence, positive maximum without completion is In progress, otherwise No recorded progress. Missing data is not zero-duration evidence. A details region shows last position, maximum reached, and last played; the active player always uses live status for the matching media.
 
@@ -43,7 +44,7 @@ Centralize UI and CLI-originated playback operations through the controller. Use
 
 Before transitions, attempt bounded final status capture, retaining the last trustworthy cached observation on failure. Starting an item validates root/fingerprint, issues playback, waits with a bounded timeout for the expected media identity, then performs validated absolute seek for Resume. Do not seek on a response still naming the previous media. Relative/absolute seek invalidates prior near-end evidence; only fresh post-seek observations can establish natural completion. Seek failure remains visible and does not claim a successful resume.
 
-Explicit Play now/Enter on an inactive incomplete item opens Resume / Start over / Cancel before any insertion or reorder. Direct Resume and Start over buttons encode that choice already. Activating the current item does not reload it; paused current media resumes. Natural advancement and explicit Next/Previous use saved resume for incomplete items without modal prompts; completed items replay from zero. Batch add-and-play resolves the first target's decision before committing the batch, so Cancel has no side effects.
+Explicit Play now/Enter on an inactive incomplete item opens Resume / Start over / Cancel before any insertion or reorder. Direct Resume and Start over controls in selected-item details encode that choice without requiring a modal. `vlcq resume` resolves the persisted current queue identity when it is unfinished, then falls back to the first unfinished entry; it never treats index zero as the saved target. Activating the current item does not reload it; paused current media resumes. Natural advancement and explicit Next/Previous use saved resume for incomplete items without modal prompts; completed items replay from zero. Batch add-and-play resolves the first target's decision before committing the batch, so Cancel has no side effects.
 
 Alternative rejected: add seek only in the TUI. Automatic advancement and CLI resume would then disagree, and stale polls would still corrupt resume intent.
 
@@ -63,7 +64,7 @@ Alternative rejected: keep playing after removal. That requires a separate detac
 
 ### 6. Separate library, queue, selected details, and active player
 
-Library controls target the explicit selection or highlighted playable video. Queue controls target the highlighted queue identity. The player bar targets active playback regardless of pane focus. Keep existing keyboard commands, add discoverable keyboard access for new commands, and suspend app-level character shortcuts while editing input fields. Row click highlights; checkbox click toggles selection without triggering playback. Explicit Open/Play controls avoid reliance on double-click timing or terminal-specific right-click behavior.
+Library controls target the explicit selection or highlighted playable video; no library-selection action is rendered in the queue pane. Queue controls target the highlighted queue identity. The player bar targets active playback regardless of pane focus. Keep existing keyboard commands, add discoverable keyboard access for new commands, and suspend app-level character shortcuts while editing input fields. A click on any video or queue row only updates highlight and details; only a browser directory row opens a folder, and only an explicit Open/Play control activates playback. Checkbox clicks toggle selection without triggering playback. Explicit Open/Play controls avoid reliance on double-click timing or terminal-specific right-click behavior.
 
 All dialogs get buttons and cancel paths, including folder entry, resume, clearing, help, and quit. An in-app folder chooser browses allowed directory choices by mouse and allows typed paths as an alternative. Reconnect is always reachable when disconnected, independent of highlighted entries; it retires stale clients/tasks and reconciles owned-process identity before starting another process. Recovery does not autoplay.
 
@@ -84,7 +85,9 @@ Wide layout:
 +-------------------------------------------------------+
 ```
 
-At 80x24, use compact pane controls and a clickable overflow action menu/details modal instead of wide fixed-width toolbars. All essential actions remain mouse-reachable. Preserve existing row reuse and restore highlight by identity after structural changes. Preserve horizontal/vertical scrolling for long names. Progress-track clicks map clamped coordinates to duration only with trustworthy active status; dragging is deferred.
+At 80x24, use compact pane controls and a clickable overflow action menu/details modal instead of wide fixed-width toolbars. All essential actions, including direct Resume and Start over, remain mouse-reachable. Preserve existing row reuse and restore highlight by identity after structural changes. Preserve horizontal/vertical scrolling for long names. Progress-track clicks map clamped coordinates to duration only with trustworthy active status; dragging is deferred.
+
+Queue mutations and root changes return whether they invalidated an available undo snapshot. The TUI immediately displays that expiration; a later Undo click remains a secondary confirmation, not the first feedback.
 
 Alternative rejected: put all controls in one global toolbar. Target ambiguity would remain and narrow terminals would worsen it.
 
@@ -93,7 +96,7 @@ Alternative rejected: put all controls in one global toolbar. Target ambiguity w
 - Legacy history lacks a true last position/time -> retain unknown timestamps and label the maximum-position fallback explicitly.
 - VLC replies may identify old media or report transient zero -> generation checks, expected-media readiness, bounded timeouts, and regression tests with delayed replies.
 - Stop-before-remove cannot make HTTP and SQLite one atomic transaction -> stop first, commit second, retain visible stopped entries on storage failure.
-- Richer rows can increase render/database cost -> bulk read-only projections, asynchronous filesystem checks, cached view data, and stable row identities.
+- Richer rows can increase render/database cost or race widget mounting -> bounded bulk read-only projections, asynchronous filesystem checks, cached view data, and mount-safe stable row updates.
 - Mouse interactions vary across terminals -> Textual Pilot click tests plus manual macOS terminal verification at 80x24 and a wide size; no drag/right-click dependency.
 - Existing natural-end inference is simple -> preserve conservative history semantics and test seeks around completion; do not expand into watch-coverage analytics.
 - Single-level undo can expire during autoplay -> clearly communicate expiration; never silently restore against a changed queue.
@@ -101,8 +104,8 @@ Alternative rejected: put all controls in one global toolbar. Target ambiguity w
 ## Migration Plan
 
 1. Implement and test explicit transactional v1-to-v2 migration, preserving all old columns, queues, fingerprints, maxima, completion flags, and export values. Failure rolls back and preserves the database with actionable guidance.
-2. Add read models and controller transitions before wiring the UI; verify fake-client ordering and malformed/stale response handling.
-3. Add mouse/keyboard UI behavior and CLI resume offer. Update README with progress-label meaning, resume choices, active removal behavior, and undo limitations.
-4. Run normal pytest, ruff, and `mypy src`; run an opt-in real VLC test using temporary generated media for resume seek, pause, seek, stop/removal, reconnect, and clean shutdown. Keep credentials and user history out of evidence.
+2. Add read models and controller transitions before wiring the UI; verify fake-client ordering, malformed/stale response handling, persisted-current resume resolution, and mount-safe refresh behavior.
+3. Add mouse/keyboard UI behavior and CLI resume offer. Verify browser-only directory activation, non-playing queue/video row clicks, direct Resume/Start over controls, pane-local targeting, asynchronous history refresh, and immediate undo-expiration notices. Update README with progress-label meaning, resume choices, active removal behavior, and undo limitations.
+4. Run normal pytest, ruff, and `mypy src`; run an opt-in real VLC test using temporary generated media for persisted resume seek, rewind, pause, natural advancement, stop/removal, reconnect, and clean shutdown. Record environmental skips and manual 80x24 and wide-terminal mouse results. Keep credentials and user history out of evidence.
 5. Before release testing on user data, create a consistent private SQLite backup using its backup API. Downgrading to a schema-v1 binary requires restoring that backup; do not decrement user_version or discard v2 fields in place. Document that restoring a backup loses observations recorded after the backup.
 6. Reinstall the implemented CLI globally using the project workflow and verify its resolved command. This step belongs to implementation, not this planning-only change.

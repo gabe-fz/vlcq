@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Resume and progress export
-`vlcq resume` SHALL restore the most recent unfinished queue and offer to resume its current item at its last trustworthy persisted playback position, with Start over and Cancel alternatives. Explicit playback of a different partially played item SHALL offer the same choice; activating the already playing or paused item SHALL not reload it. Start over SHALL preserve historical maximum progress and completion. `vlcq progress --root <path> --json` SHALL retain its version-1 document and existing field meanings, keyed by validated root-relative paths with position, duration, watched percentage, completion status, and observation time. It MUST NOT include records outside the canonical requested root, and consumers SHALL use this command rather than depend on the SQLite schema.
+`vlcq resume` SHALL restore the persisted current queue entry when it remains unfinished, or otherwise the first unfinished entry, and offer to resume that target at its last trustworthy persisted playback position, with Start over and Cancel alternatives. Explicit playback of a different partially played item SHALL offer the same choice; activating the already playing or paused item SHALL not reload it. Start over SHALL preserve historical maximum progress and completion. `vlcq progress --root <path> --json` SHALL retain its version-1 document and existing field meanings, keyed by validated root-relative paths with position, duration, watched percentage, completion status, and observation time. It MUST NOT include records outside the canonical requested root, and consumers SHALL use this command rather than depend on the SQLite schema.
 
 #### Scenario: Export a bounded root
 - **WHEN** a consumer requests JSON progress for a canonical root
@@ -10,6 +10,14 @@
 #### Scenario: Resume after rewinding
 - **WHEN** the user reached 40 minutes, deliberately rewound to 20 minutes, and later requests resume
 - **THEN** Resume uses the last trustworthy playback position near 20 minutes while exported maximum progress remains at least 40 minutes
+
+#### Scenario: Resume the persisted current entry
+- **WHEN** a saved unfinished queue has a persisted current entry that is not its first entry
+- **THEN** `vlcq resume`, including offline mode, targets that current entry rather than queue index zero
+
+#### Scenario: Resume without a current entry
+- **WHEN** a saved queue has no persisted current entry
+- **THEN** `vlcq resume` targets its first unfinished entry
 
 #### Scenario: Cancel explicit playback
 - **WHEN** the user cancels a Resume / Start over choice
@@ -20,7 +28,7 @@
 - **THEN** it starts from zero without clearing completion history
 
 ### Requirement: TUI controls and non-destructive actions
-The TUI SHALL support opening/changing root (`o`), browser navigation (arrows and Backspace), opening or playing (`Enter`), toggling selection (`v`), add (`a`), add-and-play (`A`), play/pause (`Space`), queue-only removal (`d`/Delete), reorder (`J`/`K`), next (`n`), previous (`p`), seek (Left/`[`/`]` as context permits), retry (`r`), clear completed (`c`), help (`?`), and quit (`q`) with an explicit VLC-process choice. Library-selection actions SHALL appear in the library pane; queue-item actions SHALL appear in the queue pane. Visible controls SHALL provide Add to end, Play next, Play now, Resume, Start over, transport, reconnect, removal, reordering, and undo when applicable. Clearing the full queue or completed entries SHALL require confirmation. No queue control SHALL delete or modify an underlying media file. Text-entry fields SHALL receive ordinary typing without triggering global playback or navigation shortcuts.
+The TUI SHALL support opening/changing root (`o`), browser navigation (arrows and Backspace), opening or playing (`Enter`), toggling selection (`v`), add (`a`), add-and-play (`A`), play/pause (`Space`), queue-only removal (`d`/Delete), reorder (`J`/`K`), next (`n`), previous (`p`), seek (Left/`[`/`]` as context permits), retry (`r`), clear completed (`c`), help (`?`), and quit (`q`) with an explicit VLC-process choice. Library-selection actions SHALL appear only in the library pane and target the explicit selection or highlighted library video; queue-item actions SHALL appear only in the queue pane and target its highlighted queue entry. Visible contextual controls SHALL provide Add to end, Play next, Play now, Resume, Start over, transport, reconnect, removal, reordering, and undo when applicable. Resume and Start over SHALL be directly available for the highlighted partially played item as well as in a choice dialog. Clearing the full queue or completed entries SHALL require confirmation. No queue control SHALL delete or modify an underlying media file. Text-entry fields SHALL receive ordinary typing without triggering global playback or navigation shortcuts.
 
 #### Scenario: Remove a queue item
 - **WHEN** the user removes or clears an item from the queue
@@ -34,10 +42,14 @@ The TUI SHALL support opening/changing root (`o`), browser navigation (arrows an
 - **WHEN** a text field has focus and the user types characters that are also application shortcuts
 - **THEN** those characters edit the field without playing, queueing, seeking, or quitting
 
+#### Scenario: Use pane-local controls
+- **WHEN** the user invokes a visible control from the library or queue pane
+- **THEN** it targets only that pane's declared selection or highlighted object and does not use an object from the other pane
+
 ## ADDED Requirements
 
 ### Requirement: Read-only watch-history presentation
-Library and queue rows SHALL distinguish No recorded progress, In progress, and Completed independently of queue state. Completion SHALL require recorded completion evidence; percentages SHALL describe furthest progress reached, not measured viewing coverage. Rows SHALL expose known progress and already-queued membership, and selected-item details SHALL show resume position, furthest progress, known duration, and last trustworthy playback time. Missing history and duration SHALL be shown as unknown rather than fabricated zero-time evidence. Displaying history SHALL neither create media records nor change observation timestamps and SHALL match the current canonical file fingerprint.
+Library and queue rows SHALL distinguish No recorded progress, In progress, and Completed independently of queue state. Completion SHALL require recorded completion evidence; percentages SHALL describe furthest progress reached, not measured viewing coverage. Rows SHALL expose known progress and already-queued membership, and selected-item details SHALL show resume position, furthest progress, known duration, and last trustworthy playback time. Missing history and duration SHALL be shown as unknown rather than fabricated zero-time evidence. Displaying history SHALL neither create media records nor change observation timestamps and SHALL match the current canonical file fingerprint. Routine history refresh SHALL validate file identities without blocking input, use bounded read-only retrieval for the visible folder and queue, and preserve unchanged row identity, highlight, and scrolling.
 
 #### Scenario: Browse an unplayed file
 - **WHEN** a valid video has no matching playback history
@@ -50,6 +62,10 @@ Library and queue rows SHALL distinguish No recorded progress, In progress, and 
 #### Scenario: Replacement at an existing path
 - **WHEN** a video's fingerprint differs from the stored media fingerprint
 - **THEN** neither its history display nor its resume action inherits the previous file's progress
+
+#### Scenario: Refresh history while identity checks are delayed
+- **WHEN** filesystem identity validation is delayed while a user types, highlights a row, or scrolls
+- **THEN** the interaction remains responsive and unchanged rows retain their identity, highlight, and scroll position
 
 ### Requirement: Library discovery and selection visibility
 The library SHALL provide case-insensitive filename search and All, In progress, and Not completed filters within the current folder. In progress SHALL mean positive recorded progress without completion; Not completed SHALL include files without history. Directories SHALL remain available for navigation. Filtering SHALL NOT enqueue media or silently discard selections. A persistent summary SHALL show selected count and selections hidden by filtering or located in other folders, with a clear-selection action. Action targeting SHALL distinguish highlighted-item playback from explicit batch queueing.
@@ -101,14 +117,14 @@ Single-clicking a row SHALL highlight it without changing playback. Browser vide
 
 #### Scenario: Click an inactive row
 - **WHEN** the user single-clicks a different library or queue row
-- **THEN** only highlight and details change and current playback continues uninterrupted
+- **THEN** only highlight and details change, no play command is issued, and current playback continues uninterrupted
 
 #### Scenario: Seek with unknown duration
 - **WHEN** the active video's duration is unknown or VLC is disconnected
 - **THEN** clicking the progress track sends no absolute-seek command and the unavailable action is explained
 
 ### Requirement: Safe active-item removal and bounded undo
-Removing the active entry, or clearing a set containing it, SHALL capture valid progress and confirm that owned VLC playback has stopped before removing the entry. It SHALL NOT automatically play the next entry. If stopping cannot be established, removal SHALL fail visibly while retaining the active entry and observation association. Removal and clear SHALL offer one session-local undo of the latest successful removal operation; undo SHALL restore queue order and retained history but never restart playback. A subsequent queue mutation or root change SHALL invalidate that undo with visible feedback. Undo SHALL revalidate root confinement and fingerprints and reject unsafe or replaced media; missing media SHALL remain visibly missing.
+Removing the active entry, or clearing a set containing it, SHALL capture valid progress and confirm that owned VLC playback has stopped before removing the entry. It SHALL NOT automatically play the next entry. If stopping cannot be established, removal SHALL fail visibly while retaining the active entry and observation association. Removal and clear SHALL offer one session-local undo of the latest successful removal operation; undo SHALL restore queue order and retained history but never restart playback. A subsequent queue mutation or root change SHALL invalidate that undo and immediately provide visible expiration feedback. Undo SHALL revalidate root confinement and fingerprints and reject unsafe or replaced media; missing media SHALL remain visibly missing.
 
 #### Scenario: Remove currently playing media
 - **WHEN** the user removes the active entry and the owned VLC process confirms playback stopped
@@ -125,6 +141,10 @@ Removing the active entry, or clearing a set containing it, SHALL capture valid 
 #### Scenario: Undo after replacement
 - **WHEN** a removed video's path now resolves outside the root or its fingerprint changed
 - **THEN** undo rejects the restoration without applying old history or partially restoring the snapshot
+
+#### Scenario: Undo expires after mutation
+- **WHEN** an undo is available and a subsequent queue mutation or root change occurs
+- **THEN** the undo is invalidated and the application immediately reports that expiration
 
 ### Requirement: Readable stable playback UI and reconnect
 The player area SHALL show the active filename, connection state, elapsed and known total and remaining time using minutes/seconds or hours/minutes/seconds. Unknown duration and remaining time SHALL be explicitly unknown. Highlighted-item details SHALL remain distinct from the active player. Routine polling SHALL preserve row identity, highlight, scroll position, and actionable controls. Reconnect SHALL be available without a queue selection and SHALL not restart media without an explicit playback action. Overlapping reconnect requests SHALL not create duplicate owned VLC processes or polling loops.
