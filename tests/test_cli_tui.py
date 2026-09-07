@@ -695,18 +695,25 @@ async def test_tui_queue_highlight_persists_by_entry_identity_and_clears_on_remo
         assert db.get_selected_id() == entries[1].id
         assert view.index == 0
 
-    restarted = VLCQApp(root=root, database=db, no_vlc=True)
+    # Reopen the database as a new process would. The persisted selection must
+    # remain visibly identifiable even though startup puts focus in Files.
+    db.close()
+    reopened = Database(tmp_path / "db.sqlite3")
+    restarted = VLCQApp(root=root, database=reopened, no_vlc=True)
     async with restarted.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
         view = restarted.query_one("#queue", ListView)
+        selected_row = view.children[0]
         assert view.index == 0
-        assert db.get_selected_id() == restarted.queue.entries()[0].id
+        assert reopened.get_selected_id() == restarted.queue.entries()[0].id
+        assert selected_row.has_class("queue-selected")
+        assert str(selected_row.query_one(Label).renderable).startswith("›")
         restarted.queue.remove(0)
         restarted.refresh_queue()
         await pilot.pause()
-        assert db.get_selected_id() is None
+        assert reopened.get_selected_id() is None
         assert view.index is None
-    db.close()
+    reopened.close()
 
 
 @pytest.mark.asyncio

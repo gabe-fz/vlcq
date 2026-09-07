@@ -52,6 +52,10 @@ async def test_mouse_workflow_at_compact_and_wide_sizes(tmp_path: Path, size: tu
         await pilot.click(".browser-check")
         await choose_menu_action(pilot, "#files-actions", "Add & play")
         assert app.queue.entries() == []  # Cancel has no queue side effects.
+        for selector in ("#resume-choice", "#start-over-choice", "#resume-cancel"):
+            button = app.query_one(selector, Button)
+            assert button.region.height == 1
+            assert button.content_region.height == 1
         await pilot.click("#resume-cancel")
         await choose_menu_action(pilot, "#files-actions", "Add & play")
         await pilot.click("#resume-choice")

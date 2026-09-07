@@ -22,3 +22,4 @@
 
 - [x] 4.1 Preserve stale-selection repair through initial TUI rendering so an invalid or cross-queue selected identity remains cleared instead of selecting the first unrelated row, and add a restart test verifying no selection or playback retargeting occurs.
 - [x] 4.2 Report actionable recovery guidance when a database migration fails while preserving the original database, and add an injected-failure test verifying rollback, unchanged source data, and useful CLI guidance.
+- [x] 4.3 Keep the persisted queue highlight visibly marked while Files has focus, render compact dialog button labels within their one-line height, and add restart and small-terminal regression coverage.

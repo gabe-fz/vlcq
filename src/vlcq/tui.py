@@ -125,7 +125,13 @@ class QueueListItem(ListItem):
 
     entry_id: int
 
-    def __init__(self, entry: QueueEntry, current_id: int | None, renderable: Text) -> None:
+    def __init__(
+        self,
+        entry: QueueEntry,
+        current_id: int | None,
+        selected_id: int | None,
+        renderable: Text,
+    ) -> None:
         self.entry_id = entry.id
         super().__init__(Label(renderable, classes="row-label", markup=False))
         display_state = (
@@ -133,7 +139,10 @@ class QueueListItem(ListItem):
             if current_id == entry.id or entry.state not in _TRANSIENT_QUEUE_STATES
             else "queued"
         )
-        self.set_classes(VLCQApp._queue_state_class(display_state))
+        classes = VLCQApp._queue_state_class(display_state)
+        if selected_id == entry.id:
+            classes += " queue-selected"
+        self.set_classes(classes)
 
 
 class RootPrompt(ModalScreen[str | None]):
@@ -479,6 +488,7 @@ class VLCQApp(App[None]):
     .queue-missing, .queue-failed { color: $error; text-style: bold; }
     .queue-stopped, .queue-skipped { color: $text-muted; }
     .queue-queued { color: $text; }
+    .queue-selected { background: $boost; text-style: bold; }
     .history-progress { color: $warning; }
     .history-completed { color: $success; }
     .queued-badge { color: $accent; }
@@ -491,7 +501,10 @@ class VLCQApp(App[None]):
     #context-menu { position: absolute; background: $surface; border: round $accent; padding: 0; overflow-y: auto; }
     .context-action { width: 1fr; min-width: 20; height: 1; min-height: 1; margin: 0; padding: 0 1; border: none; content-align: left middle; }
     .dialog-actions { height: 1; min-height: 1; align-horizontal: center; }
-    .dialog-actions Button { height: 1; min-height: 1; min-width: 10; margin: 0 1; padding: 0 1; }
+    .dialog-actions Button {
+        height: 1; min-height: 1; min-width: 10; margin: 0 1; padding: 0 1;
+        border: none; content-align: center middle;
+    }
     .dialog-title, .details-content, .help-content { width: 80%; max-height: 12; padding: 1; background: $surface; border: solid $accent; }
     .details-content, .help-content { height: auto; overflow-y: auto; }
     RootPrompt, SearchFilterPrompt, ResumePrompt, DetailsPrompt, ConfirmClear, ConfirmClearAll, QuitPrompt, NoticePrompt, HelpPrompt { align: center middle; }
@@ -669,8 +682,10 @@ class VLCQApp(App[None]):
                     queue.index = list(queue.children).index(row)
                     try:
                         self.database.set_selected(row.entry_id)
+                        self._apply_queue_selection(row.entry_id)
                     except ValueError:
                         self.database.set_selected(None)
+                        self._apply_queue_selection(None)
                 if event.button == 3:
                     event.stop()
                     self._open_row_menu(row, event.screen_x, event.screen_y)
@@ -741,8 +756,10 @@ class VLCQApp(App[None]):
                     if isinstance(row, QueueListItem):
                         if self.database.get_selected_id() != row.entry_id:
                             self.database.set_selected(row.entry_id)
+                        self._apply_queue_selection(row.entry_id)
                     elif self.database.get_selected_id() is not None:
                         self.database.set_selected(None)
+                        self._apply_queue_selection(None)
                 except ValueError:
                     # A stale highlight can race a root/queue replacement; it
                     # must never retarget a newly reused list position.
@@ -933,8 +950,11 @@ class VLCQApp(App[None]):
             text.append(" · " + history, style="green" if "Completed" in history else "yellow")
         return text
 
-    def _queue_renderable(self, entry: QueueEntry, current_id: int | None) -> Text:
+    def _queue_renderable(
+        self, entry: QueueEntry, current_id: int | None, selected_id: int | None
+    ) -> Text:
         text = Text(no_wrap=True, overflow="ellipsis")
+        text.append("›" if selected_id == entry.id else " ", style="bold cyan")
         if current_id == entry.id:
             text.append("◆ ", style="bold yellow")
         else:
@@ -983,6 +1003,7 @@ class VLCQApp(App[None]):
         entries = {entry.id: entry for entry in self.queue.entries()}
         current = self.queue.current()
         current_id = current.id if current is not None else None
+        selected_id = self.database.get_selected_id()
         for row in view.children:
             if not isinstance(row, QueueListItem):
                 continue
@@ -990,7 +1011,9 @@ class VLCQApp(App[None]):
             if entry is None:
                 continue
             try:
-                row.query_one(".row-label", Label).update(self._queue_renderable(entry, current_id))
+                row.query_one(".row-label", Label).update(
+                    self._queue_renderable(entry, current_id, selected_id)
+                )
             except NoMatches:
                 continue
         self._render_headers()
@@ -1108,17 +1131,40 @@ class VLCQApp(App[None]):
             "failed": "queue-failed",
         }.get(state, "queue-failed")
 
-    def _update_queue_row(self, row: QueueListItem, entry: QueueEntry, current_id: int | None) -> None:
+    def _update_queue_row(
+        self,
+        row: QueueListItem,
+        entry: QueueEntry,
+        current_id: int | None,
+        selected_id: int | None,
+    ) -> None:
         display_state = (
             entry.state
             if current_id == entry.id or entry.state not in _TRANSIENT_QUEUE_STATES
             else "queued"
         )
-        row.set_classes(self._queue_state_class(display_state))
+        classes = self._queue_state_class(display_state)
+        if selected_id == entry.id:
+            classes += " queue-selected"
+        row.set_classes(classes)
         try:
-            row.query_one(".row-label", Label).update(self._queue_renderable(entry, current_id))
+            row.query_one(".row-label", Label).update(
+                self._queue_renderable(entry, current_id, selected_id)
+            )
         except NoMatches:
             pass
+
+    def _apply_queue_selection(self, selected_id: int | None) -> None:
+        """Keep the durable queue highlight visible even while Files has focus."""
+        try:
+            view = self.query_one("#queue", ListView)
+        except NoMatches:
+            return
+        entries = {entry.id: entry for entry in self.queue.entries()}
+        current_id = self.database.get_current_id()
+        for row in view.children:
+            if isinstance(row, QueueListItem) and (entry := entries.get(row.entry_id)) is not None:
+                self._update_queue_row(row, entry, current_id, selected_id)
 
     def refresh_queue(
         self,
@@ -1186,12 +1232,21 @@ class VLCQApp(App[None]):
             if reuse_rows:
                 for row, entry in zip(rows, entries, strict=True):
                     assert isinstance(row, QueueListItem)
-                    self._update_queue_row(row, entry, current_id)
+                    self._update_queue_row(
+                        row, entry, current_id, target_id if target_present else None
+                    )
             else:
                 view.clear()
                 for entry in entries:
                     view.append(
-                        QueueListItem(entry, current_id, self._queue_renderable(entry, current_id))
+                        QueueListItem(
+                            entry,
+                            current_id,
+                            target_id if target_present else None,
+                            self._queue_renderable(
+                                entry, current_id, target_id if target_present else None
+                            ),
+                        )
                     )
             if target_present:
                 restored = next(index for index, entry in enumerate(entries) if entry.id == target_id)
@@ -1210,6 +1265,7 @@ class VLCQApp(App[None]):
         finally:
             self._restoring_queue_selection = False
             self._queue_selection_invalidated = False
+        self._apply_queue_selection(self.database.get_selected_id())
         self._render_headers()
 
     def refresh_playback(self) -> None:
