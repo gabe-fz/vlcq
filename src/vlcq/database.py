@@ -11,6 +11,9 @@ from .models import HistoryProjection, QueueEntry
 from .paths import canonical_root, is_beneath
 
 SCHEMA_VERSION = 2
+_VALID_STATES = frozenset(
+    {"queued", "playing", "paused", "stopped", "skipped", "completed", "missing", "failed"}
+)
 
 
 class Database:
@@ -139,6 +142,7 @@ class Database:
             (str(cursor.lastrowid),),
         )
         self.set_current(None)
+        self.set_selected(None)
         return value
 
     def get_root(self) -> Path | None:
@@ -148,7 +152,19 @@ class Database:
         ).fetchone()
         return Path(row[0]) if row else None
 
+    def _entry_belongs_to_active_queue(self, entry_id: int) -> bool:
+        try:
+            queue_id = self._active_queue_id()
+        except RuntimeError:
+            return False
+        row = self.connection.execute(
+            "SELECT 1 FROM queue_entries WHERE id=? AND queue_id=?",
+            (entry_id, queue_id),
+        ).fetchone()
+        return row is not None
+
     def set_current(self, entry_id: int | None) -> None:
+        """Set the legacy pointer directly; open/transition paths validate it."""
         if entry_id is None:
             self.connection.execute("DELETE FROM settings WHERE key='current_entry'")
         else:
@@ -162,7 +178,151 @@ class Database:
         row = self.connection.execute(
             "SELECT value FROM settings WHERE key='current_entry'"
         ).fetchone()
-        return int(row[0]) if row else None
+        if row is None:
+            return None
+        try:
+            entry_id = int(row[0])
+        except (TypeError, ValueError):
+            entry_id = None
+        if entry_id is None or not self._entry_belongs_to_active_queue(entry_id):
+            self.connection.execute("DELETE FROM settings WHERE key='current_entry'")
+            return None
+        return entry_id
+
+    def set_selected(self, entry_id: int | None) -> None:
+        """Persist the highlighted entry only when it belongs to the active queue."""
+        if entry_id is None:
+            self.connection.execute("DELETE FROM settings WHERE key='selected_entry'")
+        else:
+            if not self._entry_belongs_to_active_queue(entry_id):
+                raise ValueError("selected entry does not belong to the active queue")
+            self.connection.execute(
+                "INSERT INTO settings(key,value) VALUES('selected_entry',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(entry_id),),
+            )
+
+    # Explicit aliases keep the identity semantics clear at call sites.
+    set_selected_id = set_selected
+    set_selected_entry = set_selected
+
+    def get_selected_id(self) -> int | None:
+        row = self.connection.execute(
+            "SELECT value FROM settings WHERE key='selected_entry'"
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            entry_id = int(row[0])
+        except (TypeError, ValueError):
+            entry_id = None
+        if entry_id is None or not self._entry_belongs_to_active_queue(entry_id):
+            self.connection.execute("DELETE FROM settings WHERE key='selected_entry'")
+            return None
+        return entry_id
+
+    get_selected = get_selected_id
+    get_selected_entry_id = get_selected_id
+
+    def transition_current(self, entry_id: int | None, state: str = "playing") -> None:
+        """Atomically move current playback and normalize stale transient rows."""
+        if state not in _VALID_STATES:
+            raise ValueError(f"unknown queue state: {state}")
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            queue_id = self._active_queue_id()
+            if entry_id is not None:
+                row = self.connection.execute(
+                    "SELECT 1 FROM queue_entries WHERE id=? AND queue_id=?",
+                    (entry_id, queue_id),
+                ).fetchone()
+                if row is None:
+                    raise ValueError("current entry does not belong to the active queue")
+                self.connection.execute(
+                    "UPDATE queue_entries SET state='queued' "
+                    "WHERE queue_id=? AND id<>? AND state IN ('playing','paused','stopped')",
+                    (queue_id, entry_id),
+                )
+                self.connection.execute(
+                    "UPDATE queue_entries SET state=? WHERE id=? AND queue_id=?",
+                    (state, entry_id, queue_id),
+                )
+                self.connection.execute(
+                    "INSERT INTO settings(key,value) VALUES('current_entry',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (str(entry_id),),
+                )
+            else:
+                self.connection.execute(
+                    "UPDATE queue_entries SET state='queued' "
+                    "WHERE queue_id=? AND state IN ('playing','paused','stopped')",
+                    (queue_id,),
+                )
+                self.connection.execute("DELETE FROM settings WHERE key='current_entry'")
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def normalize_active_queue(self) -> None:
+        """Repair stale identities and transient rows without changing content."""
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            queue_id = self._active_queue_id()
+            current_row = self.connection.execute(
+                "SELECT value FROM settings WHERE key='current_entry'"
+            ).fetchone()
+            current_id: int | None = None
+            if current_row is not None:
+                try:
+                    candidate = int(current_row[0])
+                except (TypeError, ValueError):
+                    candidate = None
+                if candidate is not None:
+                    valid = self.connection.execute(
+                        "SELECT 1 FROM queue_entries WHERE id=? AND queue_id=?",
+                        (candidate, queue_id),
+                    ).fetchone()
+                    if valid is not None:
+                        current_id = candidate
+                if current_id is None:
+                    self.connection.execute("DELETE FROM settings WHERE key='current_entry'")
+
+            selected_row = self.connection.execute(
+                "SELECT value FROM settings WHERE key='selected_entry'"
+            ).fetchone()
+            if selected_row is not None:
+                try:
+                    selected_id = int(selected_row[0])
+                except (TypeError, ValueError):
+                    selected_id = None
+                valid = (
+                    selected_id is not None
+                    and self.connection.execute(
+                        "SELECT 1 FROM queue_entries WHERE id=? AND queue_id=?",
+                        (selected_id, queue_id),
+                    ).fetchone()
+                    is not None
+                )
+                if not valid:
+                    self.connection.execute("DELETE FROM settings WHERE key='selected_entry'")
+
+            if current_id is None:
+                self.connection.execute(
+                    "UPDATE queue_entries SET state='queued' "
+                    "WHERE queue_id=? AND state IN ('playing','paused','stopped')",
+                    (queue_id,),
+                )
+            else:
+                self.connection.execute(
+                    "UPDATE queue_entries SET state='queued' "
+                    "WHERE queue_id=? AND id<>? AND state IN ('playing','paused','stopped')",
+                    (queue_id, current_id),
+                )
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
 
     @staticmethod
     def _canonical_file(path: Path) -> tuple[Path, os.stat_result]:
@@ -239,6 +399,9 @@ class Database:
         ]
 
     def set_state(self, entry_id: int, state: str) -> None:
+        """Set a row directly for compatibility repair and terminal observations."""
+        if state not in _VALID_STATES:
+            raise ValueError(f"unknown queue state: {state}")
         self.connection.execute("UPDATE queue_entries SET state=? WHERE id=?", (state, entry_id))
 
     def _reorder_in_transaction(self, ordered_ids: list[int]) -> None:
@@ -367,22 +530,24 @@ class Database:
             raise
 
     def remove(self, entry_id: int) -> None:
-        self.connection.execute("BEGIN IMMEDIATE")
-        try:
-            self.connection.execute("DELETE FROM queue_entries WHERE id=?", (entry_id,))
-            self._reorder_in_transaction([e.id for e in self.queue_entries()])
-            self.connection.execute("COMMIT")
-        except BaseException:
-            self.connection.execute("ROLLBACK")
-            raise
+        self.remove_entries([entry_id])
 
     def remove_entries(self, entry_ids: list[int]) -> None:
         self.connection.execute("BEGIN IMMEDIATE")
         try:
-            for entry_id in entry_ids:
-                self.connection.execute("DELETE FROM queue_entries WHERE id=?", (entry_id,))
-            if self.get_current_id() in entry_ids:
-                self.set_current(None)
+            queue_id = self._active_queue_id()
+            placeholders = ",".join("?" for _ in entry_ids)
+            if entry_ids:
+                parameters: tuple[object, ...] = (queue_id, *entry_ids)
+                self.connection.execute(
+                    f"DELETE FROM queue_entries WHERE queue_id=? AND id IN ({placeholders})",
+                    parameters,
+                )
+                self.connection.execute(
+                    f"DELETE FROM settings WHERE key IN ('current_entry','selected_entry') "
+                    f"AND CAST(value AS INTEGER) IN ({placeholders})",
+                    entry_ids,
+                )
             self._reorder_in_transaction([e.id for e in self.queue_entries()])
             self.connection.execute("COMMIT")
         except BaseException:

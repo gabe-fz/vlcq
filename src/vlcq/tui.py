@@ -23,7 +23,6 @@ from .queue import QueueService
 from .vlc import VLCError
 
 _QUEUE_STATE_LABELS: dict[str, str] = {
-    "queued": "○ QUEUED",
     "playing": "▶ PLAYING",
     "paused": "Ⅱ PAUSED",
     "stopped": "■ STOPPED",
@@ -32,6 +31,7 @@ _QUEUE_STATE_LABELS: dict[str, str] = {
     "missing": "! MISSING",
     "failed": "× FAILED",
 }
+_TRANSIENT_QUEUE_STATES = frozenset({"playing", "paused", "stopped"})
 
 
 def _file_identity(
@@ -128,7 +128,12 @@ class QueueListItem(ListItem):
     def __init__(self, entry: QueueEntry, current_id: int | None, renderable: Text) -> None:
         self.entry_id = entry.id
         super().__init__(Label(renderable, classes="row-label", markup=False))
-        self.set_classes(VLCQApp._queue_state_class(entry.state))
+        display_state = (
+            entry.state
+            if current_id == entry.id or entry.state not in _TRANSIENT_QUEUE_STATES
+            else "queued"
+        )
+        self.set_classes(VLCQApp._queue_state_class(display_state))
 
 
 class RootPrompt(ModalScreen[str | None]):
@@ -553,6 +558,7 @@ class VLCQApp(App[None]):
         self._last_pane = "browser"
         self._notice = "Ready"
         self._source_focus: Widget | None = None
+        self._restoring_queue_selection = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="sections"):
@@ -658,6 +664,10 @@ class VLCQApp(App[None]):
                     return
                 if row in queue.children:
                     queue.index = list(queue.children).index(row)
+                    try:
+                        self.database.set_selected(row.entry_id)
+                    except ValueError:
+                        self.database.set_selected(None)
                 if event.button == 3:
                     event.stop()
                     self._open_row_menu(row, event.screen_x, event.screen_y)
@@ -717,6 +727,23 @@ class VLCQApp(App[None]):
             self._last_pane = "browser"
         else:
             self._last_pane = "queue"
+            if not self._restoring_queue_selection:
+                index = event.list_view.index
+                row = (
+                    event.list_view.children[index]
+                    if index is not None and 0 <= index < len(event.list_view.children)
+                    else None
+                )
+                try:
+                    if isinstance(row, QueueListItem):
+                        if self.database.get_selected_id() != row.entry_id:
+                            self.database.set_selected(row.entry_id)
+                    elif self.database.get_selected_id() is not None:
+                        self.database.set_selected(None)
+                except ValueError:
+                    # A stale highlight can race a root/queue replacement; it
+                    # must never retarget a newly reused list position.
+                    self.database.set_selected(None)
         self._refresh_headers()
 
     def _render_headers(self) -> None:
@@ -910,7 +937,14 @@ class VLCQApp(App[None]):
         else:
             text.append("  ")
         text.append(entry.path.name, style="white")
-        text.append(" · " + _QUEUE_STATE_LABELS.get(entry.state, entry.state.upper()), style="yellow")
+        display_state = (
+            entry.state
+            if current_id == entry.id or entry.state not in _TRANSIENT_QUEUE_STATES
+            else "queued"
+        )
+        state_label = _QUEUE_STATE_LABELS.get(display_state)
+        if state_label:
+            text.append(" · " + state_label, style="yellow")
         history = self._history_label(entry.path)
         if history:
             text.append(" · " + history, style="green" if "Completed" in history else "yellow")
@@ -1072,28 +1106,50 @@ class VLCQApp(App[None]):
         }.get(state, "queue-failed")
 
     def _update_queue_row(self, row: QueueListItem, entry: QueueEntry, current_id: int | None) -> None:
-        row.set_classes(self._queue_state_class(entry.state))
+        display_state = (
+            entry.state
+            if current_id == entry.id or entry.state not in _TRANSIENT_QUEUE_STATES
+            else "queued"
+        )
+        row.set_classes(self._queue_state_class(display_state))
         try:
             row.query_one(".row-label", Label).update(self._queue_renderable(entry, current_id))
         except NoMatches:
             pass
 
     def refresh_queue(
-        self, selected_path: Path | None = None, *, selection_captured: bool = False
+        self,
+        selected_path: Path | None = None,
+        *,
+        selection_captured: bool = False,
+        selected_entry_id: int | None = None,
     ) -> None:
         try:
             view = self.query_one("#queue", ListView)
         except NoMatches:
             return
-        if not selection_captured:
-            old_entries = self.queue.entries()
-            selected_index = view.index
-            selected_path = (
-                old_entries[selected_index].path
-                if selected_index is not None and 0 <= selected_index < len(old_entries)
-                else selected_path
-            )
+
+        old_rows = list(view.children)
+        old_view_id: int | None = None
+        if view.index is not None and 0 <= view.index < len(old_rows):
+            old_row = old_rows[view.index]
+            if isinstance(old_row, QueueListItem):
+                old_view_id = old_row.entry_id
+        old_persisted_id = self.database.get_selected_id()
         entries = self.queue.entries()
+        if selected_entry_id is None and selected_path is not None:
+            selected_entry_id = next(
+                (entry.id for entry in entries if entry.path == selected_path), None
+            )
+        target_id = selected_entry_id if selected_entry_id is not None else old_persisted_id
+        if target_id is None and old_view_id is not None:
+            # This preserves an in-memory highlight for callers/tests that set
+            # ListView.index directly, but only by entry identity.
+            target_id = old_view_id
+        entry_ids = {entry.id for entry in entries}
+        target_present = target_id in entry_ids if target_id is not None else False
+        had_identity = old_view_id is not None or old_persisted_id is not None or selection_captured
+
         queue_paths = [entry.path for entry in entries]
         self._schedule_history_refresh(
             queue_paths,
@@ -1107,30 +1163,40 @@ class VLCQApp(App[None]):
         empty.display = not bool(entries)
         if not entries:
             empty.update("Queue is empty — use Files actions to add a video.")
+
         rows = list(view.children)
         reuse_rows = len(rows) == len(entries) and all(
             isinstance(row, QueueListItem) and row.entry_id == entry.id
             for row, entry in zip(rows, entries)
         )
-        if reuse_rows:
-            for row, entry in zip(rows, entries, strict=True):
-                assert isinstance(row, QueueListItem)
-                self._update_queue_row(row, entry, current_id)
-        else:
-            view.clear()
-            for entry in entries:
-                view.append(QueueListItem(entry, current_id, self._queue_renderable(entry, current_id)))
-        if selected_path is not None:
-            restored = next(
-                (index for index, entry in enumerate(entries) if entry.path == selected_path),
-                None,
-            )
-            if restored is not None:
+        self._restoring_queue_selection = True
+        try:
+            if reuse_rows:
+                for row, entry in zip(rows, entries, strict=True):
+                    assert isinstance(row, QueueListItem)
+                    self._update_queue_row(row, entry, current_id)
+            else:
+                view.clear()
+                for entry in entries:
+                    view.append(
+                        QueueListItem(entry, current_id, self._queue_renderable(entry, current_id))
+                    )
+            if target_present:
+                restored = next(index for index, entry in enumerate(entries) if entry.id == target_id)
                 view.index = restored
-            elif entries:
+                if self.database.get_selected_id() != target_id:
+                    self.database.set_selected(target_id)
+            elif entries and not had_identity:
                 view.index = 0
-        elif entries and view.index is None:
-            view.index = 0
+                self.database.set_selected(entries[0].id)
+            else:
+                # Do not let a removed identity silently select a new row at
+                # the same position.
+                view.index = None
+                if self.database.get_selected_id() is not None:
+                    self.database.set_selected(None)
+        finally:
+            self._restoring_queue_selection = False
         self._render_headers()
 
     def refresh_playback(self) -> None:
@@ -1184,6 +1250,12 @@ class VLCQApp(App[None]):
         if view.index is None or not 0 <= view.index < len(entries):
             return None
         return view.index
+
+    def _queue_selected_id(self) -> int | None:
+        index = self._queue_index()
+        if index is None:
+            return None
+        return self.queue.entries()[index].id
 
     def _queue_selected_path(self) -> Path | None:
         index = self._queue_index()
@@ -1271,7 +1343,7 @@ class VLCQApp(App[None]):
         current = self.queue.current()
         if current is not None and current.id == entry.id and current.state in {"playing", "paused"}:
             if current.state == "paused":
-                self.queue.database.set_state(current.id, "playing")
+                self.queue.set_current_state(current.id, "playing")
             return True
         offer = ResumeOffer(self.queue.database.history_for(entry.path, root=self.root))
         if offer.completed:
@@ -1526,6 +1598,7 @@ class VLCQApp(App[None]):
                 self._history_cache.clear()
                 self.history.clear()
                 self.call_later(self.refresh_browser)
+                self.call_later(self.refresh_queue)
             except PathError as exc:
                 self.update_status(str(exc))
 
@@ -1542,7 +1615,7 @@ class VLCQApp(App[None]):
         try:
             if self.no_vlc:
                 state = "paused" if current.state == "playing" else "playing"
-                self.queue.database.set_state(current.id, state)
+                self.queue.set_current_state(current.id, state)
             else:
                 await self.controller.toggle_pause()
                 state = self.controller.status.state
@@ -1641,14 +1714,14 @@ class VLCQApp(App[None]):
         if index is None:
             self.update_status("Nothing is highlighted in the queue")
             return
-        selected_path = self._queue_selected_path()
+        selected_entry_id = self._queue_selected_id()
         try:
             self.queue.move(index, 1)
         except (IndexError, OSError, RuntimeError) as exc:
             self.update_status(f"Move failed: {exc}")
         else:
             self.update_status("Moved queue item down")
-        self.refresh_queue(selected_path, selection_captured=True)
+        self.refresh_queue(selected_entry_id=selected_entry_id, selection_captured=True)
 
     def action_move_up(self) -> None:
         if not self._queue_has_focus():
@@ -1658,14 +1731,14 @@ class VLCQApp(App[None]):
         if index is None:
             self.update_status("Nothing is highlighted in the queue")
             return
-        selected_path = self._queue_selected_path()
+        selected_entry_id = self._queue_selected_id()
         try:
             self.queue.move(index, -1)
         except (IndexError, OSError, RuntimeError) as exc:
             self.update_status(f"Move failed: {exc}")
         else:
             self.update_status("Moved queue item up")
-        self.refresh_queue(selected_path, selection_captured=True)
+        self.refresh_queue(selected_entry_id=selected_entry_id, selection_captured=True)
 
     async def action_retry(self) -> None:
         if not self._queue_has_focus():
@@ -2065,9 +2138,9 @@ class VLCQApp(App[None]):
         elif key == "details-file" and isinstance(target, FileTarget):
             await self._open_details(BrowserEntry(target.path, target.path.name, False, True), pane="browser")
         elif key == "sort-queue":
-            selected_path = self._queue_selected_path()
+            selected_entry_id = self._queue_selected_id()
             self.queue.sort_natural()
-            self.refresh_queue(selected_path, selection_captured=True)
+            self.refresh_queue(selected_entry_id=selected_entry_id, selection_captured=True)
             self.update_status("Queue sorted naturally")
         elif key == "clear-completed":
             self.action_clear_completed()

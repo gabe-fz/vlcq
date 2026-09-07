@@ -210,7 +210,7 @@ class PlaybackController:
                     allow_resume_reset=True,
                 )
         except (VLCError, OSError, TimeoutError):
-            self.queue.database.set_state(entry.id, "failed")
+            self.queue.set_current_state(entry.id, "failed")
             self.status = VLCStatus("unavailable", path=entry.path)
             raise
 
@@ -321,10 +321,10 @@ class PlaybackController:
         if observed_path is not None and not self._same_path(observed_path, current.path):
             return
         if not current.path.is_file():
-            self.queue.database.set_state(current.id, "missing")
+            self.queue.set_current_state(current.id, "missing")
             return
         if status.state in {"playing", "paused", "stopped"}:
-            self.queue.database.set_state(current.id, status.state)
+            self.queue.set_current_state(current.id, status.state)
 
     async def toggle_pause(self) -> None:
         async with self._transition_lock:
@@ -407,7 +407,7 @@ class PlaybackController:
                     allow_resume_reset=True,
                 )
         except (VLCError, OSError, TimeoutError):
-            self.queue.database.set_state(entry_id, "failed")
+            self.queue.set_current_state(entry_id, "failed")
             self.status = VLCStatus("unavailable", path=path)
             raise
 
@@ -454,7 +454,7 @@ class PlaybackController:
         if current is None or observed_path is None or not self._same_path(observed_path, current.path):
             return
         if not current.path.is_file():
-            self.queue.database.set_state(current.id, "missing")
+            self.queue.set_current_state(current.id, "missing")
             return
         self.status = status
         self._last_valid_status = status
@@ -469,7 +469,7 @@ class PlaybackController:
                 resume_position_ms=status.position_ms,
             )
         except OSError:
-            self.queue.database.set_state(current.id, "missing")
+            self.queue.set_current_state(current.id, "missing")
             return
         if (
             status.state == "playing"
@@ -538,7 +538,7 @@ class PlaybackController:
                 ):
                     return False
                 if current is not None:
-                    self.queue.database.set_state(current.id, "stopped")
+                    self.queue.set_current_state(current.id, "stopped")
                 self.status = VLCStatus("stopped", response.position_ms, response.duration_ms, expected)
                 self._last_valid_status = self.status
                 return True
@@ -567,5 +567,5 @@ class PlaybackController:
             self.queue.invalidate_undo()
             current = self.queue.current()
             if current is not None and current.state in {"playing", "paused"}:
-                self.queue.database.set_state(current.id, "stopped")
+                self.queue.set_current_state(current.id, "stopped")
             self.status = VLCStatus("unavailable")

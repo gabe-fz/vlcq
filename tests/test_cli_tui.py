@@ -458,6 +458,7 @@ async def test_periodic_queue_refresh_reuses_and_updates_existing_rows(tmp_path:
         assert view.children[0] is original_row
 
         entry = app.queue.entries()[0]
+        db.set_current(entry.id)
         db.set_state(entry.id, "playing")
         app.refresh_queue()
         await pilot.pause()
@@ -585,6 +586,47 @@ async def test_tui_video_and_queue_row_clicks_only_highlight(tmp_path: Path) -> 
         assert queue.index == 1
         assert app.queue.current() is not None
         assert app.queue.current().path == first.resolve()
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_queue_highlight_persists_by_entry_identity_and_clears_on_removal(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "show"
+    root.mkdir()
+    paths = [root / "first.mkv", root / "second.mkv"]
+    for path in paths:
+        path.write_bytes(path.name.encode())
+    db = Database(tmp_path / "db.sqlite3")
+    app = VLCQApp(root=root, database=db, no_vlc=True)
+    app.queue.add(paths)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        view = app.query_one("#queue", ListView)
+        entries = app.queue.entries()
+        await pilot.click(view.children[1])
+        await pilot.pause()
+        assert db.get_selected_id() == entries[1].id
+
+        app.queue.move(1, -1)
+        app.refresh_queue()
+        await pilot.pause()
+        assert db.get_selected_id() == entries[1].id
+        assert view.index == 0
+
+    restarted = VLCQApp(root=root, database=db, no_vlc=True)
+    async with restarted.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        view = restarted.query_one("#queue", ListView)
+        assert view.index == 0
+        assert db.get_selected_id() == restarted.queue.entries()[0].id
+        restarted.queue.remove(0)
+        restarted.refresh_queue()
+        await pilot.pause()
+        assert db.get_selected_id() is None
+        assert view.index is None
     db.close()
 
 
@@ -717,16 +759,12 @@ async def test_tui_empty_feedback_and_queue_state_indicators(tmp_path: Path) -> 
             str(item.query_one(Label).renderable)
             for item in app.query_one("#queue", ListView).children
         ]
-        for state in (
-            "QUEUED",
-            "PLAYING",
-            "PAUSED",
-            "STOPPED",
-            "SKIPPED",
-            "COMPLETED",
-            "MISSING",
-            "FAILED",
-        ):
-            assert state in "\n".join(labels)
+        rendered = "\n".join(labels)
+        assert "QUEUED" not in rendered
+        assert "PLAYING" in rendered
+        assert "PAUSED" not in rendered
+        assert "STOPPED" not in rendered
+        for state in ("SKIPPED", "COMPLETED", "MISSING", "FAILED"):
+            assert state in rendered
         assert not app.query_one("#queue-empty", Static).display
     db.close()

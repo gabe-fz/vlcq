@@ -42,11 +42,14 @@ Right-clicking a row opens the same contextual actions, and `Shift+F10` is the k
 fallback. Menus remain inside the terminal and scroll when needed.
 
 Rows are one line: filenames are rendered literally, including bracketed release tags.
-Checkboxes select library videos, queued membership is shown inline, and positive history
-is shown as **In progress** or **Completed** with furthest progress. Unplayed rows omit a
-history badge. Click a video or queue row to highlight it without starting playback; click
-a folder to open it. Full paths, resume/furthest positions, durations, fingerprints, and
-missing history are available through **Details**.
+Checkboxes select library videos. A queue-row highlight is a durable, identity-based
+Details selection and never starts playback; the diamond marks the independent current
+playback item. Pending queue position is implicit rather than a `QUEUED` badge. Only the
+current row may show **Playing**, **Paused**, or **Stopped**; **Skipped**, **Completed**,
+**Missing**, and **Failed** remain visible as outcomes. Positive read-only history is shown
+separately as **In progress** or **Completed** with furthest progress. Unplayed rows omit a
+history badge. Click a folder to open it. Full paths, resume/furthest positions, durations,
+fingerprints, and missing history are available through **Details**.
 
 Search and **All / In progress / Not completed** filters open from the Files menu. The
 Files header keeps the active search/filter and selected/hidden counts visible. Selections
@@ -96,8 +99,9 @@ mutation, automatic advancement, root change, or shutdown expires it. Missing me
 be restored as visibly missing, while unsafe or replaced paths are rejected.
 
 Empty sections show one short next-action hint, focused sections receive a distinct
-highlight, and queue rows display state indicators (`▶ PLAYING`, `Ⅱ PAUSED`, `✓ COMPLETED`,
-`! MISSING`, and `× FAILED`). Hidden dotfiles and unsupported file types are not shown.
+highlight, and queue rows display current-state or outcome indicators (`▶ PLAYING`,
+`Ⅱ PAUSED`, `■ STOPPED`, `→ SKIPPED`, `✓ COMPLETED`, `! MISSING`, and `× FAILED`). Hidden
+dotfiles and unsupported file types are not shown.
 
 ## Finder / right-click handoff
 

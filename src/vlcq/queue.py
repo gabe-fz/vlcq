@@ -41,6 +41,9 @@ class QueueService:
 
     def open(self, root: str | Path) -> Path:
         self.root = self.database.set_root(root)
+        # Repair legacy/current databases every time an active queue is opened;
+        # this is identity-only normalization and never touches media files.
+        self.database.normalize_active_queue()
         self._invalidate_undo()
         return self.root
 
@@ -77,6 +80,20 @@ class QueueService:
         current_id = self.database.get_current_id()
         return next((entry for entry in self.entries() if entry.id == current_id), None)
 
+    def selected(self) -> QueueEntry | None:
+        selected_id = self.database.get_selected_id()
+        return next((entry for entry in self.entries() if entry.id == selected_id), None)
+
+    def select(self, entry_id: int | None) -> None:
+        self.database.set_selected(entry_id)
+
+    def set_current_state(self, entry_id: int, state: str) -> None:
+        """Update the current row while preserving the queue invariant."""
+        current = self.current()
+        if current is None or current.id != entry_id:
+            raise ValueError("state transition target is not the current queue entry")
+        self.database.transition_current(entry_id, state)
+
     def resume_target_index(self) -> int | None:
         """Resolve the persisted unfinished queue item by identity.
 
@@ -108,11 +125,7 @@ class QueueService:
     def play_now(self, index: int) -> QueueEntry:
         entries = self.entries()
         entry = entries[index]
-        current = self.current()
-        if current and current.id != entry.id and current.state in {"playing", "paused"}:
-            self.database.set_state(current.id, "queued")
-        self.database.set_current(entry.id)
-        self.database.set_state(entry.id, "playing")
+        self.database.transition_current(entry.id, "playing")
         self._invalidate_undo()
         return next(item for item in self.entries() if item.id == entry.id)
 
@@ -129,11 +142,10 @@ class QueueService:
                 self.database.set_state(current.id, "completed" if completed else "skipped")
         for entry in entries[start + 1 :]:
             if entry.path.is_file():
-                self.database.set_current(entry.id)
-                self.database.set_state(entry.id, "playing")
+                self.database.transition_current(entry.id, "playing")
                 return next(item for item in self.entries() if item.id == entry.id)
             self.database.set_state(entry.id, "missing")
-        self.database.set_current(None)
+        self.database.transition_current(None)
         return None
 
     def previous(self) -> QueueEntry | None:
@@ -194,7 +206,7 @@ class QueueService:
         ):
             raise ActivePlaybackError("stop VLC playback before removing the active entry")
         if current is not None and current.id == entry.id and stop_confirmed:
-            self.database.set_state(entry.id, "stopped")
+            self.set_current_state(entry.id, "stopped")
         self._replace_undo(self._snapshot([entry]))
         self.database.remove_entries([entry.id])
 
@@ -211,7 +223,7 @@ class QueueService:
         ):
             raise ActivePlaybackError("stop VLC playback before clearing the active entry")
         if current is not None and current in selected and stop_confirmed:
-            self.database.set_state(current.id, "stopped")
+            self.set_current_state(current.id, "stopped")
         self._replace_undo(self._snapshot(selected))
         self.database.remove_entries([entry.id for entry in selected])
 
@@ -227,7 +239,7 @@ class QueueService:
         ):
             raise ActivePlaybackError("stop VLC playback before clearing the active entry")
         if current is not None and current.state in {"playing", "paused"} and stop_confirmed:
-            self.database.set_state(current.id, "stopped")
+            self.set_current_state(current.id, "stopped")
         self._replace_undo(self._snapshot(selected))
         self.database.remove_entries([entry.id for entry in selected])
 

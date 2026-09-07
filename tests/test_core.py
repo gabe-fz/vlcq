@@ -97,6 +97,78 @@ def test_database_queue_progress_and_export(tmp_path: Path) -> None:
     db.close()
 
 
+def test_selected_entry_is_identity_validated_and_cleared_safely(tmp_path: Path) -> None:
+    root = tmp_path / "show"
+    other_root = tmp_path / "other"
+    first = touch(root / "one.mkv")
+    second = touch(root / "two.mkv")
+    other = touch(other_root / "other.mkv")
+    db = Database(tmp_path / "db.sqlite3")
+    queue = QueueService(db)
+    queue.open(root)
+    queue.add([first, second])
+    entries = queue.entries()
+
+    db.set_selected(entries[1].id)
+    assert db.get_selected_id() == entries[1].id
+    queue.move(1, -1)
+    assert db.get_selected_id() == entries[1].id
+
+    queue.remove(0)
+    assert db.get_selected_id() is None
+
+    queue.add([first])
+    other_queue = QueueService(db)
+    other_queue.open(other_root)
+    other_queue.add([other])
+    other_entry = other_queue.entries()[0]
+    queue.open(root)
+    db.connection.execute(
+        "INSERT INTO settings(key,value) VALUES('selected_entry',?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (str(other_entry.id),),
+    )
+    queue.open(root)
+    assert db.get_selected_id() is None
+
+    queue.open(other_root)
+    assert db.get_selected_id() is None
+    db.close()
+
+
+def test_open_repairs_stale_transient_rows_without_changing_queue_content(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "show"
+    videos = [touch(root / name, name.encode()) for name in ("one.mkv", "two.mkv", "three.mkv")]
+    db = Database(tmp_path / "db.sqlite3")
+    queue = QueueService(db)
+    queue.open(root)
+    queue.add(videos)
+    before = queue.entries()
+    current = before[1]
+    queue.update_progress(videos[0], 4_000, 10_000, completed=True)
+    db.set_current(current.id)
+    db.set_selected(before[2].id)
+    for entry, state in zip(before, ("stopped", "stopped", "paused"), strict=True):
+        db.set_state(entry.id, state)
+    fingerprints = {entry.id: db.media_fingerprint(entry.media_id) for entry in before}
+    content = {path: path.read_bytes() for path in videos}
+
+    queue.open(root)
+
+    after = queue.entries()
+    assert [entry.id for entry in after] == [entry.id for entry in before]
+    assert [entry.position for entry in after] == [entry.position for entry in before]
+    assert [entry.state for entry in after] == ["queued", "stopped", "queued"]
+    assert db.get_current_id() == current.id
+    assert db.get_selected_id() == before[2].id
+    assert {entry.id: db.media_fingerprint(entry.media_id) for entry in after} == fingerprints
+    assert db.progress_for(videos[0])["completion_observed"] == 1
+    assert {path: path.read_bytes() for path in videos} == content
+    db.close()
+
+
 def test_play_next_uses_front_when_saved_current_is_not_active(tmp_path: Path) -> None:
     root = tmp_path / "show"
     videos = [touch(root / name) for name in ("one.mkv", "two.mkv", "three.mkv")]

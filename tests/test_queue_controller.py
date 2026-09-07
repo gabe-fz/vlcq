@@ -191,6 +191,28 @@ async def test_explicit_policy_cancel_preserves_queue_and_current_item(tmp_path:
     db.close()
 
 
+def test_switching_from_stopped_current_normalizes_only_transient_state(
+    tmp_path: Path,
+) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    third_path = videos[0].with_name("e3.mkv")
+    third_path.write_bytes(b"third")
+    queue.add([third_path])
+    first, second, third = queue.entries()
+    queue.play_now(0)
+    db.set_state(first.id, "stopped")
+    db.set_state(second.id, "completed")
+
+    queue.play_now(2)
+
+    states = {entry.id: entry.state for entry in queue.entries()}
+    assert states[first.id] == "queued"
+    assert states[second.id] == "completed"
+    assert states[third.id] == "playing"
+    assert queue.current() is not None and queue.current().id == third.id
+    db.close()
+
+
 def test_resume_target_prefers_persisted_current_identity(tmp_path: Path) -> None:
     db, queue, _videos = setup_queue(tmp_path)
     queue.play_now(1)
