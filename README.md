@@ -48,7 +48,9 @@ preserves the historical maximum and completion evidence. Automatic queue advanc
 uses a trustworthy resume without opening a modal.
 
 The library pane provides mouse buttons for **Add to end**, **Play next**, and **Play now**;
-the queue pane provides queue-targeted play, reorder, removal, undo, and clear controls.
+the queue pane provides highlighted-entry **Play next**, **Play now**, reorder, removal, undo,
+and clear controls. The selected-item details bar provides direct **Resume** and **Start
+over** actions without opening a dialog.
 Rows highlight without starting playback, and video checkboxes select a batch. Search and
 history filters apply only to the current folder while selections remain preserved.
 

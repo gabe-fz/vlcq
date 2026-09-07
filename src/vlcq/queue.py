@@ -25,9 +25,19 @@ class QueueService:
         self.database = database
         self.root = database.get_root()
         self._undo: QueueUndoSnapshot | None = None
+        self._undo_expired = False
 
     def _invalidate_undo(self) -> None:
+        if self._undo is not None:
+            self._undo_expired = True
         self._undo = None
+
+    def _replace_undo(self, snapshot: QueueUndoSnapshot) -> None:
+        # A successful removal replaces the previous undo with a newer,
+        # actionable snapshot.  There is no useful expired state to expose in
+        # that case because the new operation can be undone immediately.
+        self._undo = snapshot
+        self._undo_expired = False
 
     def open(self, root: str | Path) -> Path:
         self.root = self.database.set_root(root)
@@ -66,6 +76,34 @@ class QueueService:
     def current(self) -> QueueEntry | None:
         current_id = self.database.get_current_id()
         return next((entry for entry in self.entries() if entry.id == current_id), None)
+
+    def resume_target_index(self) -> int | None:
+        """Resolve the persisted unfinished queue item by identity.
+
+        The current pointer is deliberately resolved against entry ids rather
+        than a saved list position.  A completed pointer is not resumable, so
+        the first still-unfinished entry is used as the documented fallback.
+        """
+        entries = self.entries()
+        current_id = self.database.get_current_id()
+        ordered = [
+            index
+            for index, entry in enumerate(entries)
+            if entry.id == current_id
+        ] + [
+            index
+            for index, entry in enumerate(entries)
+            if entry.id != current_id
+        ]
+        for index in ordered:
+            entry = entries[index]
+            if entry.state == "completed":
+                continue
+            history = self.database.history_for(entry.path, root=self.root)
+            if history is not None and history.completion_observed:
+                continue
+            return index
+        return None
 
     def play_now(self, index: int) -> QueueEntry:
         entries = self.entries()
@@ -157,7 +195,7 @@ class QueueService:
             raise ActivePlaybackError("stop VLC playback before removing the active entry")
         if current is not None and current.id == entry.id and stop_confirmed:
             self.database.set_state(entry.id, "stopped")
-        self._undo = self._snapshot([entry])
+        self._replace_undo(self._snapshot([entry]))
         self.database.remove_entries([entry.id])
 
     def clear_completed(self, *, stop_confirmed: bool = False) -> None:
@@ -174,7 +212,7 @@ class QueueService:
             raise ActivePlaybackError("stop VLC playback before clearing the active entry")
         if current is not None and current in selected and stop_confirmed:
             self.database.set_state(current.id, "stopped")
-        self._undo = self._snapshot(selected)
+        self._replace_undo(self._snapshot(selected))
         self.database.remove_entries([entry.id for entry in selected])
 
     def clear_all(self, *, stop_confirmed: bool = False) -> None:
@@ -190,7 +228,7 @@ class QueueService:
             raise ActivePlaybackError("stop VLC playback before clearing the active entry")
         if current is not None and current.state in {"playing", "paused"} and stop_confirmed:
             self.database.set_state(current.id, "stopped")
-        self._undo = self._snapshot(selected)
+        self._replace_undo(self._snapshot(selected))
         self.database.remove_entries([entry.id for entry in selected])
 
     def undo(self) -> bool:
@@ -227,6 +265,16 @@ class QueueService:
     @property
     def undo_available(self) -> bool:
         return self._undo is not None
+
+    @property
+    def undo_expired(self) -> bool:
+        return self._undo_expired
+
+    def consume_undo_expired(self) -> bool:
+        """Return and clear the one-shot UI notification for expired undo."""
+        expired = self._undo_expired
+        self._undo_expired = False
+        return expired
 
     def invalidate_undo(self) -> None:
         self._invalidate_undo()

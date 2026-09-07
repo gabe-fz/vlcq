@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from vlcq.controller import PlaybackController
+from vlcq.controller import PlaybackController, ResumeChoiceRequired
 from vlcq.database import Database
 from vlcq.models import VLCStatus
 from vlcq.queue import QueueService
@@ -149,6 +149,65 @@ async def test_controller_controls_and_conservative_completion(tmp_path: Path) -
     assert queue.entries()[0].state == "completed"
     assert queue.current() is not None and queue.current().path == videos[1].resolve()
     assert db.progress_for(videos[0])["completion_observed"] == 1
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_stopped_current_item_still_uses_resume_policy(tmp_path: Path) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    current = queue.play_now(1)
+    db.set_state(current.id, "stopped")
+    queue.update_progress(videos[1], 4_000, 10_000)
+    process = FakeProcess()
+    controller = PlaybackController(queue, process=process)  # type: ignore[arg-type]
+    controller.client = process.client
+
+    with pytest.raises(ResumeChoiceRequired):
+        await controller.play_with_policy(1)
+    assert process.client.played == []
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_policy_cancel_preserves_queue_and_current_item(tmp_path: Path) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    queue.update_progress(videos[1], 4_000, 10_000)
+    process = FakeProcess()
+    controller = PlaybackController(queue, process=process)  # type: ignore[arg-type]
+    controller.client = process.client
+    before = [(entry.id, entry.state) for entry in queue.entries()]
+
+    with pytest.raises(ResumeChoiceRequired):
+        await controller.play_with_policy(1)
+    assert process.client.played == []
+    assert [(entry.id, entry.state) for entry in queue.entries()] == before
+    assert await controller.play_with_policy(1, choice="cancel") is False
+    assert process.client.played == []
+    assert [(entry.id, entry.state) for entry in queue.entries()] == before
+
+    assert await controller.play_with_policy(1, choice="resume") is True
+    assert process.client.played == [videos[1].resolve()]
+    assert any(command == "seek" for command, _parameters in process.client.commands)
+    db.close()
+
+
+def test_resume_target_prefers_persisted_current_identity(tmp_path: Path) -> None:
+    db, queue, _videos = setup_queue(tmp_path)
+    queue.play_now(1)
+    db.set_state(queue.entries()[1].id, "stopped")
+    assert queue.resume_target_index() == 1
+    db.set_state(queue.entries()[1].id, "completed")
+    assert queue.resume_target_index() == 0
+    db.close()
+
+
+def test_undo_expiration_is_reportable_without_expiring_new_removals(tmp_path: Path) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    queue.remove(0)
+    queue.add([videos[0]])
+    assert not queue.undo_available
+    assert queue.consume_undo_expired() is True
+    assert queue.consume_undo_expired() is False
     db.close()
 
 

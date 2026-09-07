@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
-from textual.widgets import Button, Label, ListView, ProgressBar, Static
+from textual.widgets import Button, Input, Label, ListView, ProgressBar, Static
 
 import vlcq.cli
+import vlcq.tui as tui_module
 from vlcq.cli import _resolve_paths, main
 from vlcq.database import Database
 from vlcq.paths import PathError
+from vlcq.queue import QueueService
 from vlcq.tui import VLCQApp
 from vlcq.vlc import VLCError
 
@@ -513,6 +516,150 @@ async def test_tui_retry_reconnects_when_vlc_is_disconnected(
 
 
 @pytest.mark.asyncio
+async def test_tui_search_filters_without_queueing_or_shortcut_leakage(tmp_path: Path) -> None:
+    root = tmp_path / "show"
+    root.mkdir()
+    (root / "alpha1.mkv").write_bytes(b"one")
+    (root / "episode2.mkv").write_bytes(b"two")
+    (root / "completed.mkv").write_bytes(b"done")
+    db = Database(tmp_path / "db.sqlite3")
+    db.merge_progress(root / "alpha1.mkv", 1_000, 10_000)
+    db.merge_progress(root / "completed.mkv", 10_000, 10_000, completed=True)
+    app = VLCQApp(root=root, database=db, no_vlc=True)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        search = app.query_one("#browser-search", Input)
+        search.focus()
+        await pilot.press("a", "1")
+        await pilot.pause()
+        assert search.value == "a1"
+        assert [entry.name for entry in app.browser_entries] == ["alpha1.mkv"]
+        assert app.queue.entries() == []
+
+        search.value = ""
+        await pilot.click("#filter-progress")
+        assert [entry.name for entry in app.browser_entries] == ["alpha1.mkv"]
+        await pilot.click("#filter-not-completed")
+        assert {entry.name for entry in app.browser_entries} == {"alpha1.mkv", "episode2.mkv"}
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_video_and_queue_row_clicks_only_highlight(tmp_path: Path) -> None:
+    root = tmp_path / "show"
+    root.mkdir()
+    first = root / "episode1.mkv"
+    second = root / "episode2.mkv"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+    db = Database(tmp_path / "db.sqlite3")
+    app = VLCQApp(root=root, database=db, no_vlc=True)
+    app.queue.open(root)
+    app.queue.add([first, second])
+    app.queue.play_now(0)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        browser = app.query_one("#browser", ListView)
+        queue = app.query_one("#queue", ListView)
+        await pilot.click(browser.children[1])
+        await pilot.pause()
+        assert browser.index == 1
+        assert app.queue.current() is not None
+        assert app.queue.current().path == first.resolve()
+        await pilot.click(queue.children[1])
+        await pilot.pause()
+        assert queue.index == 1
+        assert app.queue.current() is not None
+        assert app.queue.current().path == first.resolve()
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_resume_startup_uses_persisted_current_identity_offline(tmp_path: Path) -> None:
+    root = tmp_path / "show"
+    root.mkdir()
+    first = root / "first.mkv"
+    second = root / "second.mkv"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    db = Database(tmp_path / "db.sqlite3")
+    queue = QueueService(db)
+    queue.open(root)
+    queue.add([first, second])
+    current = queue.play_now(1)
+    db.set_state(current.id, "stopped")
+    db.merge_progress(second, 1_000, 10_000)
+    app = VLCQApp(root=root, database=db, no_vlc=True)
+    app.resume_command = True
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        await pilot.click("#resume-choice")
+        await pilot.pause()
+        assert app.queue.current() is not None
+        assert app.queue.current().path == second.resolve()
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_history_refresh_is_async_and_reuses_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "show"
+    root.mkdir()
+    paths = [root / "episode1.mkv", root / "episode2.mkv"]
+    for path in paths:
+        path.write_bytes(b"video")
+    db = Database(tmp_path / "db.sqlite3")
+    db.merge_progress(paths[0], 1_000, 10_000)
+    app = VLCQApp(root=root, database=db, no_vlc=True)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        view = app.query_one("#browser", ListView)
+        original_rows = list(view.children)
+        original_index = view.index
+        original_scroll = view.scroll_y
+        original_identity = tui_module._file_identity
+
+        def delayed_identity(path: Path, library_root: Path):
+            time.sleep(0.05)
+            return original_identity(path, library_root)
+
+        monkeypatch.setattr(tui_module, "_file_identity", delayed_identity)
+        app._refresh_browser_history()
+        view.index = 1
+        await pilot.pause()
+        assert view.index == 1
+        await pilot.pause(0.1)
+        assert list(view.children) == original_rows
+        assert view.index == 1
+        assert view.scroll_y >= original_scroll
+        assert original_index == 0
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_direct_resume_and_start_over_target_highlighted_item(tmp_path: Path) -> None:
+    root = tmp_path / "show"
+    root.mkdir()
+    video = root / "episode.mkv"
+    video.write_bytes(b"video")
+    db = Database(tmp_path / "db.sqlite3")
+    db.merge_progress(video, 2_000, 10_000)
+    app = VLCQApp(root=root, database=db, no_vlc=True)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        assert not app.query_one("#details-resume", Button).disabled
+        await pilot.click("#details-resume")
+        assert app.queue.current() is not None
+        assert app.queue.current().path == video.resolve()
+        app.queue.database.set_state(app.queue.current().id, "paused")
+        await pilot.click("#details-start-over")
+        assert app.queue.current() is not None
+        assert app.queue.current().state == "playing"
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_tui_empty_feedback_and_queue_state_indicators(tmp_path: Path) -> None:
     root = tmp_path / "show"
     root.mkdir()
@@ -521,7 +668,7 @@ async def test_tui_empty_feedback_and_queue_state_indicators(tmp_path: Path) -> 
     async with app.run_test(size=(120, 40)) as pilot:
         assert app.query_one("#browser-empty", Static).display
         assert app.query_one("#queue-empty", Static).display
-        assert app.query_one("#queue-add", Button).disabled
+        assert app.query_one("#browser-add", Button).disabled
         await pilot.press("a")
         assert "Nothing to add" in str(app.query_one("#status", Static).renderable)
 

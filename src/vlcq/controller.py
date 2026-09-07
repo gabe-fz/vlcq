@@ -220,24 +220,32 @@ class PlaybackController:
             raise IndexError("queue index out of range")
         return ResumeOffer(self.queue.database.history_for(entries[index].path, root=self.queue.root))
 
-    async def play_with_policy(
+    async def _play_with_policy_locked(
         self,
         index: int,
         *,
         choice: str | None = None,
         automatic: bool = False,
     ) -> bool:
-        """Apply the single playback policy used by UI, CLI, and autoplay."""
+        """Apply the one playback policy while holding the transition lock."""
         entries = self.queue.entries()
         if not 0 <= index < len(entries):
             raise IndexError("queue index out of range")
         current = self.queue.current()
-        if current is not None and current.id == entries[index].id:
-            await self.play_index(index)
+        if (
+            current is not None
+            and current.id == entries[index].id
+            and current.state in {"playing", "paused"}
+        ):
+            # Activating the active item is intentionally not a reload.  A
+            # paused item is resumed by _play_entry_locked; no resume dialog is
+            # presented and no queue insertion occurs.  A stopped current item
+            # still goes through the normal resume choice on CLI/TUI startup.
+            await self._play_entry_locked(index)
             return True
         offer = self.resume_offer(index)
         if offer.completed:
-            await self.play_index(
+            await self._play_entry_locked(
                 index,
                 resume_position_ms=0 if offer.duration_ms > 0 else None,
                 duration_ms=offer.duration_ms,
@@ -246,7 +254,9 @@ class PlaybackController:
             return True
         if offer.usable_resume or offer.legacy_fallback:
             if offer.legacy_fallback and automatic and not offer.usable_resume:
-                await self.play_index(index)
+                # A legacy maximum is not a trustworthy last position.  It is
+                # safe for automatic advancement to start from zero instead.
+                await self._play_entry_locked(index)
                 return True
             if choice is None and not automatic:
                 raise ResumeChoiceRequired(offer)
@@ -255,24 +265,36 @@ class PlaybackController:
             if choice not in {None, "resume", "start_over"}:
                 raise ValueError("unknown resume choice")
             if choice == "start_over":
-                await self.play_index(
+                await self._play_entry_locked(
                     index,
                     resume_position_ms=0 if offer.duration_ms > 0 else None,
                     duration_ms=offer.duration_ms,
                     start_over=True,
                 )
             else:
-                await self.play_index(
+                await self._play_entry_locked(
                     index,
                     resume_position_ms=offer.position_ms,
                     duration_ms=offer.duration_ms,
                 )
             return True
-        # Legacy furthest-progress fallback is deliberately interactive.  An
-        # automatic transition cannot claim that maximum as a trustworthy last
-        # position and therefore starts from zero.
-        await self.play_index(index)
+        # No usable resume point: explicit and automatic playback both start at
+        # zero, without presenting a misleading choice.
+        await self._play_entry_locked(index)
         return True
+
+    async def play_with_policy(
+        self,
+        index: int,
+        *,
+        choice: str | None = None,
+        automatic: bool = False,
+    ) -> bool:
+        """Apply the single playback policy used by UI, CLI, and autoplay."""
+        async with self._transition_lock:
+            return await self._play_with_policy_locked(
+                index, choice=choice, automatic=automatic
+            )
 
     async def play_index(
         self,
@@ -330,7 +352,12 @@ class PlaybackController:
                 raise VLCError("absolute seek is unavailable while disconnected")
             status = self.status
             duration = duration_ms or status.duration_ms
-            if duration <= 0 or status.path is not None and not self._same_path(status.path, current.path):
+            if (
+                duration <= 0
+                or status.path is None
+                or not self._same_path(status.path, current.path)
+                or status.state == "unavailable"
+            ):
                 raise VLCError("absolute seek requires a matching item with known duration")
             self._generation += 1
             await self._seek_absolute_locked(position_ms, duration, current.path)

@@ -143,6 +143,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     no_vlc=getattr(args, "no_vlc", False),
                     autoplay=args.command == "play" and bool(selected),
                 )
+                # Preserve the identity of explicit CLI operands so startup
+                # autoplay cannot accidentally target an older queue index.
+                app.autoplay_target_paths = list(selected)
                 if args.command == "resume":
                     # Keep the constructor compatible with integrations that
                     # provide their own app class while still making the

@@ -320,13 +320,22 @@ class Database:
             ).fetchall()
             by_path = {str(row["path"]): row for row in rows}
             current_id = self.get_current_id()
+            active_id = next(
+                (
+                    int(row["id"])
+                    for row in rows
+                    if int(row["id"]) == current_id
+                    and str(row["state"]) in {"playing", "paused"}
+                ),
+                None,
+            )
             selected_ids: list[int] = []
             for path in paths:
                 media_id = self.ensure_media(path)
                 key = str(path.resolve())
                 row = by_path.get(key)
                 if row is not None:
-                    if int(row["id"]) == current_id:
+                    if int(row["id"]) == active_id:
                         continue
                     selected_ids.append(int(row["id"]))
                     if int(row["media_id"]) != media_id and row["state"] not in {"playing", "paused"}:
@@ -346,8 +355,8 @@ class Database:
             # entries relative to one another and do not move the active item.
             selected_set = set(selected_ids)
             remaining = [int(row["id"]) for row in rows if int(row["id"]) not in selected_set]
-            if current_id is not None and current_id in remaining:
-                insertion = remaining.index(current_id) + 1
+            if active_id is not None and active_id in remaining:
+                insertion = remaining.index(active_id) + 1
                 ordered = remaining[:insertion] + selected_ids + remaining[insertion:]
             else:
                 ordered = selected_ids + remaining
@@ -538,12 +547,38 @@ class Database:
         projections = self.history_for_paths([path], root=root)
         return projections.get(path.expanduser().resolve(strict=False))
 
+    def history_for_identities(
+        self,
+        identities: Iterable[tuple[Path, tuple[int, int, int, int]]],
+    ) -> dict[Path, HistoryProjection]:
+        """Read history for already-validated identities without filesystem I/O.
+
+        Callers that validate files asynchronously can hand the owning SQLite
+        thread only canonical paths and fingerprints.  Keeping the SELECT
+        separate from validation prevents rendering from doing blocking stat
+        calls while also preserving the connection's thread ownership.
+        """
+        result: dict[Path, HistoryProjection] = {}
+        columns = (
+            "id,path,position_ms,duration_ms,completion_observed,first_observed,"
+            "last_observed,resume_position_ms,last_played_at"
+        )
+        for path, fingerprint in identities:
+            row = self.connection.execute(
+                f"SELECT {columns} FROM media WHERE path=? AND device=? AND inode=? "
+                "AND size=? AND mtime_ns=?",
+                (str(path), *fingerprint),
+            ).fetchone()
+            if row is not None:
+                result[path] = self._projection(row, path)
+        return result
+
     def history_for_paths(
         self, paths: Iterable[Path], *, root: str | Path | None = None
     ) -> dict[Path, HistoryProjection]:
         """Bulk, read-only history lookup keyed by canonical current paths."""
         base = canonical_root(root) if root is not None else None
-        identities: list[tuple[Path, os.stat_result]] = []
+        identities: list[tuple[Path, tuple[int, int, int, int]]] = []
         for raw_path in paths:
             path = Path(raw_path).expanduser().resolve(strict=False)
             if base is not None and not is_beneath(path, base):
@@ -554,24 +589,10 @@ class Database:
                 continue
             if not path.is_file():
                 continue
-            identities.append((path, stat))
-        if not identities:
-            return {}
-
-        result: dict[Path, HistoryProjection] = {}
-        columns = (
-            "id,path,position_ms,duration_ms,completion_observed,first_observed,"
-            "last_observed,resume_position_ms,last_played_at"
-        )
-        for path, stat in identities:
-            row = self.connection.execute(
-                f"SELECT {columns} FROM media WHERE path=? AND device=? AND inode=? "
-                "AND size=? AND mtime_ns=?",
-                (str(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns),
-            ).fetchone()
-            if row is not None:
-                result[path] = self._projection(row, path)
-        return result
+            identities.append(
+                (path, (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns))
+            )
+        return self.history_for_identities(identities)
 
     # Descriptive alias used by rendering code and external integrations.
     def history_projection(

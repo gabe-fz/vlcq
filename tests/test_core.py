@@ -97,6 +97,28 @@ def test_database_queue_progress_and_export(tmp_path: Path) -> None:
     db.close()
 
 
+def test_play_next_uses_front_when_saved_current_is_not_active(tmp_path: Path) -> None:
+    root = tmp_path / "show"
+    videos = [touch(root / name) for name in ("one.mkv", "two.mkv", "three.mkv")]
+    db = Database(tmp_path / "db.sqlite3")
+    queue = QueueService(db)
+    queue.open(root)
+    queue.add(videos)
+    current = queue.play_now(1)
+    current_path = current.path
+    db.set_state(current.id, "stopped")
+
+    queue.play_next([videos[2]])
+
+    assert [entry.path.name for entry in queue.entries()] == [
+        "three.mkv",
+        "one.mkv",
+        "two.mkv",
+    ]
+    assert queue.current() is not None and queue.current().path == current_path
+    db.close()
+
+
 def test_newer_database_is_preserved_and_rejected(tmp_path: Path) -> None:
     path = tmp_path / "future.sqlite3"
     connection = sqlite3.connect(path)
