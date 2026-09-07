@@ -17,3 +17,8 @@
 - [x] 3.1 Run the complete pytest suite and verify all tests pass without enabling unmanaged media playback.
 - [x] 3.2 Run Ruff and mypy with the project commands and resolve all reported issues.
 - [x] 3.3 Reinstall the CLI into the global tool environment with the established installer and verify the globally resolved `vlcq` command uses the updated installation.
+
+## 4. Verification Remediation
+
+- [x] 4.1 Preserve stale-selection repair through initial TUI rendering so an invalid or cross-queue selected identity remains cleared instead of selecting the first unrelated row, and add a restart test verifying no selection or playback retargeting occurs.
+- [x] 4.2 Report actionable recovery guidance when a database migration fails while preserving the original database, and add an injected-failure test verifying rollback, unchanged source data, and useful CLI guidance.

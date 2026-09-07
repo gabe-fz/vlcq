@@ -11,6 +11,20 @@ from .models import HistoryProjection, QueueEntry
 from .paths import canonical_root, is_beneath
 
 SCHEMA_VERSION = 2
+
+
+class DatabaseMigrationError(RuntimeError):
+    """A schema migration failed without changing the source database."""
+
+    def __init__(self, path: Path, cause: Exception) -> None:
+        super().__init__(
+            f"database migration failed for {path}: {cause}. "
+            "The original database was preserved. Recovery: close vlcq, make a "
+            "private SQLite backup before retrying, or restore a known-good backup; "
+            "do not delete or downgrade the database in place."
+        )
+
+
 _VALID_STATES = frozenset(
     {"queued", "playing", "paused", "stopped", "skipped", "completed", "missing", "failed"}
 )
@@ -27,11 +41,26 @@ class Database:
             os.chmod(self.path.parent, 0o700)
         self.connection = sqlite3.connect(self.path, timeout=5, isolation_level=None)
         self.connection.row_factory = sqlite3.Row
+        self._selected_identity_invalidated = False
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA busy_timeout=5000")
         self.connection.execute("PRAGMA foreign_keys=ON")
-        self._migrate()
+        try:
+            self._migrate()
+        except DatabaseMigrationError:
+            self._close_after_migration_failure()
+            raise
         self._secure_files()
+
+    def _close_after_migration_failure(self) -> None:
+        try:
+            if self.connection.in_transaction:
+                self.connection.rollback()
+        except sqlite3.DatabaseError:
+            pass
+        finally:
+            self.connection.close()
+            self._secure_files()
 
     def _secure_files(self) -> None:
         for candidate in (
@@ -97,16 +126,19 @@ class Database:
         version = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
         if version > SCHEMA_VERSION:
             raise RuntimeError("database was created by a newer vlcq")
-        if version == 0:
-            self._create_schema()
-        elif version == 1:
-            self._transactional_schema_change(
-                (
-                    "ALTER TABLE media ADD COLUMN resume_position_ms INTEGER",
-                    "ALTER TABLE media ADD COLUMN last_played_at TEXT",
-                ),
-                SCHEMA_VERSION,
-            )
+        try:
+            if version == 0:
+                self._create_schema()
+            elif version == 1:
+                self._transactional_schema_change(
+                    (
+                        "ALTER TABLE media ADD COLUMN resume_position_ms INTEGER",
+                        "ALTER TABLE media ADD COLUMN last_played_at TEXT",
+                    ),
+                    SCHEMA_VERSION,
+                )
+        except Exception as exc:
+            raise DatabaseMigrationError(self.path, exc) from exc
 
     def close(self) -> None:
         self._secure_files()
@@ -218,8 +250,15 @@ class Database:
             entry_id = None
         if entry_id is None or not self._entry_belongs_to_active_queue(entry_id):
             self.connection.execute("DELETE FROM settings WHERE key='selected_entry'")
+            self._selected_identity_invalidated = True
             return None
         return entry_id
+
+    def consume_selected_identity_invalidated(self) -> bool:
+        """Return whether a stale selected identity was repaired since last read."""
+        invalidated = self._selected_identity_invalidated
+        self._selected_identity_invalidated = False
+        return invalidated
 
     get_selected = get_selected_id
     get_selected_entry_id = get_selected_id
@@ -306,6 +345,7 @@ class Database:
                 )
                 if not valid:
                     self.connection.execute("DELETE FROM settings WHERE key='selected_entry'")
+                    self._selected_identity_invalidated = True
 
             if current_id is None:
                 self.connection.execute(

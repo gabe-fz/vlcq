@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from .config import database_path
-from .database import Database
+from .database import Database, DatabaseMigrationError
 from .finder import resolve_handoff
 from .ipc import ControllerBusy, ControllerLock
 from .paths import PathError, canonical_root, common_root, validate_video
@@ -155,6 +155,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             finally:
                 database.close()
         return 0
+    except DatabaseMigrationError as exc:
+        print(f"vlcq: {exc}", file=sys.stderr)
+        return 2
     except (
         PathError,
         ControllerBusy,

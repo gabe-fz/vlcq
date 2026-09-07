@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from pathlib import Path
 
@@ -86,6 +87,84 @@ def test_commandless_cli_opens_last_library(
         "autoplay": False,
         "ran": True,
     }
+
+
+def test_cli_reports_migration_recovery_and_preserves_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "show"
+    root.mkdir()
+    video = root / "episode.mkv"
+    video.write_bytes(b"video")
+    db_path = tmp_path / "db.sqlite3"
+    connection = sqlite3.connect(db_path)
+    connection.executescript(
+        """
+        CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE queues(
+            id INTEGER PRIMARY KEY, root TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE media(
+            id INTEGER PRIMARY KEY, path TEXT NOT NULL,
+            device INTEGER NOT NULL, inode INTEGER NOT NULL, size INTEGER NOT NULL,
+            mtime_ns INTEGER NOT NULL, position_ms INTEGER NOT NULL DEFAULT 0,
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            completion_observed INTEGER NOT NULL DEFAULT 0,
+            first_observed TEXT NOT NULL, last_observed TEXT NOT NULL,
+            UNIQUE(path, device, inode, size, mtime_ns)
+        );
+        CREATE TABLE queue_entries(
+            id INTEGER PRIMARY KEY, queue_id INTEGER NOT NULL REFERENCES queues(id),
+            position INTEGER NOT NULL, media_id INTEGER NOT NULL REFERENCES media(id),
+            state TEXT NOT NULL DEFAULT 'queued', UNIQUE(queue_id, position)
+        );
+        """
+    )
+    connection.execute(
+        "INSERT INTO settings(key,value) VALUES('active_queue','1')"
+    )
+    connection.execute(
+        "INSERT INTO queues(id,root,created_at,updated_at) VALUES(1,?,?,?)",
+        (str(root), "created", "updated"),
+    )
+    stat = video.stat()
+    connection.execute(
+        "INSERT INTO media(id,path,device,inode,size,mtime_ns,first_observed,last_observed) "
+        "VALUES(1,?,?,?,?,?,?,?)",
+        (str(video), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, "first", "last"),
+    )
+    connection.execute(
+        "INSERT INTO queue_entries(id,queue_id,position,media_id,state) VALUES(1,1,0,1,'queued')"
+    )
+    connection.execute("PRAGMA user_version=1")
+    connection.commit()
+    connection.close()
+
+    def injected_failure(
+        database: Database, statements: tuple[str, ...], version: int
+    ) -> None:
+        del version
+        database.connection.execute("BEGIN IMMEDIATE")
+        database.connection.execute(statements[0])
+        raise sqlite3.OperationalError("injected migration failure")
+
+    monkeypatch.setattr(Database, "_transactional_schema_change", injected_failure)
+    assert main(
+        ["--database", str(db_path), "progress", "--root", str(root), "--json"]
+    ) == 2
+    error = capsys.readouterr().err
+    assert "database migration failed" in error
+    assert "original database was preserved" in error
+    assert "private SQLite backup" in error
+
+    preserved = sqlite3.connect(db_path)
+    assert preserved.execute("PRAGMA user_version").fetchone() == (1,)
+    columns = {row[1] for row in preserved.execute("PRAGMA table_info(media)")}
+    assert "resume_position_ms" not in columns
+    assert preserved.execute("SELECT root FROM queues WHERE id=1").fetchone() == (str(root),)
+    assert preserved.execute("SELECT COUNT(*) FROM queue_entries").fetchone() == (1,)
+    preserved.close()
 
 
 def test_progress_cli_root_filtered(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -628,6 +707,43 @@ async def test_tui_queue_highlight_persists_by_entry_identity_and_clears_on_remo
         assert db.get_selected_id() is None
         assert view.index is None
     db.close()
+
+
+@pytest.mark.asyncio
+async def test_tui_restart_does_not_retarget_stale_cross_queue_selection(tmp_path: Path) -> None:
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first = first_root / "first.mkv"
+    second = second_root / "second.mkv"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+
+    db_path = tmp_path / "db.sqlite3"
+    db = Database(db_path)
+    queue = QueueService(db)
+    queue.open(first_root)
+    queue.add([first])
+    stale_entry_id = queue.entries()[0].id
+    queue.open(second_root)
+    queue.add([second])
+    db.connection.execute(
+        "INSERT INTO settings(key,value) VALUES('selected_entry',?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (str(stale_entry_id),),
+    )
+    db.close()
+
+    reopened = Database(db_path)
+    app = VLCQApp(root=second_root, database=reopened, no_vlc=True)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        view = app.query_one("#queue", ListView)
+        assert view.index is None
+        assert reopened.get_selected_id() is None
+        assert app.queue.current() is None
+    reopened.close()
 
 
 @pytest.mark.asyncio

@@ -536,6 +536,9 @@ class VLCQApp(App[None]):
         self.database = database
         self.queue = QueueService(database)
         self.root = self.queue.open(root)
+        # Keep the one-shot repair signal so initial rendering does not turn
+        # an invalid persisted identity into a new, unrelated highlight.
+        self._queue_selection_invalidated = self.database.consume_selected_identity_invalidated()
         self.browser_path = self.root
         self.browser_entries: list[BrowserEntry] = []
         self._browser_source_entries: list[BrowserEntry] = []
@@ -1136,6 +1139,10 @@ class VLCQApp(App[None]):
             if isinstance(old_row, QueueListItem):
                 old_view_id = old_row.entry_id
         old_persisted_id = self.database.get_selected_id()
+        selection_invalidated = (
+            self._queue_selection_invalidated
+            or self.database.consume_selected_identity_invalidated()
+        )
         entries = self.queue.entries()
         if selected_entry_id is None and selected_path is not None:
             selected_entry_id = next(
@@ -1148,7 +1155,12 @@ class VLCQApp(App[None]):
             target_id = old_view_id
         entry_ids = {entry.id for entry in entries}
         target_present = target_id in entry_ids if target_id is not None else False
-        had_identity = old_view_id is not None or old_persisted_id is not None or selection_captured
+        had_identity = (
+            old_view_id is not None
+            or old_persisted_id is not None
+            or selection_captured
+            or selection_invalidated
+        )
 
         queue_paths = [entry.path for entry in entries]
         self._schedule_history_refresh(
@@ -1197,6 +1209,7 @@ class VLCQApp(App[None]):
                     self.database.set_selected(None)
         finally:
             self._restoring_queue_selection = False
+            self._queue_selection_invalidated = False
         self._render_headers()
 
     def refresh_playback(self) -> None:
