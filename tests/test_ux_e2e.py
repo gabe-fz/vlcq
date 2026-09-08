@@ -62,11 +62,13 @@ async def test_mouse_workflow_at_compact_and_wide_sizes(tmp_path: Path, size: tu
         await pilot.pause()
         assert app.queue.current() is not None
 
-        # Mouse transport and queue controls target the active/highlighted object.
-        await choose_menu_action(pilot, "#player-menu", "Pause / resume")
+        # Promoted mouse transport stays direct rather than being duplicated in overflow.
+        await pilot.click("#player-pause")
+        await pilot.pause()
         browser.index = 1
         await pilot.click(".browser-check")
-        await choose_menu_action(pilot, "#files-actions", "Add to end")
+        await pilot.click("#files-add")
+        await pilot.pause()
         queue_view = app.query_one("#queue", ListView)
         queue_view.focus()
         queue_view.index = 0

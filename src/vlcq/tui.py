@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Literal
@@ -19,7 +21,7 @@ from .config import resolve_watched_percent
 from .controller import PlaybackController, ResumeChoiceRequired, ResumeOffer
 from .database import Database
 from .models import BrowserEntry, HistoryProjection, QueueEntry
-from .paths import VIDEO_EXTENSIONS, PathError, canonical_root, is_beneath, list_folder, natural_key
+from .paths import VIDEO_EXTENSIONS, PathError, is_beneath, list_folder, natural_key
 from .progress import clamped_percentage
 from .queue import QueueService
 from .vlc import VLCError
@@ -689,6 +691,7 @@ class VLCQApp(App[None]):
         self._search_generation = 0
         self._recursive_entries: list[BrowserEntry] = []
         self._recursive_task: asyncio.Task[None] | None = None
+        self._recursive_cancel: threading.Event | None = None
         self._search_loading = False
         self.selected_paths: set[Path] = set()
         self._browser_highlight_path: Path | None = None
@@ -785,6 +788,8 @@ class VLCQApp(App[None]):
         self._history_tasks.clear()
         if self._browser_mount_task is not None:
             self._browser_mount_task.cancel()
+        if self._recursive_cancel is not None:
+            self._recursive_cancel.set()
         if self._recursive_task is not None:
             self._recursive_task.cancel()
         for folder in list(self._tree_tasks):
@@ -1007,6 +1012,12 @@ class VLCQApp(App[None]):
         minutes = (total // 60) % 60
         hours = total // 3600
         return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
+
+    async def _run_database_operation[Result](
+        self, operation: Callable[[], Result]
+    ) -> Result:
+        """Run one compound queue/database operation without blocking Textual input."""
+        return await asyncio.to_thread(self.database.run_serialized, operation)
 
     def _history_for(self, paths: list[Path]) -> dict[Path, HistoryProjection]:
         return {
@@ -1342,10 +1353,17 @@ class VLCQApp(App[None]):
         highlighted_path: Path | None,
         old_scroll_y: float,
     ) -> None:
-        """Replace the list in DOM order while reusing path-identical rows."""
-        await browser.remove_children()
-        if rows:
-            await browser.mount(*rows)
+        """Reconcile DOM order while preserving still-visible row widgets."""
+        desired = set(rows)
+        obsolete = [row for row in browser.children if row not in desired]
+        if obsolete:
+            await browser.remove_children(obsolete)
+        attached = set(browser.children)
+        new_rows = [row for row in rows if row not in attached]
+        if new_rows:
+            await browser.mount(*new_rows)
+        order: dict[Widget, int] = {row: index for index, row in enumerate(rows)}
+        browser.sort_children(key=lambda row: order[row])
         if highlighted_path is not None:
             restored = next(
                 (index for index, entry in enumerate(self.browser_entries) if entry.path == highlighted_path),
@@ -1424,7 +1442,10 @@ class VLCQApp(App[None]):
                     old_by_path[old_row.path] = old_row
             new_rows: list[BrowserListItem] = []
             for entry in self.browser_entries:
-                reusable_row = old_by_path.get(entry.path) or self._browser_rows_by_path.get(entry.path)
+                # Textual dismantles descendants when a row is removed. Reuse
+                # only rows still in the current list; cached detached rows no
+                # longer contain their label/progress children.
+                reusable_row = old_by_path.get(entry.path)
                 if reusable_row is not None and reusable_row.is_dir == entry.is_dir:
                     self._update_browser_row(reusable_row, entry, queued_paths)
                     reusable_row.set_class(entry.path in self.selected_paths, "selected-video")
@@ -1521,15 +1542,23 @@ class VLCQApp(App[None]):
         current_task = asyncio.current_task()
         previous_task = self._recursive_task
         if previous_task is not None and previous_task is not current_task and not previous_task.done():
+            if self._recursive_cancel is not None:
+                self._recursive_cancel.set()
             previous_task.cancel()
         self._recursive_task = current_task
+        cancel_event = threading.Event()
+        self._recursive_cancel = cancel_event
         self._search_generation += 1
         search_generation = self._search_generation
         self._search_loading = True
         from .paths import discover_tree
 
         try:
-            discovered = await asyncio.to_thread(discover_tree, self.root)
+            discovered = await asyncio.to_thread(
+                discover_tree,
+                self.root,
+                cancel=cancel_event.is_set,
+            )
             if generation is not None and generation != self._tree_generation:
                 return
             if search_generation != self._search_generation:
@@ -1558,6 +1587,7 @@ class VLCQApp(App[None]):
         finally:
             if self._recursive_task is current_task:
                 self._recursive_task = None
+                self._recursive_cancel = None
                 self._search_loading = False
 
     async def refresh_browser(self) -> None:
@@ -1885,13 +1915,15 @@ class VLCQApp(App[None]):
         current = self.queue.current()
         if current is not None and current.id == entry.id and current.state in {"playing", "paused"}:
             if current.state == "paused":
-                self.queue.set_current_state(current.id, "playing")
+                await self._run_database_operation(
+                    lambda: self.queue.set_current_state(current.id, "playing")
+                )
             return True
         offer = ResumeOffer(
             self.queue.database.history_for(entry.path, root=self.root), self.watched_percent
         )
         if offer.completed:
-            self.queue.play_now(index)
+            await self._run_database_operation(lambda: self.queue.play_now(index))
             return True
         if self._offer_requires_choice(offer):
             if choice is None and not automatic:
@@ -1900,7 +1932,7 @@ class VLCQApp(App[None]):
                 return False
             if choice not in {None, "resume", "start_over"}:
                 raise ValueError("unknown resume choice")
-        self.queue.play_now(index)
+        await self._run_database_operation(lambda: self.queue.play_now(index))
         return True
 
     async def _play_queue_index(
@@ -1942,7 +1974,7 @@ class VLCQApp(App[None]):
             self.push_screen(ResumePrompt(offer), chosen)
             return
         try:
-            self.queue.add([entry.path])
+            await self._run_database_operation(lambda: self.queue.add([entry.path]))
             index = self._queue_path_index(entry.path)
             if index is None:
                 raise RuntimeError("video was not added to the queue")
@@ -2099,7 +2131,7 @@ class VLCQApp(App[None]):
             self.update_status("Nothing to add — highlight a playable video or select one")
             return
         try:
-            self.queue.add(paths)
+            await self._run_database_operation(lambda: self.queue.add(paths))
         except (OSError, PathError, RuntimeError, ValueError) as exc:
             self.update_status(f"Add failed: {exc}")
             return
@@ -2114,7 +2146,7 @@ class VLCQApp(App[None]):
             self.update_status("Nothing to place next — select or highlight a video")
             return
         try:
-            self.queue.play_next(paths)
+            await self._run_database_operation(lambda: self.queue.play_next(paths))
         except (OSError, PathError, RuntimeError, ValueError) as exc:
             self.update_status(f"Play next failed: {exc}")
             return
@@ -2130,7 +2162,7 @@ class VLCQApp(App[None]):
 
     async def action_undo(self) -> None:
         try:
-            restored = self.queue.undo()
+            restored = await self._run_database_operation(self.queue.undo)
         except (OSError, RuntimeError, ValueError) as exc:
             self.update_status(f"Undo refused: {exc}")
         else:
@@ -2140,7 +2172,7 @@ class VLCQApp(App[None]):
     async def _finish_add_and_play(self, paths: list[Path], choice: str | None = None) -> None:
         target = paths[0]
         try:
-            self.queue.add(paths)
+            await self._run_database_operation(lambda: self.queue.add(paths))
             index = self._queue_path_index(target)
             if index is None:
                 raise RuntimeError("video was not added to the queue")
@@ -2174,36 +2206,41 @@ class VLCQApp(App[None]):
             return
         await self._finish_add_and_play(paths)
 
+    async def _change_root(self, value: str) -> None:
+        try:
+            self.root = await self._run_database_operation(lambda: self.queue.open(value))
+        except (OSError, PathError) as exc:
+            self.update_status(str(exc))
+            return
+        self.browser_path = self.root
+        self._root_generation += 1
+        self._tree_generation += 1
+        self.expanded_paths.clear()
+        self._tree_children.clear()
+        self._tree_loaded.clear()
+        self._browser_rows_by_path.clear()
+        self._browser_scroll_anchor = 0.0
+        self._recursive_entries.clear()
+        self._search_generation += 1
+        if self._recursive_task is not None and not self._recursive_task.done():
+            if self._recursive_cancel is not None:
+                self._recursive_cancel.set()
+            self._recursive_task.cancel()
+        self.selected_paths.clear()
+        self._browser_highlight_path = None
+        try:
+            self.query_one("#browser", ListView).index = None
+        except NoMatches:
+            pass
+        self._history_cache.clear()
+        self.history.clear()
+        await self.refresh_browser()
+        self.refresh_queue()
+
     def action_open_root(self) -> None:
         def opened(value: str | None) -> None:
-            if not value:
-                return
-            try:
-                self.root = self.queue.open(canonical_root(value))
-                self.browser_path = self.root
-                self._root_generation += 1
-                self._tree_generation += 1
-                self.expanded_paths.clear()
-                self._tree_children.clear()
-                self._tree_loaded.clear()
-                self._browser_rows_by_path.clear()
-                self._browser_scroll_anchor = 0.0
-                self._recursive_entries.clear()
-                self._search_generation += 1
-                if self._recursive_task is not None and not self._recursive_task.done():
-                    self._recursive_task.cancel()
-                self.selected_paths.clear()
-                self._browser_highlight_path = None
-                try:
-                    self.query_one("#browser", ListView).index = None
-                except NoMatches:
-                    pass
-                self._history_cache.clear()
-                self.history.clear()
-                self.call_later(self.refresh_browser)
-                self.call_later(self.refresh_queue)
-            except PathError as exc:
-                self.update_status(str(exc))
+            if value:
+                self.run_worker(self._change_root(value), exclusive=True)
 
         self.push_screen(RootPrompt(), opened)
 
@@ -2218,7 +2255,9 @@ class VLCQApp(App[None]):
         try:
             if self.no_vlc:
                 state = "paused" if current.state == "playing" else "playing"
-                self.queue.set_current_state(current.id, state)
+                await self._run_database_operation(
+                    lambda: self.queue.set_current_state(current.id, state)
+                )
             else:
                 await self.controller.toggle_pause()
                 state = self.controller.status.state
@@ -2234,7 +2273,7 @@ class VLCQApp(App[None]):
             return
         try:
             if self.no_vlc:
-                entry = self.queue.next()
+                entry = await self._run_database_operation(self.queue.next)
             else:
                 await self.controller.next()
                 entry = self.queue.current()
@@ -2250,7 +2289,7 @@ class VLCQApp(App[None]):
             return
         try:
             if self.no_vlc:
-                entry = self.queue.previous()
+                entry = await self._run_database_operation(self.queue.previous)
             else:
                 await self.controller.previous()
                 entry = self.queue.current()
@@ -2302,14 +2341,19 @@ class VLCQApp(App[None]):
             ):
                 self.update_status("Remove blocked: VLC stop could not be confirmed")
                 return
-            self.queue.remove(index, stop_confirmed=self.no_vlc or entry.state in {"playing", "paused"})
+            await self._run_database_operation(
+                lambda: self.queue.remove(
+                    index,
+                    stop_confirmed=self.no_vlc or entry.state in {"playing", "paused"},
+                )
+            )
         except (IndexError, OSError, RuntimeError, ValueError) as exc:
             self.update_status(f"Remove failed: {exc}")
         else:
             self.update_status(f"Removed {entry.path.name}; media was not changed · Undo available")
         self.refresh_queue()
 
-    def action_move_down(self) -> None:
+    async def action_move_down(self) -> None:
         if not self._queue_has_focus():
             self.update_status("Move is available in the Queue section")
             return
@@ -2319,14 +2363,14 @@ class VLCQApp(App[None]):
             return
         selected_entry_id = self._queue_selected_id()
         try:
-            self.queue.move(index, 1)
+            await self._run_database_operation(lambda: self.queue.move(index, 1))
         except (IndexError, OSError, RuntimeError) as exc:
             self.update_status(f"Move failed: {exc}")
         else:
             self.update_status("Moved queue item down")
         self.refresh_queue(selected_entry_id=selected_entry_id, selection_captured=True)
 
-    def action_move_up(self) -> None:
+    async def action_move_up(self) -> None:
         if not self._queue_has_focus():
             self.update_status("Move is available in the Queue section")
             return
@@ -2336,7 +2380,7 @@ class VLCQApp(App[None]):
             return
         selected_entry_id = self._queue_selected_id()
         try:
-            self.queue.move(index, -1)
+            await self._run_database_operation(lambda: self.queue.move(index, -1))
         except (IndexError, OSError, RuntimeError) as exc:
             self.update_status(f"Move failed: {exc}")
         else:
@@ -2354,7 +2398,7 @@ class VLCQApp(App[None]):
         try:
             if not self.no_vlc and self.controller.client is None:
                 await self.controller.start()
-            entry = self.queue.retry(index)
+            entry = await self._run_database_operation(lambda: self.queue.retry(index))
             if not self.no_vlc:
                 await self.controller.play_index(index)
         except FileNotFoundError:
@@ -2376,7 +2420,7 @@ class VLCQApp(App[None]):
             ):
                 self.update_status("Clear blocked: VLC stop could not be confirmed")
                 return
-            self.queue.clear_all(stop_confirmed=True)
+            await self._run_database_operation(lambda: self.queue.clear_all(stop_confirmed=True))
         except (OSError, RuntimeError, ValueError) as exc:
             self.update_status(f"Clear failed: {exc}")
             return
@@ -2520,14 +2564,17 @@ class VLCQApp(App[None]):
         file_target = self._context_library_target(entry)
         actions: list[ContextAction] = []
         if file_target is not None:
-            actions.extend(self._context_actions_for_file(file_target))
+            actions.extend(
+                action
+                for action in self._context_actions_for_file(file_target)
+                if action.key != "add-end-file"
+            )
         actions.extend(
             [
                 ContextAction("open-root", "Open/change root", target),
                 ContextAction("parent", "Up", target, self.browser_path != self.root),
                 ContextAction("search-filter", "Search / filters…", target),
                 ContextAction("sort-files", "Reverse filename order", target),
-                ContextAction("add-selection", self._batch_label("Add to end"), target, bool(self._paths_for_add())),
                 ContextAction("next-selection", self._batch_label("Play next"), target, bool(self._paths_for_add())),
                 ContextAction("add-play-selection", self._batch_label("Add & play"), target, bool(self._paths_for_add())),
                 ContextAction("clear-selection", "Clear selection", target, bool(self.selected_paths)),
@@ -2558,7 +2605,6 @@ class VLCQApp(App[None]):
     def _context_actions_for_queue_section(self, target: SectionTarget) -> list[ContextAction]:
         actions = [
             ContextAction("sort-queue", "Sort naturally", target, bool(self.queue.entries())),
-            ContextAction("clear-completed", "Clear watched/completed", target, self._queue_has_clearable()),
             ContextAction("clear-all", "Clear queue", target, bool(self.queue.entries())),
             ContextAction("undo", "Undo latest removal", target, self.queue.undo_available),
         ]
@@ -2595,11 +2641,8 @@ class VLCQApp(App[None]):
         current = self.queue.current()
         connected = self.no_vlc or self.controller.client is not None
         return [
-            ContextAction("pause", "Pause / resume", target, current is not None and connected),
-            ContextAction("previous", "Previous", target, bool(self.queue.entries())),
             ContextAction("seek-back", "Seek back 10s", target, connected and current is not None),
             ContextAction("seek-forward", "Seek forward 10s", target, connected and current is not None),
-            ContextAction("next", "Next", target, bool(self.queue.entries())),
             ContextAction("reconnect", "Reconnect", target, not self.no_vlc),
             ContextAction("active-details", "Active player details", target, current is not None),
             ContextAction(
@@ -2763,7 +2806,7 @@ class VLCQApp(App[None]):
             await self._open_details(BrowserEntry(target.path, target.path.name, False, True), pane="browser")
         elif key == "sort-queue":
             selected_entry_id = self._queue_selected_id()
-            self.queue.sort_natural()
+            await self._run_database_operation(self.queue.sort_natural)
             self.refresh_queue(selected_entry_id=selected_entry_id, selection_captured=True)
             self.update_status("Queue sorted naturally")
         elif key == "clear-completed":
@@ -2780,9 +2823,9 @@ class VLCQApp(App[None]):
             await self._play_queue_index(index, choice=choice)
             self.refresh_queue()
         elif key == "move-up":
-            self.action_move_up()
+            await self.action_move_up()
         elif key == "move-down":
-            self.action_move_down()
+            await self.action_move_down()
         elif key == "remove-queue":
             await self.action_remove_target(target)
         elif key == "details-queue" and isinstance(target, QueueTarget):
@@ -2824,7 +2867,7 @@ class VLCQApp(App[None]):
             self.update_status("Nothing to add")
             return
         try:
-            self.queue.add(paths)
+            await self._run_database_operation(lambda: self.queue.add(paths))
         except (OSError, PathError, RuntimeError, ValueError) as exc:
             self.update_status(f"Add failed: {exc}")
             return
@@ -2838,7 +2881,7 @@ class VLCQApp(App[None]):
             self.update_status("Nothing to place next")
             return
         try:
-            self.queue.play_next(paths)
+            await self._run_database_operation(lambda: self.queue.play_next(paths))
         except (OSError, PathError, RuntimeError, ValueError) as exc:
             self.update_status(f"Play next failed: {exc}")
             return
@@ -2953,7 +2996,9 @@ class VLCQApp(App[None]):
                     ):
                         self.update_status("Clear blocked: VLC stop could not be confirmed")
                         return
-                    self.queue.clear_completed(stop_confirmed=True)
+                    await self._run_database_operation(
+                        lambda: self.queue.clear_completed(stop_confirmed=True)
+                    )
                 except (OSError, RuntimeError, ValueError) as exc:
                     self.update_status(f"Clear failed: {exc}")
                     return

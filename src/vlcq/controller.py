@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from pathlib import Path
 
 from .models import HistoryProjection, QueueEntry, VLCStatus
@@ -74,6 +75,11 @@ class PlaybackController:
     @property
     def playback_generation(self) -> int:
         return self._generation
+
+    async def _run_database_operation[Result](
+        self, operation: Callable[[], Result]
+    ) -> Result:
+        return await asyncio.to_thread(self.queue.database.run_serialized, operation)
 
     async def start(self) -> None:
         """Connect exactly once and own exactly one polling task."""
@@ -190,44 +196,50 @@ class PlaybackController:
             # be resumed, but its media identity and position stay intact.
             if current.state == "paused":
                 self.status = await self.client.command("pl_pause")
-                self._sync_queue_state(self.status, entry.path)
+                await self._sync_queue_state(self.status, entry.path)
             return
 
         await self._capture_final_observation_locked()
         self._generation += 1
         generation = self._generation
         self._near_end_seen = False
-        self.queue.play_now(entry_index)
+        await self._run_database_operation(lambda: self.queue.play_now(entry_index))
         try:
             response = await self.client.play(entry.path)
             ready = await self._wait_for_expected_media(response, entry.path, generation)
             self.status = ready
             self._last_valid_status = ready
-            self._sync_queue_state(ready, entry.path)
+            await self._sync_queue_state(ready, entry.path)
             if start_over:
-                self.queue.update_progress(
-                    entry.path,
-                    0,
-                    duration_ms or ready.duration_ms,
-                    trustworthy=True,
-                    resume_position_ms=0,
-                    allow_resume_reset=True,
+                await self._run_database_operation(
+                    lambda: self.queue.update_progress(
+                        entry.path,
+                        0,
+                        duration_ms or ready.duration_ms,
+                        trustworthy=True,
+                        resume_position_ms=0,
+                        allow_resume_reset=True,
+                    )
                 )
             if resume_position_ms is not None:
                 seek_duration = duration_ms or ready.duration_ms
                 if seek_duration <= 0:
                     raise VLCError("cannot seek without a known duration")
                 await self._seek_absolute_locked(resume_position_ms, seek_duration, entry.path)
-                self.queue.update_progress(
-                    entry.path,
-                    resume_position_ms,
-                    seek_duration,
-                    trustworthy=True,
-                    resume_position_ms=resume_position_ms,
-                    allow_resume_reset=True,
+                await self._run_database_operation(
+                    lambda: self.queue.update_progress(
+                        entry.path,
+                        resume_position_ms,
+                        seek_duration,
+                        trustworthy=True,
+                        resume_position_ms=resume_position_ms,
+                        allow_resume_reset=True,
+                    )
                 )
         except (VLCError, OSError, TimeoutError):
-            self.queue.set_current_state(entry.id, "failed")
+            await self._run_database_operation(
+                lambda: self.queue.set_current_state(entry.id, "failed")
+            )
             self.status = VLCStatus("unavailable", path=entry.path)
             raise
 
@@ -332,7 +344,9 @@ class PlaybackController:
                 start_over=start_over,
             )
 
-    def _sync_queue_state(self, status: VLCStatus, expected_path: Path | None = None) -> None:
+    async def _sync_queue_state(
+        self, status: VLCStatus, expected_path: Path | None = None
+    ) -> None:
         """Reflect an observed controller state on the active queue row."""
         current = self.queue.current()
         if current is None:
@@ -341,10 +355,14 @@ class PlaybackController:
         if observed_path is not None and not self._same_path(observed_path, current.path):
             return
         if not current.path.is_file():
-            self.queue.set_current_state(current.id, "missing")
+            await self._run_database_operation(
+                lambda: self.queue.set_current_state(current.id, "missing")
+            )
             return
         if status.state in {"playing", "paused", "stopped"}:
-            self.queue.set_current_state(current.id, status.state)
+            await self._run_database_operation(
+                lambda: self.queue.set_current_state(current.id, status.state)
+            )
 
     async def toggle_pause(self) -> None:
         async with self._transition_lock:
@@ -352,7 +370,7 @@ class PlaybackController:
                 self._generation += 1
                 self.status = await self.client.command("pl_pause")
                 self._last_valid_status = self.status
-                self._sync_queue_state(self.status)
+                await self._sync_queue_state(self.status)
 
     async def seek(self, seconds: int) -> None:
         async with self._transition_lock:
@@ -363,7 +381,7 @@ class PlaybackController:
                 if status.state != "unavailable":
                     self.status = status
                     self._last_valid_status = status
-                    self._sync_queue_state(status)
+                    await self._sync_queue_state(status)
 
     async def seek_absolute(self, position_ms: int, duration_ms: int | None = None) -> None:
         async with self._transition_lock:
@@ -381,13 +399,15 @@ class PlaybackController:
                 raise VLCError("absolute seek requires a matching item with known duration")
             self._generation += 1
             await self._seek_absolute_locked(position_ms, duration, current.path)
-            self.queue.update_progress(
-                current.path,
-                max(0, min(position_ms, duration)),
-                duration,
-                trustworthy=True,
-                resume_position_ms=max(0, min(position_ms, duration)),
-                allow_resume_reset=True,
+            await self._run_database_operation(
+                lambda: self.queue.update_progress(
+                    current.path,
+                    max(0, min(position_ms, duration)),
+                    duration,
+                    trustworthy=True,
+                    resume_position_ms=max(0, min(position_ms, duration)),
+                    allow_resume_reset=True,
+                )
             )
 
     async def _play_automatic_entry_locked(self, entry: QueueEntry) -> None:
@@ -405,31 +425,37 @@ class PlaybackController:
             ready = await self._wait_for_expected_media(response, path, self._generation)
             self.status = ready
             self._last_valid_status = ready
-            self._sync_queue_state(ready, path)
+            await self._sync_queue_state(ready, path)
             if start_over:
-                self.queue.update_progress(
-                    path,
-                    0,
-                    offer.duration_ms or ready.duration_ms,
-                    trustworthy=True,
-                    resume_position_ms=0,
-                    allow_resume_reset=True,
+                await self._run_database_operation(
+                    lambda: self.queue.update_progress(
+                        path,
+                        0,
+                        offer.duration_ms or ready.duration_ms,
+                        trustworthy=True,
+                        resume_position_ms=0,
+                        allow_resume_reset=True,
+                    )
                 )
             if resume_position is not None:
                 duration = offer.duration_ms or ready.duration_ms
                 if duration <= 0:
                     raise VLCError("cannot resume without a known duration")
                 await self._seek_absolute_locked(resume_position, duration, path)
-                self.queue.update_progress(
-                    path,
-                    resume_position,
-                    duration,
-                    trustworthy=True,
-                    resume_position_ms=resume_position,
-                    allow_resume_reset=True,
+                await self._run_database_operation(
+                    lambda: self.queue.update_progress(
+                        path,
+                        resume_position,
+                        duration,
+                        trustworthy=True,
+                        resume_position_ms=resume_position,
+                        allow_resume_reset=True,
+                    )
                 )
         except (VLCError, OSError, TimeoutError):
-            self.queue.set_current_state(entry_id, "failed")
+            await self._run_database_operation(
+                lambda: self.queue.set_current_state(entry_id, "failed")
+            )
             self.status = VLCStatus("unavailable", path=path)
             raise
 
@@ -438,7 +464,7 @@ class PlaybackController:
             await self._capture_final_observation_locked()
             self._near_end_seen = False
             self._generation += 1
-            entry = self.queue.next(completed)
+            entry = await self._run_database_operation(lambda: self.queue.next(completed))
             if entry and self.client:
                 await self._play_automatic_entry_locked(entry)
 
@@ -447,7 +473,7 @@ class PlaybackController:
             await self._capture_final_observation_locked()
             self._near_end_seen = False
             self._generation += 1
-            entry = self.queue.previous()
+            entry = await self._run_database_operation(self.queue.previous)
             if entry and self.client:
                 await self._play_automatic_entry_locked(entry)
 
@@ -476,22 +502,28 @@ class PlaybackController:
         if current is None or observed_path is None or not self._same_path(observed_path, current.path):
             return
         if not current.path.is_file():
-            self.queue.set_current_state(current.id, "missing")
+            await self._run_database_operation(
+                lambda: self.queue.set_current_state(current.id, "missing")
+            )
             return
         self.status = status
         self._last_valid_status = status
-        self._sync_queue_state(status, observed_path)
+        await self._sync_queue_state(status, observed_path)
         try:
             trustworthy = not (status.state == "stopped" and status.position_ms == 0)
-            self.queue.update_progress(
-                observed_path,
-                status.position_ms,
-                status.duration_ms,
-                trustworthy=trustworthy,
-                resume_position_ms=status.position_ms,
+            await self._run_database_operation(
+                lambda: self.queue.update_progress(
+                    observed_path,
+                    status.position_ms,
+                    status.duration_ms,
+                    trustworthy=trustworthy,
+                    resume_position_ms=status.position_ms,
+                )
             )
         except OSError:
-            self.queue.set_current_state(current.id, "missing")
+            await self._run_database_operation(
+                lambda: self.queue.set_current_state(current.id, "missing")
+            )
             return
         if (
             status.state == "playing"
@@ -500,13 +532,15 @@ class PlaybackController:
         ):
             self._near_end_seen = True
         if status.state == "stopped" and self._near_end_seen:
-            self.queue.update_progress(
-                observed_path,
-                status.duration_ms,
-                status.duration_ms,
-                completed=True,
-                trustworthy=True,
-                resume_position_ms=status.duration_ms,
+            await self._run_database_operation(
+                lambda: self.queue.update_progress(
+                    observed_path,
+                    status.duration_ms,
+                    status.duration_ms,
+                    completed=True,
+                    trustworthy=True,
+                    resume_position_ms=status.duration_ms,
+                )
             )
             if allow_advance and (generation is None or generation == self._generation):
                 await self.next(completed=True)
@@ -560,7 +594,9 @@ class PlaybackController:
                 ):
                     return False
                 if current is not None:
-                    self.queue.set_current_state(current.id, "stopped")
+                    await self._run_database_operation(
+                        lambda: self.queue.set_current_state(current.id, "stopped")
+                    )
                 self.status = VLCStatus("stopped", response.position_ms, response.duration_ms, expected)
                 self._last_valid_status = self.status
                 return True
@@ -589,5 +625,7 @@ class PlaybackController:
             self.queue.invalidate_undo()
             current = self.queue.current()
             if current is not None and current.state in {"playing", "paused"}:
-                self.queue.set_current_state(current.id, "stopped")
+                await self._run_database_operation(
+                    lambda: self.queue.set_current_state(current.id, "stopped")
+                )
             self.status = VLCStatus("unavailable")

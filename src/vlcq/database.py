@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
+from functools import wraps
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from .models import HistoryProjection, QueueEntry
@@ -12,6 +14,29 @@ from .paths import canonical_root, is_beneath
 from .progress import is_watched
 
 SCHEMA_VERSION = 2
+
+
+def _locked_method(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Serialize access to the shared SQLite connection across UI workers."""
+
+    @wraps(method)
+    def locked(self: Database, *args: Any, **kwargs: Any) -> Any:
+        with self._connection_lock:
+            return method(self, *args, **kwargs)
+
+    return locked
+
+
+def _serialize_database_methods[DatabaseClass: type[Any]](
+    cls: DatabaseClass,
+) -> DatabaseClass:
+    """Apply the connection lock to every instance operation except construction."""
+    for name, attribute in tuple(vars(cls).items()):
+        if name == "__init__" or isinstance(attribute, (staticmethod, classmethod)):
+            continue
+        if callable(attribute):
+            setattr(cls, name, _locked_method(attribute))
+    return cls
 
 
 class DatabaseMigrationError(RuntimeError):
@@ -31,8 +56,10 @@ _VALID_STATES = frozenset(
 )
 
 
+@_serialize_database_methods
 class Database:
     def __init__(self, path: str | Path) -> None:
+        self._connection_lock = RLock()
         self.path = Path(path).expanduser()
         parent_existed = self.path.parent.exists()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -40,7 +67,12 @@ class Database:
             raise RuntimeError("refusing a symlinked database location")
         if not parent_existed:
             os.chmod(self.path.parent, 0o700)
-        self.connection = sqlite3.connect(self.path, timeout=5, isolation_level=None)
+        self.connection = sqlite3.connect(
+            self.path,
+            timeout=5,
+            isolation_level=None,
+            check_same_thread=False,
+        )
         self.connection.row_factory = sqlite3.Row
         self._selected_identity_invalidated = False
         self.connection.execute("PRAGMA journal_mode=WAL")
@@ -145,6 +177,15 @@ class Database:
         self._secure_files()
         self.connection.close()
         self._secure_files()
+
+    def run_serialized[Result](self, operation: Callable[[], Result]) -> Result:
+        """Run a compound queue operation under the connection lock.
+
+        TUI callers execute this method in a worker thread so filesystem and
+        SQLite latency cannot block Textual input. The re-entrant lock keeps
+        the operation atomic with respect to ordinary Database method calls.
+        """
+        return operation()
 
     def _active_queue_id(self) -> int:
         row = self.connection.execute(

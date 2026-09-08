@@ -321,7 +321,7 @@ async def test_bottom_player_is_single_bounded_summary_and_menu_is_complete(tmp_
         assert app.query_one("#progress-line").display
         assert app.query_one("#notice").display
         assert app.query_one("#notice").region.height == 1
-        async def player_action(label: str) -> Button:
+        async def overflow_action(label: str) -> Button:
             await pilot.click("#player-menu")
             await pilot.pause()
             button = next(button for button in app.screen.query(Button) if str(button.label) == label)
@@ -331,22 +331,23 @@ async def test_bottom_player_is_single_bounded_summary_and_menu_is_complete(tmp_
 
         await pilot.click("#player-menu")
         await pilot.pause()
-        assert any(str(button.label) == "Pause / resume" for button in app.screen.query(Button))
+        overflow_labels = {str(button.label) for button in app.screen.query(Button)}
+        assert {"Pause / resume", "Previous", "Next"}.isdisjoint(overflow_labels)
         reconnect = next(button for button in app.screen.query(Button) if str(button.label) == "Reconnect")
         assert reconnect.disabled
         await pilot.press("escape")
-        await player_action("Pause / resume")
+        await pilot.click("#player-pause")
         assert app.queue.current() is not None
-        await player_action("Seek back 10s")
+        await overflow_action("Seek back 10s")
         assert "offline" in app._notice.lower()
-        await player_action("Next")
+        await pilot.click("#player-next")
         assert app.queue.current() is None
-        await player_action("Previous")
+        await pilot.click("#player-previous")
         assert app.queue.current() is not None
-        await player_action("Active player details")
+        await overflow_action("Active player details")
         assert "Full path:" in str(app.query_one("#details-content", Static).renderable)
         await pilot.click("#details-close")
-        await player_action("Help")
+        await overflow_action("Help")
         await pilot.click("#help-close")
         await pilot.click("#player-menu")
         await pilot.pause()

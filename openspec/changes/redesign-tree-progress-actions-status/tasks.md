@@ -37,3 +37,10 @@
 - [x] 6.1 Update README documentation for the expandable tree, filename syntax colors, watched threshold/environment setting, per-item bars, direct/overflow controls, filters, and taller status area, and verify documented keys and labels match the implemented UI.
 - [x] 6.2 Run `.venv/bin/python -m pytest`, `.venv/bin/python -m ruff check .`, and `.venv/bin/python -m mypy src`, fixing all regressions and verifying the complete offline suite passes; no real-VLC smoke run is required because process/HTTP integration is unchanged.
 - [x] 6.3 Reinstall the completed CLI globally with `pipx install --force .` and verify the globally resolved `vlcq` reports/runs the updated installation in offline mode.
+
+## 7. Verification Remediation
+
+- [x] 7.1 Make recursive search cancellation cooperative inside the discovery worker and verify superseded scans stop without applying stale results.
+- [x] 7.2 Serialize shared SQLite access and move TUI/controller database mutations off the event loop, with a delayed-write responsiveness test.
+- [x] 7.3 Remove promoted direct actions from section/player overflow menus while retaining contextual and less-common actions.
+- [x] 7.4 Add focused coverage for watched configuration/classification/export/replay, recursive confinement and deduplication, multi-branch tree state, progress bars, direct controls, live seeking, filtering, cancellation, and responsive writes.
