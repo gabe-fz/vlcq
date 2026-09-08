@@ -7,6 +7,7 @@ from pathlib import Path
 from .database import Database
 from .models import QueueEntry
 from .paths import deduplicate_natural, is_beneath, natural_key, validate_video
+from .progress import is_watched
 
 
 class ActivePlaybackError(RuntimeError):
@@ -21,8 +22,11 @@ class QueueUndoSnapshot:
 
 
 class QueueService:
-    def __init__(self, database: Database) -> None:
+    def __init__(self, database: Database, watched_percent: int = 90) -> None:
+        if not 1 <= int(watched_percent) <= 100:
+            raise ValueError("watched threshold must be an integer from 1 through 100")
         self.database = database
+        self.watched_percent = int(watched_percent)
         self.root = database.get_root()
         self._undo: QueueUndoSnapshot | None = None
         self._undo_expired = False
@@ -117,7 +121,12 @@ class QueueService:
             if entry.state == "completed":
                 continue
             history = self.database.history_for(entry.path, root=self.root)
-            if history is not None and history.completion_observed:
+            if history is not None and is_watched(
+                history.position_ms,
+                history.duration_ms,
+                completion_observed=history.completion_observed,
+                threshold=self.watched_percent,
+            ):
                 continue
             return index
         return None
@@ -211,7 +220,19 @@ class QueueService:
         self.database.remove_entries([entry.id])
 
     def clear_completed(self, *, stop_confirmed: bool = False) -> None:
-        selected = [entry for entry in self.entries() if entry.state == "completed"]
+        selected = []
+        for entry in self.entries():
+            if entry.state == "completed":
+                selected.append(entry)
+                continue
+            history = self.database.history_for(entry.path, root=self.root)
+            if history is not None and is_watched(
+                history.position_ms,
+                history.duration_ms,
+                completion_observed=history.completion_observed,
+                threshold=self.watched_percent,
+            ):
+                selected.append(entry)
         if not selected:
             return
         current = self.current()

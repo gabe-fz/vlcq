@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import sqlite3
 import subprocess
@@ -8,7 +9,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from .config import database_path
+from .config import database_path, resolve_watched_percent
 from .database import Database, DatabaseMigrationError
 from .finder import resolve_handoff
 from .ipc import ControllerBusy, ControllerLock
@@ -19,7 +20,9 @@ from .tui import VLCQApp
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        prog="vlcq", description="Folder-first deterministic VLC queue"
+        prog="vlcq",
+        description="Folder-first deterministic VLC queue",
+        epilog="Watched status uses VLCQ_WATCHED_PERCENT (whole 1-100, default 90).",
     )
     result.add_argument("--database", type=Path, default=None, help=argparse.SUPPRESS)
     sub = result.add_subparsers(dest="command")
@@ -83,6 +86,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
     db_path: Path = args.database if args.database is not None else database_path()
     try:
+        # Resolve policy before opening the database so a bad environment
+        # setting cannot mutate queue, history, or media state.
+        watched_percent = resolve_watched_percent()
         if args.command == "progress":
             progress_root = canonical_root(args.root)
             database = Database(db_path)
@@ -90,7 +96,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 document = {
                     "version": 1,
                     "root": str(progress_root),
-                    "records": database.export_progress(progress_root),
+                    "records": database.export_progress(progress_root, watched_percent),
                 }
                 print(json.dumps(document, indent=2, sort_keys=True))
             finally:
@@ -133,16 +139,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                         selected = [validate_video(path, root) for path in selected]
                 else:
                     root, selected = _resolve_paths(args.paths, active_saved_root)
-                queue = QueueService(database)
+                queue = QueueService(database, watched_percent)
                 queue.open(root)
                 if selected:
                     queue.add(selected)
-                app = VLCQApp(
-                    root=root,
-                    database=database,
-                    no_vlc=getattr(args, "no_vlc", False),
-                    autoplay=args.command == "play" and bool(selected),
-                )
+                app_kwargs: dict[str, object] = {
+                    "root": root,
+                    "database": database,
+                    "no_vlc": getattr(args, "no_vlc", False),
+                    "autoplay": args.command == "play" and bool(selected),
+                }
+                # Keep compatibility with small injected app doubles used by
+                # integrations while passing the resolved policy to vlcq's
+                # actual TUI constructor.
+                if "watched_percent" in inspect.signature(VLCQApp).parameters:
+                    app_kwargs["watched_percent"] = watched_percent
+                app = VLCQApp(**app_kwargs)  # type: ignore[arg-type]
                 # Preserve the identity of explicit CLI operands so startup
                 # autoplay cannot accidentally target an older queue index.
                 app.autoplay_target_paths = list(selected)

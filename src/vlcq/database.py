@@ -9,6 +9,7 @@ from typing import Any
 
 from .models import HistoryProjection, QueueEntry
 from .paths import canonical_root, is_beneath
+from .progress import is_watched
 
 SCHEMA_VERSION = 2
 
@@ -805,7 +806,19 @@ class Database:
     ) -> dict[Path, HistoryProjection]:
         return self.history_for_paths(paths, root=root)
 
-    def export_progress(self, root: str | Path) -> dict[str, dict[str, Any]]:
+    def export_progress(
+        self, root: str | Path, watched_percent: int = 90, *, threshold: int | None = None
+    ) -> dict[str, dict[str, Any]]:
+        """Export the stable version-1 document records for a confined root.
+
+        ``threshold`` is an explicit spelling accepted by integrations; the
+        positional ``watched_percent`` keeps the existing API compatible.
+        Exporting is read-only and deliberately does not call ``ensure_media``.
+        """
+        if threshold is not None:
+            watched_percent = threshold
+        if not 1 <= int(watched_percent) <= 100:
+            raise ValueError("watched threshold must be an integer from 1 through 100")
         base = canonical_root(root)
         records: dict[str, dict[str, Any]] = {}
         for row in self.connection.execute(
@@ -826,7 +839,12 @@ class Database:
                 "positionMs": position,
                 "durationMs": duration,
                 "watchedPercent": min(100, round(position * 100 / duration)) if duration else 0,
-                "completionObserved": bool(row["completion_observed"]),
+                "completionObserved": is_watched(
+                    position,
+                    duration,
+                    completion_observed=bool(row["completion_observed"]),
+                    threshold=watched_percent,
+                ),
                 "observedAt": row["last_observed"],
             }
         return dict(sorted(records.items()))

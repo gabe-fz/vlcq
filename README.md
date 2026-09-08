@@ -1,8 +1,8 @@
 # vlcq
 
 `vlcq` is a folder-first Textual interface for a deterministic, persistent VLC 3
-video queue on macOS. It browses local folders without automatically enqueueing
-their contents, sends VLC one selected item at a time, and records monotonic
+video queue on macOS. It browses a lazily expandable library tree without automatically
+enqueueing its contents, sends VLC one selected item at a time, and records monotonic
 playback history plus a separate trustworthy resume position in SQLite.
 
 ## Install
@@ -17,7 +17,9 @@ python3 -m venv .venv
 ```
 
 Running `vlcq` reopens the last library, or displays the native macOS folder
-chooser on first use. You can also open a specific root directly:
+chooser on first use. You can also open a specific root directly. The Files pane keeps
+that root visible while folders expand/collapse in place; normal discovery is lazy and
+search/filter discovery is recursive and asynchronous:
 
 ```sh
 vlcq play ~/Videos/Show
@@ -41,32 +43,41 @@ section. Each header remains visible and its `…` menu provides the section’s
 Right-clicking a row opens the same contextual actions, and `Shift+F10` is the keyboard
 fallback. Menus remain inside the terminal and scroll when needed.
 
-Rows are one line: filenames are rendered literally, including bracketed release tags.
-Checkboxes select library videos. A queue-row highlight is a durable, identity-based
-Details selection and never starts playback; the diamond marks the independent current
-playback item. Pending queue position is implicit rather than a `QUEUED` badge. Only the
-current row may show **Playing**, **Paused**, or **Stopped**; **Skipped**, **Completed**,
-**Missing**, and **Failed** remain visible as outcomes. Positive read-only history is shown
-separately as **In progress** or **Completed** with furthest progress. Unplayed rows omit a
-history badge. Click a folder to open it. Full paths, resume/furthest positions, durations,
-fingerprints, and missing history are available through **Details**.
+Rows are one line: filenames remain literal, including bracketed release tags, while
+folders, stems, bracketed spans, numeric runs, punctuation, and extensions use distinct
+syntax colors. Checkbox targets select library videos. Files and Queue items with positive
+history show a thick read-only bar and whole percentage; unknown durations show `?%`.
+A queue-row highlight is a durable, identity-based Details selection and never starts
+playback; the diamond marks the independent current playback item. Pending queue position
+is implicit rather than a `QUEUED` badge. Only the current row may show **Playing**,
+**Paused**, or **Stopped**; **Skipped**, **Completed**, **Missing**, and **Failed** remain
+visible as outcomes. Unplayed rows omit a history badge. Click a folder to expand it.
+Full paths, resume/furthest positions, durations, watched threshold, fingerprints, and
+missing history are available through **Details**.
 
-Search and **All / In progress / Not completed** filters open from the Files menu. The
-Files header keeps the active search/filter and selected/hidden counts visible. Selections
-remain explicit across filtering and subfolder navigation; batch menu labels include their
-counts. **Play now** always targets the highlighted item, while **Add to end**, **Play next**,
-and **Add & play** explicitly use the selected batch when one exists.
+The Files header exposes **Open**, **Search/filter**, **Add**, and `…`; Queue exposes
+**Play/pause**, **Next**, **Clear**, and `…`; the player exposes **Previous**, **Play/pause**,
+**Next**, and `…`. The overflow menus retain Details, resume/start-over, reorder, undo,
+reconnect, help, and quit. Search and **All / In progress / Not watched** filters discover
+the whole root without enqueueing results. The Files header keeps active search/filter and
+selected/hidden counts visible. Selections remain explicit across filtering, collapsing,
+and resizing. **Play now** always targets the highlighted item, while **Add to end**,
+**Play next**, and **Add & play** use the selected batch when one exists.
 
 Selecting an incomplete item with a trustworthy resume point opens **Resume**, **Start
 over**, or **Cancel**. Legacy rows use **Resume from furthest recorded progress**; their
 last-played time remains unknown. Start over preserves maximum history and completion.
-Automatic advancement uses a trustworthy resume without opening a modal.
+An item is **Watched** when explicit completion exists or furthest progress reaches the
+configured threshold (90% by default). Threshold classification never advances playback
+or changes queue outcome state. Set `VLCQ_WATCHED_PERCENT` to a whole number from 1 through
+100; invalid values fail startup before database mutation. Automatic advancement uses a
+trustworthy resume without opening a modal.
 
-The bottom area is limited to a player summary, a one-line progress track/percentage, and
-a bounded notice. The player menu contains pause/resume, previous/next, relative seek,
-reconnect, active-player details, full notice access, Help, and Quit. Reconnect never
-selects or autoplays a queue item. Absolute seek is available only for connected matching
-media with a known positive duration.
+The bounded bottom area contains a player summary, a thick live progress track/percentage,
+a player action bar, and a one-line notice. The player overflow contains remaining time,
+relative seek, reconnect, active-player details, full notice access, Help, and Quit.
+Reconnect never selects or autoplays a queue item. Absolute seek is available only for
+connected matching media with a known positive duration; item history bars are inert.
 
 ## TUI keys
 
@@ -85,7 +96,7 @@ media with a known positive duration.
 | `d` | Remove queue entry (never the media file) |
 | `J` / `K` | Move queue entry down/up |
 | `r` | Retry selected queue entry |
-| `c` | Clear completed entries |
+| `c` | Clear watched/completed entries |
 | `Shift+F10` | Open contextual actions for the focused section |
 | `?` | Help |
 | `q` | Quit after choosing whether to stop or keep the owned VLC process |
@@ -102,6 +113,15 @@ Empty sections show one short next-action hint, focused sections receive a disti
 highlight, and queue rows display current-state or outcome indicators (`▶ PLAYING`,
 `Ⅱ PAUSED`, `■ STOPPED`, `→ SKIPPED`, `✓ COMPLETED`, `! MISSING`, and `× FAILED`). Hidden
 dotfiles and unsupported file types are not shown.
+
+## Watched threshold
+
+Watched status is derived from explicit completion or furthest recorded progress. The
+threshold defaults to 90 percent and can be set before startup with
+`VLCQ_WATCHED_PERCENT=1..100`. Only decimal whole percentages are accepted; an invalid
+value exits clearly without opening or changing the database. The setting changes display,
+filters, replay choices, Clear watched/completed, and `progress --json` classification, but
+never rewrites stored completion evidence or queue outcomes.
 
 ## Finder / right-click handoff
 

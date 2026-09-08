@@ -15,10 +15,12 @@ from textual.screen import ModalScreen
 from textual.widget import Widget
 from textual.widgets import Button, Input, Label, ListItem, ListView, ProgressBar, Static
 
+from .config import resolve_watched_percent
 from .controller import PlaybackController, ResumeChoiceRequired, ResumeOffer
 from .database import Database
 from .models import BrowserEntry, HistoryProjection, QueueEntry
 from .paths import VIDEO_EXTENSIONS, PathError, canonical_root, is_beneath, list_folder, natural_key
+from .progress import clamped_percentage
 from .queue import QueueService
 from .vlc import VLCError
 
@@ -92,13 +94,112 @@ class CompactButton(Button):
         self.active_effect_duration = 0
 
 
+def render_filename(name: str, *, folder: bool = False, depth: int = 0, expanded: bool = False) -> Text:
+    """Render literal filename syntax as semantic Rich spans.
+
+    No filename is parsed for episode/show meaning: the returned text is the
+    original name with only presentation styles attached to its spans.
+    """
+    text = Text(no_wrap=True, overflow="ellipsis")
+    prefix = "  " * max(0, depth)
+    if folder:
+        text.append(prefix + ("▾ " if expanded else "▸ "), style="bold cyan")
+        text.append(name, style="bold cyan")
+        return text
+
+    suffix = Path(name).suffix
+    stem = name[: -len(suffix)] if suffix else name
+    text.append(prefix)
+    index = 0
+    bracket = False
+    while index < len(stem):
+        character = stem[index]
+        if character == "[":
+            bracket = True
+            text.append(character, style="bold magenta")
+        elif character == "]" and bracket:
+            bracket = False
+            text.append(character, style="bold magenta")
+        elif bracket:
+            text.append(character, style="magenta")
+        elif character.isdigit():
+            end = index + 1
+            while end < len(stem) and stem[end].isdigit():
+                end += 1
+            text.append(stem[index:end], style="bold yellow")
+            index = end - 1
+        elif not character.isalnum() and character != "_":
+            text.append(character, style="bright_black")
+        else:
+            text.append(character, style="white")
+        index += 1
+    if suffix:
+        text.append(suffix, style="bold green")
+    return text
+
+
+class ItemProgress(Static):
+    """Fixed-width, read-only history progress attached to one item row."""
+
+    BAR_WIDTH = 8
+
+    def __init__(
+        self,
+        percentage: int | None,
+        watched: bool,
+        *,
+        visible: bool = False,
+        id: str | None = None,
+    ) -> None:
+        super().__init__(id=id, classes="history-bar")
+        self.percentage = percentage
+        self.watched = watched
+        self.display = visible or percentage is not None or watched
+        self._render_progress()
+
+    def set_progress(
+        self, percentage: int | None, watched: bool, *, visible: bool = False
+    ) -> None:
+        self.percentage = percentage
+        self.watched = watched
+        self.display = visible or percentage is not None or watched
+        self._render_progress()
+
+    def _render_progress(self) -> None:
+        if not self.display:
+            self.update("")
+            return
+        if self.percentage is None:
+            bar = "?" * self.BAR_WIDTH
+            value = "?%"
+            style = "green" if self.watched else "yellow"
+        else:
+            filled = round(self.BAR_WIDTH * self.percentage / 100)
+            bar = "█" * filled + "░" * (self.BAR_WIDTH - filled)
+            value = f"{self.percentage}%"
+            style = "green" if self.watched else "yellow"
+        self.update(Text(f" {bar} {value:>4}", style=style, no_wrap=True))
+
+
 class BrowserListItem(ListItem):
     path: Path
     is_dir: bool
+    depth: int
 
-    def __init__(self, entry: BrowserEntry, renderable: Text, selected: bool = False) -> None:
+    def __init__(
+        self,
+        entry: BrowserEntry,
+        renderable: Text,
+        selected: bool = False,
+        *,
+        depth: int = 0,
+        history_percentage: int | None = None,
+        history_watched: bool = False,
+        history_visible: bool = False,
+    ) -> None:
         self.path = entry.path
         self.is_dir = entry.is_dir
+        self.depth = depth
         classes = "folder-entry" if entry.is_dir else "video-entry"
         if selected:
             classes += " selected-video"
@@ -114,6 +215,9 @@ class BrowserListItem(ListItem):
                         tooltip="Deselect video" if selected else "Select video",
                     ),
                     Label(renderable, classes="row-label", markup=False),
+                    ItemProgress(
+                        history_percentage, history_watched, visible=history_visible
+                    ),
                     classes="browser-row",
                 ),
                 classes=classes,
@@ -131,9 +235,21 @@ class QueueListItem(ListItem):
         current_id: int | None,
         selected_id: int | None,
         renderable: Text,
+        *,
+        history_percentage: int | None = None,
+        history_watched: bool = False,
+        history_visible: bool = False,
     ) -> None:
         self.entry_id = entry.id
-        super().__init__(Label(renderable, classes="row-label", markup=False))
+        super().__init__(
+            Horizontal(
+                Label(renderable, classes="row-label", markup=False),
+                ItemProgress(
+                    history_percentage, history_watched, visible=history_visible
+                ),
+                classes="queue-row",
+            )
+        )
         display_state = (
             entry.state
             if current_id == entry.id or entry.state not in _TRANSIENT_QUEUE_STATES
@@ -182,7 +298,7 @@ class SearchFilterPrompt(ModalScreen[tuple[str, str] | None]):
         with Horizontal(classes="dialog-actions search-filters"):
             yield Button("All", id="search-filter-all")
             yield Button("In progress", id="search-filter-progress")
-            yield Button("Not completed", id="search-filter-not-completed")
+            yield Button("Not watched", id="search-filter-not-completed")
         with Horizontal(classes="dialog-actions"):
             yield Button("Apply", id="search-apply", variant="primary")
             yield Button("Clear", id="search-clear")
@@ -342,7 +458,7 @@ class ConfirmClear(ModalScreen[bool]):
     ]
 
     def compose(self) -> ComposeResult:
-        yield Static("Clear completed queue entries? Media files will not be changed.", classes="dialog-title")
+        yield Static("Clear watched/completed queue entries? Media files will not be changed.", classes="dialog-title")
         with Horizontal(classes="dialog-actions"):
             yield Button("Clear", id="clear-confirm", variant="error")
             yield Button("Cancel", id="clear-cancel")
@@ -444,7 +560,8 @@ class HelpPrompt(ModalScreen[None]):
         yield Static(
             "Keys: o open · arrows/backspace browse · Enter play/open · v select · "
             "a add · A add & play · Space pause · n/p next/previous · [ ] seek · "
-            "d remove · J/K reorder · r retry · ? help · q quit · Shift+F10 menu",
+            "d remove · J/K reorder · r retry · c clear watched · ? help · q quit · Shift+F10 menu. "
+            "Files and Queue headers and the player bar also expose frequent mouse actions; use … for more.",
             classes="help-content",
             markup=False,
         )
@@ -468,18 +585,22 @@ class VLCQApp(App[None]):
     .section.focused { background: $primary-background; }
     #queue-section.focused { background: $secondary-background; }
     .section-header { height: 1; min-height: 1; width: 1fr; }
-    .section-header Button, #player-line Button {
-        width: 3; min-width: 3; height: 1; min-height: 1; margin: 0; padding: 0;
+    .section-header Button, #player-actions Button {
+        width: auto; min-width: 3; height: 1; min-height: 1; margin: 0; padding: 0 1;
         border: none; content-align: center middle;
     }
+    #files-toggle, #queue-toggle, #files-actions, #queue-actions, #player-menu { width: 3; min-width: 3; padding: 0; }
+    #files-open, #files-search, #files-add, #queue-play, #queue-next, #queue-clear,
+    #player-previous, #player-pause, #player-next { min-width: 5; }
     .section-title { width: 1fr; height: 1; overflow-x: hidden; }
     .section-body { height: 1fr; min-height: 1; }
     .section.collapsed .section-body { display: none; }
     #browser, #queue { height: 1fr; min-height: 1; overflow-x: auto; overflow-y: auto; }
     #browser > ListItem, #queue > ListItem { width: auto; min-width: 100%; height: 1; min-height: 1; }
-    .browser-row { width: 1fr; height: 1; min-height: 1; }
+    .browser-row, .queue-row { width: 1fr; height: 1; min-height: 1; }
     .browser-check { width: 3; min-width: 3; height: 1; min-height: 1; margin: 0; padding: 0; border: none; }
     .row-label { width: 1fr; height: 1; min-height: 1; overflow-x: hidden; }
+    .history-bar { width: 14; min-width: 14; height: 1; min-height: 1; padding: 0; content-align: right middle; }
     .folder-entry { color: $primary-lighten-2; text-style: bold; }
     .video-entry { color: $text; }
     .selected-video { color: $warning; text-style: bold; }
@@ -494,9 +615,10 @@ class VLCQApp(App[None]):
     .queued-badge { color: $accent; }
     #player-line { height: 1; min-height: 1; background: $boost; }
     #player { width: 1fr; height: 1; min-height: 1; padding: 0 1; overflow-x: hidden; }
-    #progress-line { height: 1; min-height: 1; }
-    #progress { width: 1fr; height: 1; min-height: 1; }
-    #progress-percent { width: 7; height: 1; min-height: 1; content-align: right middle; padding: 0 1; }
+    #progress-line { height: 2; min-height: 2; }
+    #progress { width: 1fr; height: 2; min-height: 2; }
+    #progress-percent { width: 7; height: 2; min-height: 2; content-align: right middle; padding: 0 1; }
+    #player-actions { height: 1; min-height: 1; }
     #notice { height: 1; min-height: 1; padding: 0 1; color: $text-muted; overflow-x: hidden; }
     #context-menu { position: absolute; background: $surface; border: round $accent; padding: 0; overflow-y: auto; }
     .context-action { width: 1fr; min-width: 20; height: 1; min-height: 1; margin: 0; padding: 0 1; border: none; content-align: left middle; }
@@ -544,29 +666,46 @@ class VLCQApp(App[None]):
         database: Database,
         no_vlc: bool = False,
         autoplay: bool = False,
+        watched_percent: int | None = None,
     ) -> None:
         super().__init__()
+        self.watched_percent = resolve_watched_percent(watched_percent)
         self.database = database
-        self.queue = QueueService(database)
+        self.queue = QueueService(database, self.watched_percent)
         self.root = self.queue.open(root)
         # Keep the one-shot repair signal so initial rendering does not turn
         # an invalid persisted identity into a new, unrelated highlight.
         self._queue_selection_invalidated = self.database.consume_selected_identity_invalidated()
+        # ``browser_path`` remains as a compatibility/navigation anchor for
+        # integrations, while the visible model is always rooted at ``root``.
         self.browser_path = self.root
         self.browser_entries: list[BrowserEntry] = []
         self._browser_source_entries: list[BrowserEntry] = []
+        self._tree_children: dict[Path, list[BrowserEntry]] = {}
+        self._tree_loaded: set[Path] = set()
+        self.expanded_paths: set[Path] = set()
+        self._tree_tasks: dict[Path, asyncio.Task[None]] = {}
+        self._tree_generation = 0
+        self._search_generation = 0
+        self._recursive_entries: list[BrowserEntry] = []
+        self._recursive_task: asyncio.Task[None] | None = None
+        self._search_loading = False
         self.selected_paths: set[Path] = set()
+        self._browser_highlight_path: Path | None = None
         self.history: dict[Path, HistoryProjection] = {}
         self._history_cache: dict[
             Path, tuple[tuple[int, int, int, int] | None, HistoryProjection | None]
         ] = {}
         self._history_tasks: dict[str, asyncio.Task[None]] = {}
+        self._browser_mount_task: asyncio.Task[None] | None = None
+        self._browser_rows_by_path: dict[Path, BrowserListItem] = {}
+        self._browser_scroll_anchor = 0.0
         self._browser_refresh_token = 0
         self._root_generation = 0
         self.search_query = ""
         self.history_filter = "all"
         self.browser_reverse = False
-        self.controller = PlaybackController(self.queue)
+        self.controller = PlaybackController(self.queue, watched_percent=self.watched_percent)
         self.no_vlc = no_vlc
         self.autoplay = autoplay
         self.autoplay_target_paths: list[Path] = []
@@ -582,7 +721,10 @@ class VLCQApp(App[None]):
                 with Horizontal(id="files-header", classes="section-header"):
                     yield CompactButton("▾", id="files-toggle", tooltip="Collapse Files")
                     yield Static("Files", id="files-title", classes="section-title")
-                    yield CompactButton("…", id="files-actions", tooltip="Files actions")
+                    yield CompactButton("Open", id="files-open", tooltip="Open or change library root")
+                    yield CompactButton("Search", id="files-search", tooltip="Search and filter files")
+                    yield CompactButton("Add", id="files-add", tooltip="Add highlighted or selected files")
+                    yield CompactButton("…", id="files-actions", tooltip="More Files actions")
                 with Vertical(id="files-body", classes="section-body"):
                     yield Static("No folders or playable videos here — use Files actions to open a root.", id="files-empty")
                     yield ListView(id="browser")
@@ -590,16 +732,23 @@ class VLCQApp(App[None]):
                 with Horizontal(id="queue-header", classes="section-header"):
                     yield CompactButton("▾", id="queue-toggle", tooltip="Collapse Queue")
                     yield Static("Queue", id="queue-title", classes="section-title")
-                    yield CompactButton("…", id="queue-actions", tooltip="Queue actions")
+                    yield CompactButton("Play", id="queue-play", tooltip="Play or pause current queue item")
+                    yield CompactButton("Next", id="queue-next", tooltip="Play next queue item")
+                    yield CompactButton("Clear", id="queue-clear", tooltip="Clear watched/completed queue entries")
+                    yield CompactButton("…", id="queue-actions", tooltip="More Queue actions")
                 with Vertical(id="queue-body", classes="section-body"):
                     yield Static("Queue is empty — use Files actions to add a video.", id="queue-empty")
                     yield ListView(id="queue")
         with Horizontal(id="player-line"):
             yield Static("Idle · disconnected", id="player")
-            yield CompactButton("…", id="player-menu", tooltip="Player and application actions")
         with Horizontal(id="progress-line"):
             yield ProgressBar(total=100, id="progress", show_eta=False)
-            yield Static("?", id="progress-percent")
+            yield Static("?%", id="progress-percent")
+        with Horizontal(id="player-actions"):
+            yield CompactButton("Previous", id="player-previous", tooltip="Previous queue item")
+            yield CompactButton("Play", id="player-pause", tooltip="Play or pause current item")
+            yield CompactButton("Next", id="player-next", tooltip="Next queue item")
+            yield CompactButton("…", id="player-menu", tooltip="More player and application actions")
         yield Static("Ready", id="notice")
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
@@ -634,6 +783,12 @@ class VLCQApp(App[None]):
         for task in self._history_tasks.values():
             task.cancel()
         self._history_tasks.clear()
+        if self._browser_mount_task is not None:
+            self._browser_mount_task.cancel()
+        if self._recursive_task is not None:
+            self._recursive_task.cancel()
+        for folder in list(self._tree_tasks):
+            self._cancel_tree_task(folder)
         if not self.no_vlc:
             await self.controller.stop()
 
@@ -743,6 +898,9 @@ class VLCQApp(App[None]):
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
         if event.list_view.id == "browser":
             self._last_pane = "browser"
+            index = event.list_view.index
+            if index is not None and 0 <= index < len(self.browser_entries):
+                self._browser_highlight_path = self.browser_entries[index].path
         else:
             self._last_pane = "queue"
             if not self._restoring_queue_selection:
@@ -767,10 +925,6 @@ class VLCQApp(App[None]):
         self._refresh_headers()
 
     def _render_headers(self) -> None:
-        try:
-            relative = self.browser_path.relative_to(self.root)
-        except ValueError:
-            relative = Path(".")
         visible_selected = sum(1 for entry in self.browser_entries if entry.path in self.selected_paths)
         hidden_selected = len(self.selected_paths) - visible_selected
         selection = ""
@@ -782,17 +936,54 @@ class VLCQApp(App[None]):
         if self.search_query:
             discovery.append(f"search:{self.search_query}")
         if self.history_filter != "all":
-            discovery.append(self.history_filter.replace("not-completed", "not completed"))
+            discovery.append(self.history_filter.replace("not-completed", "not watched"))
         if discovery:
             selection += " · " + ", ".join(discovery)
-        title = f"Files · {self.root.name} / {relative}{selection}"
+        location = self.root.name
+        if self.browser_path != self.root:
+            try:
+                location += f" · focus: {self.browser_path.relative_to(self.root)}"
+            except ValueError:
+                pass
+        title = f"Files · {location}{selection}"
         queue_count = len(self.queue.entries())
         queue_title = f"Queue · {queue_count} entr{'y' if queue_count == 1 else 'ies'}"
         try:
             self.query_one("#files-title", Static).update(title)
             self.query_one("#queue-title", Static).update(queue_title)
+            self._refresh_action_buttons()
         except NoMatches:
             pass
+
+    def _refresh_action_buttons(self) -> None:
+        """Keep direct controls aligned with the same targeting predicates."""
+        try:
+            files_add = self.query_one("#files-add", Button)
+            queue_play = self.query_one("#queue-play", Button)
+            queue_next = self.query_one("#queue-next", Button)
+            queue_clear = self.query_one("#queue-clear", Button)
+            player_pause = self.query_one("#player-pause", Button)
+            player_previous = self.query_one("#player-previous", Button)
+            player_next = self.query_one("#player-next", Button)
+        except NoMatches:
+            return
+        current = self.queue.current()
+        connected = self.no_vlc or self.controller.client is not None
+        clearable = any(
+            entry.state == "completed"
+            or (
+                (history := self.history.get(entry.path)) is not None
+                and history.watched(self.watched_percent)
+            )
+            for entry in self.queue.entries()
+        )
+        files_add.disabled = not bool(self._paths_for_add())
+        queue_play.disabled = current is None or not connected
+        player_pause.disabled = current is None or not connected
+        queue_next.disabled = not self.queue.entries() or not connected
+        player_next.disabled = not self.queue.entries() or not connected
+        player_previous.disabled = not self.queue.entries() or not connected
+        queue_clear.disabled = not clearable
 
     def _refresh_headers(self) -> None:
         self._render_headers()
@@ -827,13 +1018,18 @@ class VLCQApp(App[None]):
     async def _load_history(
         self, paths: list[Path], *, force: bool = False
     ) -> dict[Path, HistoryProjection]:
-        normalized = list(dict.fromkeys(path.expanduser().resolve(strict=False) for path in paths))[:250]
+        normalized = list(dict.fromkeys(path.expanduser().resolve(strict=False) for path in paths))
         if not normalized:
             return {}
         root = self.root
-        identities = await asyncio.gather(
-            *(asyncio.to_thread(_file_identity, path, root) for path in normalized)
-        )
+        identities: list[tuple[Path, tuple[int, int, int, int]] | None] = []
+        for start in range(0, len(normalized), 100):
+            identities.extend(
+                await asyncio.gather(
+                    *(asyncio.to_thread(_file_identity, path, root) for path in normalized[start : start + 100])
+                )
+            )
+            await asyncio.sleep(0)
         uncached: list[tuple[Path, tuple[int, int, int, int]]] = []
         result: dict[Path, HistoryProjection] = {}
         for path, identity in zip(normalized, identities, strict=True):
@@ -848,16 +1044,18 @@ class VLCQApp(App[None]):
                     result[canonical] = cached[1]
             else:
                 uncached.append((canonical, fingerprint))
-        if uncached:
+        for start in range(0, len(uncached), 100):
+            batch = uncached[start : start + 100]
             try:
-                loaded = self.database.history_for_identities(uncached)
+                loaded = self.database.history_for_identities(batch)
             except (OSError, PathError, RuntimeError):
                 loaded = {}
-            for path, fingerprint in uncached:
+            for path, fingerprint in batch:
                 projection = loaded.get(path)
                 self._history_cache[path] = (fingerprint, projection)
                 if projection is not None:
                     result[path] = projection
+            await asyncio.sleep(0)
         if root != self.root:
             return result
         for path in normalized:
@@ -914,40 +1112,56 @@ class VLCQApp(App[None]):
 
         self._history_tasks[target] = asyncio.create_task(refresh())
 
-    def _history_label(self, path: Path) -> str:
+    def _history_watched(self, path: Path) -> bool:
+        history = self.history.get(path.expanduser().resolve(strict=False))
+        return history is not None and history.watched(self.watched_percent)
+
+    def _history_percentage(self, path: Path) -> int | None:
         history = self.history.get(path.expanduser().resolve(strict=False))
         if history is None:
+            return None
+        if history.completion_observed and history.duration_ms > 0:
+            return 100
+        return clamped_percentage(history.position_ms, history.duration_ms)
+
+    def _history_visible(self, path: Path) -> bool:
+        history = self.history.get(path.expanduser().resolve(strict=False))
+        return history is not None and history.has_recorded_progress
+
+    def _history_label(self, path: Path) -> str:
+        history = self.history.get(path.expanduser().resolve(strict=False))
+        if history is None or not history.has_recorded_progress:
             return ""
-        if history.completion_observed:
-            category = "✓ Completed"
-        elif history.position_ms > 0:
-            category = "~ In progress"
+        if self._history_watched(path):
+            category = "✓ Watched (Completed)"
         else:
-            return ""
+            category = "~ In progress"
         progress = self._format_time(history.position_ms)
         duration = self._format_time(history.duration_ms) if history.duration_ms > 0 else "?"
         return f"{category} {progress}/{duration}"
 
     def _history_class(self, path: Path) -> str:
         history = self.history.get(path.expanduser().resolve(strict=False))
-        if history is not None and history.completion_observed:
+        if history is not None and self._history_watched(path):
             return "history-completed"
         if history is not None and history.position_ms > 0:
             return "history-progress"
         return ""
 
     def _browser_renderable(self, entry: BrowserEntry, selected: bool, queued: bool) -> Text:
-        text = Text(no_wrap=True, overflow="ellipsis")
+        text = render_filename(
+            entry.name,
+            folder=entry.is_dir,
+            depth=self._entry_depth(entry.path),
+            expanded=entry.path in self.expanded_paths,
+        )
         if entry.is_dir:
-            text.append("▸ ", style="cyan bold")
-            text.append(entry.name, style="cyan bold")
             return text
-        text.append(entry.name, style="yellow bold" if selected else "white")
         if queued:
             text.append(" · queued", style="magenta")
         history = self._history_label(entry.path)
         if history:
-            text.append(" · " + history, style="green" if "Completed" in history else "yellow")
+            text.append(" · " + history, style="green" if self._history_watched(entry.path) else "yellow")
         return text
 
     def _queue_renderable(
@@ -959,7 +1173,7 @@ class VLCQApp(App[None]):
             text.append("◆ ", style="bold yellow")
         else:
             text.append("  ")
-        text.append(entry.path.name, style="white")
+        text.append(render_filename(entry.path.name))
         display_state = (
             entry.state
             if current_id == entry.id or entry.state not in _TRANSIENT_QUEUE_STATES
@@ -970,7 +1184,7 @@ class VLCQApp(App[None]):
             text.append(" · " + state_label, style="yellow")
         history = self._history_label(entry.path)
         if history:
-            text.append(" · " + history, style="green" if "Completed" in history else "yellow")
+            text.append(" · " + history, style="green" if self._history_watched(entry.path) else "yellow")
         return text
 
     def _apply_browser_history_rows(self) -> None:
@@ -981,15 +1195,23 @@ class VLCQApp(App[None]):
         if not view.is_attached:
             return
         queued_paths = {entry.path for entry in self.queue.entries()}
+        visible = {entry.path: entry for entry in self.browser_entries}
         for row in view.children:
             if not isinstance(row, BrowserListItem) or row.is_dir:
                 continue
+            entry = visible.get(row.path)
+            if entry is None:
+                continue
             try:
-                entry = next(item for item in self.browser_entries if item.path == row.path)
                 row.query_one(".row-label", Label).update(
                     self._browser_renderable(entry, entry.path in self.selected_paths, entry.path in queued_paths)
                 )
-            except (NoMatches, StopIteration):
+                row.query_one(ItemProgress).set_progress(
+                    self._history_percentage(entry.path),
+                    self._history_watched(entry.path),
+                    visible=self._history_visible(entry.path),
+                )
+            except NoMatches:
                 continue
         self._render_headers()
 
@@ -1014,109 +1236,352 @@ class VLCQApp(App[None]):
                 row.query_one(".row-label", Label).update(
                     self._queue_renderable(entry, current_id, selected_id)
                 )
+                row.query_one(ItemProgress).set_progress(
+                    self._history_percentage(entry.path),
+                    self._history_watched(entry.path),
+                    visible=self._history_visible(entry.path),
+                )
             except NoMatches:
                 continue
         self._render_headers()
 
     def _refresh_browser_history(self) -> None:
-        paths = [entry.path for entry in self._browser_source_entries if entry.supported]
+        paths = [entry.path for entry in self.browser_entries if entry.supported]
         self._schedule_history_refresh(
             paths,
             target="browser",
             expected_browser_path=self.browser_path,
-            force=False,
+            force=True,
         )
 
-    def _filtered_browser_entries(self) -> list[BrowserEntry]:
+    def _entry_depth(self, path: Path) -> int:
+        try:
+            return len(path.relative_to(self.root).parts) - 1
+        except ValueError:
+            return 0
+
+    def _ordered_children(self, folder: Path) -> list[BrowserEntry]:
+        entries = list(self._tree_children.get(folder, ()))
+        if not self.browser_reverse:
+            return entries
+        folders = sorted(
+            (entry for entry in entries if entry.is_dir),
+            key=lambda entry: natural_key(entry.name),
+            reverse=True,
+        )
+        files = sorted(
+            (entry for entry in entries if not entry.is_dir),
+            key=lambda entry: natural_key(entry.name),
+            reverse=True,
+        )
+        return [*folders, *files]
+
+    def _visible_tree_entries(self) -> list[BrowserEntry]:
         result: list[BrowserEntry] = []
-        for entry in self._browser_source_entries:
-            if entry.is_dir:
+
+        def flatten(folder: Path) -> None:
+            for entry in self._ordered_children(folder):
                 result.append(entry)
+                if entry.is_dir and entry.path in self.expanded_paths and entry.path in self._tree_loaded:
+                    flatten(entry.path)
+
+        flatten(self.root)
+        return result
+
+    def _filtered_browser_entries(self) -> list[BrowserEntry]:
+        """Return visible rows, retaining ancestors for active filters."""
+        if not self.search_query and self.history_filter == "all":
+            return self._visible_tree_entries()
+        source = self._recursive_entries
+        if not source:
+            return []
+        matching_files: set[Path] = set()
+        for entry in source:
+            if entry.is_dir:
                 continue
             if self.search_query and self.search_query not in entry.name.casefold():
                 continue
             history = self.history.get(entry.path)
+            watched = history is not None and history.watched(self.watched_percent)
             if self.history_filter == "progress" and not (
-                history is not None and history.position_ms > 0 and not history.completion_observed
+                history is not None and history.position_ms > 0 and not watched
             ):
                 continue
-            if self.history_filter == "not-completed" and history is not None and history.completion_observed:
+            if self.history_filter == "not-completed" and watched:
                 continue
-            result.append(entry)
-        return result
+            matching_files.add(entry.path)
+        included = set(matching_files)
+        by_path = {entry.path: entry for entry in source}
+        for path in tuple(matching_files):
+            parent = by_path.get(path)
+            while parent is not None and parent.parent is not None:
+                included.add(parent.parent)
+                parent = by_path.get(parent.parent)
+        return [entry for entry in source if entry.path in included]
+
+    def _update_browser_row(
+        self, row: BrowserListItem, entry: BrowserEntry, queued_paths: set[Path]
+    ) -> None:
+        try:
+            row.query_one(".row-label", Label).update(
+                self._browser_renderable(entry, entry.path in self.selected_paths, entry.path in queued_paths)
+            )
+            if not entry.is_dir:
+                row.query_one(ItemProgress).set_progress(
+                    self._history_percentage(entry.path),
+                    self._history_watched(entry.path),
+                    visible=self._history_visible(entry.path),
+                )
+        except NoMatches:
+            pass
+
+    async def _mount_browser_rows(
+        self,
+        browser: ListView,
+        rows: list[BrowserListItem],
+        highlighted_path: Path | None,
+        old_scroll_y: float,
+    ) -> None:
+        """Replace the list in DOM order while reusing path-identical rows."""
+        await browser.remove_children()
+        if rows:
+            await browser.mount(*rows)
+        if highlighted_path is not None:
+            restored = next(
+                (index for index, entry in enumerate(self.browser_entries) if entry.path == highlighted_path),
+                None,
+            )
+            browser.index = restored
+        elif self.browser_entries and self._browser_highlight_path is None:
+            browser.index = 0
+        if self.browser_entries:
+            browser.scroll_y = old_scroll_y
+
+    def _schedule_browser_mount(
+        self,
+        browser: ListView,
+        rows: list[BrowserListItem],
+        highlighted_path: Path | None,
+        old_scroll_y: float,
+    ) -> None:
+        if self._browser_mount_task is not None and not self._browser_mount_task.done():
+            self._browser_mount_task.cancel()
+        task = asyncio.create_task(
+            self._mount_browser_rows(browser, rows, highlighted_path, old_scroll_y)
+        )
+        self._browser_mount_task = task
+
+        def finished(done: asyncio.Task[None]) -> None:
+            if self._browser_mount_task is done:
+                self._browser_mount_task = None
+
+        task.add_done_callback(finished)
 
     def _render_browser_rows(self) -> None:
         try:
             browser = self.query_one("#browser", ListView)
         except NoMatches:
             return
-        highlighted_path: Path | None = None
+        highlighted_path: Path | None = self._browser_highlight_path
+        old_scroll_y = browser.scroll_y
+        if old_scroll_y > 0:
+            self._browser_scroll_anchor = old_scroll_y
         if browser.index is not None and 0 <= browser.index < len(self.browser_entries):
             highlighted_path = self.browser_entries[browser.index].path
+        if highlighted_path is not None:
+            self._browser_highlight_path = highlighted_path
         self.browser_entries = self._filtered_browser_entries()
+        self._browser_source_entries = list(self.browser_entries)
         empty = self.query_one("#files-empty", Static)
         empty.display = not bool(self.browser_entries)
         if not self.browser_entries:
-            empty.update("No folders or playable videos match the current view — use Files actions to adjust it.")
-        queued_paths = {entry.path for entry in self.queue.entries()}
-        browser.clear()
-        for entry in self.browser_entries:
-            awaitable_row = BrowserListItem(
-                entry,
-                self._browser_renderable(entry, entry.path in self.selected_paths, entry.path in queued_paths),
-                selected=entry.path in self.selected_paths,
+            empty.update(
+                "No folders or playable videos match the current view — use Files actions to adjust it."
+                if self.search_query or self.history_filter != "all"
+                else "No folders or playable videos here — use Open or Add to choose a library."
             )
-            browser.append(awaitable_row)
-        if highlighted_path is not None:
+        queued_paths = {entry.path for entry in self.queue.entries()}
+        old_rows = list(browser.children)
+        for old_row in old_rows:
+            if isinstance(old_row, BrowserListItem):
+                self._browser_rows_by_path[old_row.path] = old_row
+        same_shape = len(old_rows) == len(self.browser_entries) and all(
+            isinstance(row, BrowserListItem)
+            and row.path == entry.path
+            and row.is_dir == entry.is_dir
+            for row, entry in zip(old_rows, self.browser_entries)
+        )
+        mounted_now = same_shape
+        if same_shape:
+            for row, entry in zip(old_rows, self.browser_entries, strict=True):
+                assert isinstance(row, BrowserListItem)
+                self._update_browser_row(row, entry, queued_paths)
+                row.set_class(entry.path in self.selected_paths, "selected-video")
+        else:
+            old_by_path: dict[Path, BrowserListItem] = {}
+            for old_row in old_rows:
+                if isinstance(old_row, BrowserListItem):
+                    old_by_path[old_row.path] = old_row
+            new_rows: list[BrowserListItem] = []
+            for entry in self.browser_entries:
+                reusable_row = old_by_path.get(entry.path) or self._browser_rows_by_path.get(entry.path)
+                if reusable_row is not None and reusable_row.is_dir == entry.is_dir:
+                    self._update_browser_row(reusable_row, entry, queued_paths)
+                    reusable_row.set_class(entry.path in self.selected_paths, "selected-video")
+                    new_rows.append(reusable_row)
+                else:
+                    new_rows.append(
+                        BrowserListItem(
+                            entry,
+                            self._browser_renderable(
+                                entry,
+                                entry.path in self.selected_paths,
+                                entry.path in queued_paths,
+                            ),
+                            selected=entry.path in self.selected_paths,
+                            depth=self._entry_depth(entry.path),
+                            history_percentage=self._history_percentage(entry.path),
+                            history_watched=self._history_watched(entry.path),
+                            history_visible=self._history_visible(entry.path),
+                        )
+                    )
+                    self._browser_rows_by_path[entry.path] = new_rows[-1]
+            mounted_now = False
+            self._schedule_browser_mount(
+                browser,
+                new_rows,
+                highlighted_path,
+                max(old_scroll_y, self._browser_scroll_anchor),
+            )
+        if mounted_now and highlighted_path is not None:
             restored = next(
                 (index for index, entry in enumerate(self.browser_entries) if entry.path == highlighted_path),
                 None,
             )
-            browser.index = restored if restored is not None else (0 if self.browser_entries else None)
-        elif self.browser_entries and browser.index is None:
+            browser.index = restored if restored is not None else None
+        elif mounted_now and self.browser_entries and browser.index is None and self._browser_highlight_path is None:
             browser.index = 0
+        if mounted_now and self.browser_entries:
+            browser.scroll_y = old_scroll_y
         self._render_headers()
 
-    async def refresh_browser(self) -> None:
-        self._browser_refresh_token += 1
-        refresh_token = self._browser_refresh_token
-        self._cancel_history_task("browser")
+    async def _load_tree_branch(self, folder: Path, generation: int) -> None:
         try:
-            entries = await asyncio.to_thread(list_folder, self.browser_path, self.root)
+            entries = await asyncio.to_thread(list_folder, folder, self.root)
         except (OSError, PathError) as exc:
-            self._browser_source_entries = []
-            self.browser_entries = []
-            empty = self.query_one("#files-empty", Static)
-            empty.update(f"Unable to read this folder: {exc}")
-            empty.display = True
-            self.update_status(f"Browse failed: {exc}")
+            if generation == self._tree_generation and folder == self.root:
+                self.update_status(f"Browse failed: {exc}")
             return
-        if refresh_token != self._browser_refresh_token:
+        if generation != self._tree_generation:
             return
-        if self.browser_reverse:
-            folders = sorted(
-                (entry for entry in entries if entry.is_dir),
-                key=lambda entry: natural_key(entry.name),
-                reverse=True,
+        if folder != self.root and folder not in self.expanded_paths:
+            return
+        entries = [
+            BrowserEntry(
+                entry.path,
+                entry.name,
+                entry.is_dir,
+                entry.supported,
+                depth=self._entry_depth(entry.path),
+                parent=folder,
+                expanded=entry.path in self.expanded_paths,
+                loading=entry.path in self._tree_tasks,
             )
-            files = sorted(
-                (entry for entry in entries if not entry.is_dir),
-                key=lambda entry: natural_key(entry.name),
-                reverse=True,
-            )
-            entries = [*folders, *files]
-        try:
-            self.search_query = self.search_query.casefold()
-        except AttributeError:
-            self.search_query = ""
-        self._browser_source_entries = entries
+            for entry in entries
+        ]
+        self._tree_children[folder] = entries
+        self._tree_loaded.add(folder)
         self._render_browser_rows()
         self._schedule_history_refresh(
-            [entry.path for entry in entries if entry.supported],
+            [entry.path for entry in self.browser_entries if entry.supported],
             target="browser",
             expected_browser_path=self.browser_path,
             force=False,
         )
+
+    def _start_tree_branch_load(self, folder: Path) -> None:
+        self._cancel_tree_task(folder)
+        generation = self._tree_generation
+        task = asyncio.create_task(self._load_tree_branch(folder, generation))
+        self._tree_tasks[folder] = task
+
+        def finished(done: asyncio.Task[None]) -> None:
+            if self._tree_tasks.get(folder) is done:
+                self._tree_tasks.pop(folder, None)
+
+        task.add_done_callback(finished)
+
+    def _cancel_tree_task(self, folder: Path) -> None:
+        task = self._tree_tasks.pop(folder, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _refresh_recursive_discovery(self, generation: int | None = None) -> None:
+        """Discover the whole root only for search/history filters."""
+        current_task = asyncio.current_task()
+        previous_task = self._recursive_task
+        if previous_task is not None and previous_task is not current_task and not previous_task.done():
+            previous_task.cancel()
+        self._recursive_task = current_task
+        self._search_generation += 1
+        search_generation = self._search_generation
+        self._search_loading = True
+        from .paths import discover_tree
+
+        try:
+            discovered = await asyncio.to_thread(discover_tree, self.root)
+            if generation is not None and generation != self._tree_generation:
+                return
+            if search_generation != self._search_generation:
+                return
+            self._recursive_entries = [
+                BrowserEntry(
+                    item.path,
+                    item.name,
+                    item.is_dir,
+                    item.supported,
+                    depth=item.depth,
+                    parent=item.parent,
+                    expanded=item.path in self.expanded_paths,
+                    loading=item.path in self._tree_tasks,
+                )
+                for item in discovered
+            ]
+            await self._load_history(
+                [entry.path for entry in self._recursive_entries if entry.supported], force=False
+            )
+            if generation is None or generation == self._tree_generation:
+                self._render_browser_rows()
+        except (OSError, PathError):
+            if generation is None or generation == self._tree_generation:
+                self._recursive_entries = []
+        finally:
+            if self._recursive_task is current_task:
+                self._recursive_task = None
+                self._search_loading = False
+
+    async def refresh_browser(self) -> None:
+        self._browser_refresh_token += 1
+        self._tree_generation += 1
+        generation = self._tree_generation
+        self._cancel_history_task("browser")
+        for folder in list(self._tree_tasks):
+            self._cancel_tree_task(folder)
+        try:
+            self.search_query = self.search_query.casefold()
+        except AttributeError:
+            self.search_query = ""
+        if self.root not in self._tree_loaded:
+            self._start_tree_branch_load(self.root)
+            task = self._tree_tasks.get(self.root)
+            if task is not None:
+                await task
+        else:
+            self._render_browser_rows()
+        if self.search_query or self.history_filter != "all":
+            await self._refresh_recursive_discovery(generation)
+        else:
+            self._refresh_browser_history()
 
     @staticmethod
     def _queue_state_class(state: str) -> str:
@@ -1150,6 +1615,11 @@ class VLCQApp(App[None]):
         try:
             row.query_one(".row-label", Label).update(
                 self._queue_renderable(entry, current_id, selected_id)
+            )
+            row.query_one(ItemProgress).set_progress(
+                self._history_percentage(entry.path),
+                self._history_watched(entry.path),
+                visible=self._history_visible(entry.path),
             )
         except NoMatches:
             pass
@@ -1213,7 +1683,7 @@ class VLCQApp(App[None]):
             queue_paths,
             target="queue",
             expected_queue_ids=tuple(entry.id for entry in entries),
-            force=False,
+            force=True,
         )
         current = self.queue.current()
         current_id = current.id if current is not None else None
@@ -1246,6 +1716,9 @@ class VLCQApp(App[None]):
                             self._queue_renderable(
                                 entry, current_id, target_id if target_present else None
                             ),
+                            history_percentage=self._history_percentage(entry.path),
+                            history_watched=self._history_watched(entry.path),
+                            history_visible=self._history_visible(entry.path),
                         )
                     )
             if target_present:
@@ -1396,7 +1869,7 @@ class VLCQApp(App[None]):
         return True
 
     def _resume_offer_for_path(self, path: Path) -> ResumeOffer:
-        return ResumeOffer(self.database.history_for(path, root=self.root))
+        return ResumeOffer(self.database.history_for(path, root=self.root), self.watched_percent)
 
     @staticmethod
     def _offer_requires_choice(offer: ResumeOffer) -> bool:
@@ -1414,7 +1887,9 @@ class VLCQApp(App[None]):
             if current.state == "paused":
                 self.queue.set_current_state(current.id, "playing")
             return True
-        offer = ResumeOffer(self.queue.database.history_for(entry.path, root=self.root))
+        offer = ResumeOffer(
+            self.queue.database.history_for(entry.path, root=self.root), self.watched_percent
+        )
         if offer.completed:
             self.queue.play_now(index)
             return True
@@ -1489,7 +1964,7 @@ class VLCQApp(App[None]):
         if entry is None or entry.is_dir:
             self.update_status("Nothing playable is highlighted")
             return
-        offer = ResumeOffer(self.history.get(entry.path))
+        offer = ResumeOffer(self.history.get(entry.path), self.watched_percent)
         if choice == "resume" and not self._offer_requires_choice(offer):
             self.update_status("No trustworthy resume point is recorded for this video")
             return
@@ -1517,12 +1992,28 @@ class VLCQApp(App[None]):
         await self._play_details_target("start_over")
 
     async def _open_browser_folder(self, path: Path) -> None:
-        if not is_beneath(path, self.root) or not path.is_dir():
+        try:
+            canonical = path.expanduser().resolve(strict=True)
+        except (OSError, RuntimeError):
             self.update_status("Folder is no longer available inside the library root")
             return
-        self.browser_path = path
-        await self.refresh_browser()
-        self.update_status("Browsing")
+        if not is_beneath(canonical, self.root) or not canonical.is_dir():
+            self.update_status("Folder is no longer available inside the library root")
+            return
+        self.browser_path = canonical
+        if canonical in self.expanded_paths:
+            self.expanded_paths.remove(canonical)
+            self._cancel_tree_task(canonical)
+            self._render_browser_rows()
+            self.update_status("Folder collapsed")
+            return
+        self.expanded_paths.add(canonical)
+        self._render_browser_rows()
+        if canonical not in self._tree_loaded:
+            self._start_tree_branch_load(canonical)
+            self.update_status("Loading folder…")
+        else:
+            self.update_status("Folder expanded")
 
     async def action_activate(self) -> None:
         entry = self._browser_entry()
@@ -1552,8 +2043,14 @@ class VLCQApp(App[None]):
             self.update_status("Parent navigation is available in the Files section")
             return
         if self.browser_path != self.root:
-            self.browser_path = self.browser_path.parent
-            await self.refresh_browser()
+            current = self.browser_path
+            self.expanded_paths.discard(current)
+            self._cancel_tree_task(current)
+            self.browser_path = current.parent
+            self._render_browser_rows()
+        else:
+            self.update_status("At root")
+            return
         self.update_status("At root" if self.browser_path == self.root else "Browsing")
 
     async def action_select(self) -> None:
@@ -1571,6 +2068,28 @@ class VLCQApp(App[None]):
                 self.selected_paths.add(entry.path)
                 self.update_status(f"Selected {entry.path.name} ({len(self.selected_paths)} total)")
             self._render_browser_rows()
+        elif entry.is_dir:
+            # In a flattened tree, retain folder navigation semantics while
+            # keeping the legacy v-then-a workflow useful: toggle the first
+            # visible playable child, never the directory itself.
+            child = next(
+                (
+                    candidate
+                    for candidate in self.browser_entries
+                    if candidate.supported and candidate.parent == entry.path
+                ),
+                None,
+            )
+            if child is not None:
+                if child.path in self.selected_paths:
+                    self.selected_paths.remove(child.path)
+                    self.update_status(f"Deselected {child.name}")
+                else:
+                    self.selected_paths.add(child.path)
+                    self.update_status(f"Selected {child.name} ({len(self.selected_paths)} total)")
+                self._render_browser_rows()
+            else:
+                self.update_status("Folders cannot be selected; highlight a playable video")
         else:
             self.update_status("Folders cannot be selected; highlight a playable video")
 
@@ -1663,7 +2182,22 @@ class VLCQApp(App[None]):
                 self.root = self.queue.open(canonical_root(value))
                 self.browser_path = self.root
                 self._root_generation += 1
+                self._tree_generation += 1
+                self.expanded_paths.clear()
+                self._tree_children.clear()
+                self._tree_loaded.clear()
+                self._browser_rows_by_path.clear()
+                self._browser_scroll_anchor = 0.0
+                self._recursive_entries.clear()
+                self._search_generation += 1
+                if self._recursive_task is not None and not self._recursive_task.done():
+                    self._recursive_task.cancel()
                 self.selected_paths.clear()
+                self._browser_highlight_path = None
+                try:
+                    self.query_one("#browser", ListView).index = None
+                except NoMatches:
+                    pass
                 self._history_cache.clear()
                 self.history.clear()
                 self.call_later(self.refresh_browser)
@@ -1874,11 +2408,12 @@ class VLCQApp(App[None]):
     def _details_text(self, entry: BrowserEntry, history: HistoryProjection | None) -> str:
         queued = any(item.path == entry.path for item in self.queue.entries())
         queue_label = "queued" if queued else "not queued"
-        if history is None:
+        if history is None or not history.has_recorded_progress:
             return (
                 f"{entry.name}\nFull path: {entry.path}\n{queue_label}\n"
                 "No recorded progress\nResume position: unknown\nFurthest progress: unknown\n"
-                "Duration: unknown\nLast played: unknown"
+                f"Duration: unknown\nWatched threshold: {self.watched_percent}%\n"
+                "Watched: no\nLast played: unknown"
             )
         last_played = history.last_played_at or "unknown"
         if history.resume_position_ms is not None:
@@ -1891,6 +2426,8 @@ class VLCQApp(App[None]):
             f"{entry.name}\nFull path: {entry.path}\n{queue_label}\n"
             f"Resume position: {resume}\nFurthest progress: {self._format_time(history.position_ms)}\n"
             f"Duration: {self._format_time(history.duration_ms) if history.duration_ms else 'unknown'}\n"
+            f"Watched threshold: {self.watched_percent}%\n"
+            f"Watched: {'yes' if history.watched(self.watched_percent) else 'no'}\n"
             f"Last played: {last_played}"
         )
 
@@ -1909,7 +2446,7 @@ class VLCQApp(App[None]):
             return
         await self._load_history([target.path], force=True)
         history = self.history.get(target.path.resolve(strict=False))
-        offer = ResumeOffer(history)
+        offer = ResumeOffer(history, self.watched_percent)
 
         def chosen(value: str | None) -> None:
             if value is not None:
@@ -2008,10 +2545,20 @@ class VLCQApp(App[None]):
             suffix += f", {hidden} hidden"
         return verb + suffix + ")"
 
+    def _queue_has_clearable(self) -> bool:
+        return any(
+            entry.state == "completed"
+            or (
+                (history := self.history.get(entry.path)) is not None
+                and history.watched(self.watched_percent)
+            )
+            for entry in self.queue.entries()
+        )
+
     def _context_actions_for_queue_section(self, target: SectionTarget) -> list[ContextAction]:
         actions = [
             ContextAction("sort-queue", "Sort naturally", target, bool(self.queue.entries())),
-            ContextAction("clear-completed", "Clear completed", target, any(item.state == "completed" for item in self.queue.entries())),
+            ContextAction("clear-completed", "Clear watched/completed", target, self._queue_has_clearable()),
             ContextAction("clear-all", "Clear queue", target, bool(self.queue.entries())),
             ContextAction("undo", "Undo latest removal", target, self.queue.undo_available),
         ]
@@ -2030,7 +2577,9 @@ class VLCQApp(App[None]):
         entry = next((item for item in self.queue.entries() if item.id == target.entry_id), None)
         if entry is None:
             return []
-        offer = ResumeOffer(self.database.history_for(entry.path, root=self.root))
+        offer = ResumeOffer(
+            self.database.history_for(entry.path, root=self.root), self.watched_percent
+        )
         return [
             ContextAction("play-now-queue", f"Play now · {entry.path.name}", target),
             ContextAction("resume-queue", "Resume", target, self._offer_requires_choice(offer)),
@@ -2053,6 +2602,12 @@ class VLCQApp(App[None]):
             ContextAction("next", "Next", target, bool(self.queue.entries())),
             ContextAction("reconnect", "Reconnect", target, not self.no_vlc),
             ContextAction("active-details", "Active player details", target, current is not None),
+            ContextAction(
+                "remaining",
+                "Show remaining time",
+                target,
+                current is not None and self.controller.status.duration_ms > 0,
+            ),
             ContextAction("last-notice", "Show full last notice", target, len(self._notice) > 0),
             ContextAction("help", "Help", target),
             ContextAction("quit", "Quit", target),
@@ -2250,6 +2805,13 @@ class VLCQApp(App[None]):
             current = self.queue.current()
             if current is not None:
                 await self._open_details(BrowserEntry(current.path, current.path.name, False, True), pane="queue")
+        elif key == "remaining":
+            status = self.controller.status
+            if status.duration_ms > 0:
+                remaining = max(0, status.duration_ms - status.position_ms)
+                self.update_status(f"Remaining: {self._format_time(remaining)}")
+            else:
+                self.update_status("Remaining time is unknown")
         elif key == "last-notice":
             self.push_screen(NoticePrompt(self._notice))
         elif key == "help":
@@ -2371,8 +2933,8 @@ class VLCQApp(App[None]):
         self.push_screen(QuitPrompt(), chosen)
 
     def action_clear_completed(self) -> None:
-        if not any(entry.state == "completed" for entry in self.queue.entries()):
-            self.update_status("No completed queue entries to clear")
+        if not self._queue_has_clearable():
+            self.update_status("No watched/completed queue entries to clear")
             return
 
         def confirmed(value: bool | None) -> None:
@@ -2417,6 +2979,24 @@ class VLCQApp(App[None]):
             self.action_toggle_files()
         elif button_id == "queue-toggle":
             self.action_toggle_queue()
+        elif button_id == "files-open":
+            self.action_open_root()
+        elif button_id == "files-search":
+            self.action_search_filter()
+        elif button_id == "files-add":
+            await self.action_add_selected()
+        elif button_id == "queue-play":
+            await self.action_pause()
+        elif button_id == "queue-next":
+            await self.action_next()
+        elif button_id == "queue-clear":
+            self.action_clear_completed()
+        elif button_id == "player-previous":
+            await self.action_previous()
+        elif button_id == "player-pause":
+            await self.action_pause()
+        elif button_id == "player-next":
+            await self.action_next()
         elif button_id == "files-actions":
             self._open_section_menu("files", button, button.region.x, button.region.y)
         elif button_id == "queue-actions":

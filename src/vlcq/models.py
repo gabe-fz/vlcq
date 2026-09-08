@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from .progress import clamped_percentage, is_watched
+
 
 @dataclass(frozen=True)
 class BrowserEntry:
@@ -10,6 +12,28 @@ class BrowserEntry:
     name: str
     is_dir: bool
     supported: bool
+    depth: int = 0
+    parent: Path | None = None
+    expanded: bool = False
+    loading: bool = False
+
+
+@dataclass(frozen=True)
+class TreeEntry:
+    """A canonical root-confined entry in the lazily displayed library tree."""
+
+    path: Path
+    name: str
+    is_dir: bool
+    supported: bool
+    depth: int = 0
+    parent: Path | None = None
+    expanded: bool = False
+    loading: bool = False
+
+    @property
+    def key(self) -> Path:
+        return self.path
 
 
 @dataclass(frozen=True)
@@ -53,11 +77,23 @@ class HistoryProjection:
 
     @property
     def category(self) -> str:
+        """Legacy storage category based only on explicit evidence."""
         if self.completion_observed:
             return "completed"
         if self.position_ms > 0:
             return "in_progress"
         return "none"
+
+    def watched(self, threshold: int = 90) -> bool:
+        return is_watched(
+            self.position_ms,
+            self.duration_ms,
+            completion_observed=self.completion_observed,
+            threshold=threshold,
+        )
+
+    def percentage(self) -> int | None:
+        return clamped_percentage(self.position_ms, self.duration_ms)
 
 
 @dataclass(frozen=True)

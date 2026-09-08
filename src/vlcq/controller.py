@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 
 from .models import HistoryProjection, QueueEntry, VLCStatus
+from .progress import is_watched
 from .queue import QueueService
 from .vlc import VLCClient, VLCError, VLCProcess
 
@@ -16,8 +17,11 @@ class ResumeChoiceRequired(VLCError):
 
 
 class ResumeOffer:
-    def __init__(self, history: HistoryProjection | None) -> None:
+    def __init__(self, history: HistoryProjection | None, watched_percent: int = 90) -> None:
+        if not 1 <= int(watched_percent) <= 100:
+            raise ValueError("watched threshold must be an integer from 1 through 100")
         self.history = history
+        self.watched_percent = int(watched_percent)
         self.legacy_fallback = history is not None and history.fallback_resume_position_ms is not None
         if history is None:
             self.position_ms = 0
@@ -30,7 +34,12 @@ class ResumeOffer:
                 else history.fallback_resume_position_ms or 0
             )
             self.duration_ms = history.duration_ms
-            self.completed = history.completion_observed
+            self.completed = is_watched(
+                history.position_ms,
+                history.duration_ms,
+                completion_observed=history.completion_observed,
+                threshold=self.watched_percent,
+            )
 
     @property
     def usable_resume(self) -> bool:
@@ -40,8 +49,16 @@ class ResumeOffer:
 class PlaybackController:
     """Own the ordering boundary between VLC observations and queue state."""
 
-    def __init__(self, queue: QueueService, process: VLCProcess | None = None) -> None:
+    def __init__(
+        self,
+        queue: QueueService,
+        process: VLCProcess | None = None,
+        watched_percent: int | None = None,
+    ) -> None:
         self.queue = queue
+        self.watched_percent = queue.watched_percent if watched_percent is None else int(watched_percent)
+        if not 1 <= self.watched_percent <= 100:
+            raise ValueError("watched threshold must be an integer from 1 through 100")
         self.process = process or VLCProcess()
         self.client: VLCClient | None = None
         self.status = VLCStatus("unavailable")
@@ -218,7 +235,10 @@ class PlaybackController:
         entries = self.queue.entries()
         if not 0 <= index < len(entries):
             raise IndexError("queue index out of range")
-        return ResumeOffer(self.queue.database.history_for(entries[index].path, root=self.queue.root))
+        return ResumeOffer(
+            self.queue.database.history_for(entries[index].path, root=self.queue.root),
+            self.watched_percent,
+        )
 
     async def _play_with_policy_locked(
         self,
@@ -375,7 +395,9 @@ class PlaybackController:
             return
         path = entry.path
         entry_id = entry.id
-        offer = ResumeOffer(self.queue.database.history_for(path, root=self.queue.root))
+        offer = ResumeOffer(
+            self.queue.database.history_for(path, root=self.queue.root), self.watched_percent
+        )
         resume_position = offer.position_ms if offer.usable_resume else None
         start_over = offer.completed
         try:
