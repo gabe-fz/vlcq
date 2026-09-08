@@ -109,8 +109,10 @@ async def test_headers_lead_with_color_coded_pane_specific_controls(tmp_path: Pa
         folder = next(entry for entry in app.browser_entries if entry.is_dir)
         await app._open_browser_folder(folder.path)
         await pilot.pause()
-        assert app.query_one("#files-open", Button).region.x < 20
-        assert app.query_one("#queue-remove", Button).region.x < 20
+        assert app.query_one("#files-title", Static).region.x < app.query_one("#files-open", Button).region.x
+        assert app.query_one("#queue-title", Static).region.x < app.query_one("#queue-remove", Button).region.x
+        assert app.query_one("#files-open", Button).region.x < 40
+        assert app.query_one("#queue-remove", Button).region.x < 40
         assert "focus:" not in str(app.query_one("#files-title", Static).renderable)
         assert app.query_one("#files-open", Button).variant == "primary"
         assert app.query_one("#files-search", Button).variant == "success"
@@ -123,8 +125,11 @@ async def test_headers_lead_with_color_coded_pane_specific_controls(tmp_path: Pa
 
         await pilot.resize_terminal(160, 30)
         await pilot.pause()
+        assert app.query_one("#files-select", Button).display
         assert app.query_one("#files-clear-selection", Button).display
+        assert app.query_one("#files-details", Button).display
         assert app.query_one("#queue-clear-all", Button).display
+        assert app.query_one("#queue-details", Button).display
         assert app.query_one("#player-help", Button).display
         assert app.query_one("#player-quit", Button).display
         await pilot.resize_terminal(80, 30)

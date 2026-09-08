@@ -573,13 +573,14 @@ class VLCQApp(App[None]):
         border: none; content-align: center middle;
     }
     #files-toggle, #queue-toggle, #files-actions, #queue-actions, #player-menu { width: 3; min-width: 3; padding: 0; }
-    #files-open, #files-search, #files-add, #files-up, #files-sort, #files-clear-selection,
-    #queue-remove, #queue-up, #queue-down, #queue-clear, #queue-sort, #queue-undo,
-    #queue-clear-all, #player-previous, #player-pause, #player-next, #player-seek-back,
+    #files-open, #files-search, #files-add, #files-select, #files-up, #files-sort,
+    #files-clear-selection, #files-details, #queue-remove, #queue-up, #queue-down,
+    #queue-clear, #queue-sort, #queue-undo, #queue-clear-all, #queue-details,
+    #player-previous, #player-pause, #player-next, #player-seek-back,
     #player-seek-forward, #player-reconnect, #player-help, #player-quit { min-width: 5; }
     .responsive-action { display: none; }
     .section-name { width: auto; min-width: 7; height: 1; text-style: bold; }
-    .section-title { width: 1fr; height: 1; padding-left: 1; color: $text-muted; overflow-x: hidden; }
+    .section-title { width: auto; max-width: 30%; height: 1; padding: 0 1; color: $text-muted; overflow-x: hidden; }
     .section-body { height: 1fr; min-height: 1; }
     .section.collapsed .section-body { display: none; }
     #browser, #queue { height: 1fr; min-height: 1; overflow-x: auto; overflow-y: auto; }
@@ -711,14 +712,16 @@ class VLCQApp(App[None]):
                 with Horizontal(id="files-header", classes="section-header"):
                     yield CompactButton("▾", id="files-toggle", tooltip="Collapse Files")
                     yield Static("Files", classes="section-name")
+                    yield Static(self.root.name, id="files-title", classes="section-title")
                     yield CompactButton("Open", id="files-open", variant="primary", tooltip="Open or change library root")
                     yield CompactButton("Search", id="files-search", variant="success", tooltip="Search and filter files")
                     yield CompactButton("Add", id="files-add", variant="warning", tooltip="Add highlighted or selected files")
+                    yield CompactButton("Select", id="files-select", classes="responsive-action responsive-wide", tooltip="Select or deselect highlighted file")
                     yield CompactButton("Up", id="files-up", classes="responsive-action responsive-medium", tooltip="Move browsing focus to the parent folder")
                     yield CompactButton("Sort", id="files-sort", classes="responsive-action responsive-medium", tooltip="Reverse filename order")
                     yield CompactButton("Clear", id="files-clear-selection", classes="responsive-action responsive-wide", tooltip="Clear file selection")
+                    yield CompactButton("Details", id="files-details", classes="responsive-action responsive-wide", tooltip="Show highlighted file details")
                     yield CompactButton("…", id="files-actions", tooltip="More Files actions")
-                    yield Static(self.root.name, id="files-title", classes="section-title")
                 with Vertical(id="files-body", classes="section-body"):
                     yield Static("No folders or playable videos here — use Files actions to open a root.", id="files-empty")
                     yield ListView(id="browser")
@@ -726,6 +729,7 @@ class VLCQApp(App[None]):
                 with Horizontal(id="queue-header", classes="section-header"):
                     yield CompactButton("▾", id="queue-toggle", tooltip="Collapse Queue")
                     yield Static("Queue", classes="section-name")
+                    yield Static("0 entries", id="queue-title", classes="section-title")
                     yield CompactButton("Remove", id="queue-remove", variant="error", tooltip="Remove highlighted queue item")
                     yield CompactButton("↑", id="queue-up", variant="primary", tooltip="Move highlighted queue item up")
                     yield CompactButton("↓", id="queue-down", variant="primary", tooltip="Move highlighted queue item down")
@@ -733,8 +737,8 @@ class VLCQApp(App[None]):
                     yield CompactButton("Sort", id="queue-sort", classes="responsive-action responsive-medium", tooltip="Sort queue naturally")
                     yield CompactButton("Undo", id="queue-undo", classes="responsive-action responsive-medium", tooltip="Undo latest queue removal")
                     yield CompactButton("Clear all", id="queue-clear-all", classes="responsive-action responsive-wide", variant="error", tooltip="Clear every queue entry")
+                    yield CompactButton("Details", id="queue-details", classes="responsive-action responsive-wide", tooltip="Show highlighted queue item details")
                     yield CompactButton("…", id="queue-actions", tooltip="More Queue actions")
-                    yield Static("0 entries", id="queue-title", classes="section-title")
                 with Vertical(id="queue-body", classes="section-body"):
                     yield Static("Queue is empty — use Files actions to add a video.", id="queue-empty")
                     yield ListView(id="queue")
@@ -975,8 +979,10 @@ class VLCQApp(App[None]):
         """Keep direct controls aligned with the same targeting predicates."""
         try:
             files_add = self.query_one("#files-add", Button)
+            files_select = self.query_one("#files-select", Button)
             files_up = self.query_one("#files-up", Button)
             files_clear_selection = self.query_one("#files-clear-selection", Button)
+            files_details = self.query_one("#files-details", Button)
             queue_remove = self.query_one("#queue-remove", Button)
             queue_up = self.query_one("#queue-up", Button)
             queue_down = self.query_one("#queue-down", Button)
@@ -984,6 +990,7 @@ class VLCQApp(App[None]):
             queue_sort = self.query_one("#queue-sort", Button)
             queue_undo = self.query_one("#queue-undo", Button)
             queue_clear_all = self.query_one("#queue-clear-all", Button)
+            queue_details = self.query_one("#queue-details", Button)
             player_pause = self.query_one("#player-pause", Button)
             player_previous = self.query_one("#player-previous", Button)
             player_next = self.query_one("#player-next", Button)
@@ -1002,9 +1009,12 @@ class VLCQApp(App[None]):
             )
             for entry in self.queue.entries()
         )
+        browser_entry = self._browser_entry()
         files_add.disabled = not bool(self._paths_for_add())
+        files_select.disabled = browser_entry is None or not browser_entry.supported
         files_up.disabled = self.browser_path == self.root
         files_clear_selection.disabled = not self.selected_paths
+        files_details.disabled = browser_entry is None or browser_entry.is_dir
         selected_index = self._queue_index()
         queue_remove.disabled = selected_index is None
         queue_up.disabled = selected_index is None or selected_index == 0
@@ -1013,6 +1023,7 @@ class VLCQApp(App[None]):
         queue_sort.disabled = not self.queue.entries()
         queue_undo.disabled = not self.queue.undo_available
         queue_clear_all.disabled = not self.queue.entries()
+        queue_details.disabled = selected_index is None
         player_pause.disabled = current is None or not connected
         player_next.disabled = not self.queue.entries() or not connected
         player_previous.disabled = not self.queue.entries() or not connected
@@ -3055,6 +3066,8 @@ class VLCQApp(App[None]):
             self.action_search_filter()
         elif button_id == "files-add":
             await self.action_add_selected()
+        elif button_id == "files-select":
+            await self.action_select()
         elif button_id == "files-up":
             await self.action_parent()
         elif button_id == "files-sort":
@@ -3063,6 +3076,8 @@ class VLCQApp(App[None]):
             self.update_status("Reversed filename order")
         elif button_id == "files-clear-selection":
             await self.action_clear_selection()
+        elif button_id == "files-details":
+            await self._open_details(pane="browser")
         elif button_id == "queue-remove":
             await self.action_remove()
         elif button_id == "queue-up":
@@ -3080,6 +3095,8 @@ class VLCQApp(App[None]):
             await self.action_undo()
         elif button_id == "queue-clear-all":
             self.action_clear_all()
+        elif button_id == "queue-details":
+            await self._open_details(pane="queue")
         elif button_id == "player-previous":
             await self.action_previous()
         elif button_id == "player-pause":
