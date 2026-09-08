@@ -573,8 +573,11 @@ class VLCQApp(App[None]):
         border: none; content-align: center middle;
     }
     #files-toggle, #queue-toggle, #files-actions, #queue-actions, #player-menu { width: 3; min-width: 3; padding: 0; }
-    #files-open, #files-search, #files-add, #queue-remove, #queue-up, #queue-down,
-    #queue-clear, #player-previous, #player-pause, #player-next { min-width: 5; }
+    #files-open, #files-search, #files-add, #files-up, #files-sort, #files-clear-selection,
+    #queue-remove, #queue-up, #queue-down, #queue-clear, #queue-sort, #queue-undo,
+    #queue-clear-all, #player-previous, #player-pause, #player-next, #player-seek-back,
+    #player-seek-forward, #player-reconnect, #player-help, #player-quit { min-width: 5; }
+    .responsive-action { display: none; }
     .section-name { width: auto; min-width: 7; height: 1; text-style: bold; }
     .section-title { width: 1fr; height: 1; padding-left: 1; color: $text-muted; overflow-x: hidden; }
     .section-body { height: 1fr; min-height: 1; }
@@ -711,6 +714,9 @@ class VLCQApp(App[None]):
                     yield CompactButton("Open", id="files-open", variant="primary", tooltip="Open or change library root")
                     yield CompactButton("Search", id="files-search", variant="success", tooltip="Search and filter files")
                     yield CompactButton("Add", id="files-add", variant="warning", tooltip="Add highlighted or selected files")
+                    yield CompactButton("Up", id="files-up", classes="responsive-action responsive-medium", tooltip="Move browsing focus to the parent folder")
+                    yield CompactButton("Sort", id="files-sort", classes="responsive-action responsive-medium", tooltip="Reverse filename order")
+                    yield CompactButton("Clear", id="files-clear-selection", classes="responsive-action responsive-wide", tooltip="Clear file selection")
                     yield CompactButton("…", id="files-actions", tooltip="More Files actions")
                     yield Static(self.root.name, id="files-title", classes="section-title")
                 with Vertical(id="files-body", classes="section-body"):
@@ -724,6 +730,9 @@ class VLCQApp(App[None]):
                     yield CompactButton("↑", id="queue-up", variant="primary", tooltip="Move highlighted queue item up")
                     yield CompactButton("↓", id="queue-down", variant="primary", tooltip="Move highlighted queue item down")
                     yield CompactButton("Clear", id="queue-clear", variant="warning", tooltip="Clear watched/completed queue entries")
+                    yield CompactButton("Sort", id="queue-sort", classes="responsive-action responsive-medium", tooltip="Sort queue naturally")
+                    yield CompactButton("Undo", id="queue-undo", classes="responsive-action responsive-medium", tooltip="Undo latest queue removal")
+                    yield CompactButton("Clear all", id="queue-clear-all", classes="responsive-action responsive-wide", variant="error", tooltip="Clear every queue entry")
                     yield CompactButton("…", id="queue-actions", tooltip="More Queue actions")
                     yield Static("0 entries", id="queue-title", classes="section-title")
                 with Vertical(id="queue-body", classes="section-body"):
@@ -738,8 +747,13 @@ class VLCQApp(App[None]):
                 yield Static("?%", id="progress-percent")
             with Horizontal(id="player-actions"):
                 yield CompactButton("Previous", id="player-previous", variant="primary", tooltip="Previous queue item")
+                yield CompactButton("−10s", id="player-seek-back", classes="responsive-action responsive-medium", tooltip="Seek back 10 seconds")
                 yield CompactButton("Play", id="player-pause", variant="success", tooltip="Play or pause current item")
+                yield CompactButton("+10s", id="player-seek-forward", classes="responsive-action responsive-medium", tooltip="Seek forward 10 seconds")
                 yield CompactButton("Next", id="player-next", variant="primary", tooltip="Next queue item")
+                yield CompactButton("Reconnect", id="player-reconnect", classes="responsive-action responsive-medium", tooltip="Reconnect to VLC")
+                yield CompactButton("Help", id="player-help", classes="responsive-action responsive-wide", tooltip="Show help")
+                yield CompactButton("Quit", id="player-quit", classes="responsive-action responsive-wide", variant="error", tooltip="Quit vlcq")
                 yield CompactButton("…", id="player-menu", variant="warning", tooltip="VLC and application actions")
             yield Static("NOTICE  Ready", id="notice", markup=False)
 
@@ -750,6 +764,7 @@ class VLCQApp(App[None]):
         return not isinstance(self.focused, Input)
 
     async def on_mount(self) -> None:
+        self._refresh_responsive_controls()
         await self.refresh_browser()
         self.query_one("#browser", ListView).focus()
         self.refresh_queue()
@@ -790,7 +805,17 @@ class VLCQApp(App[None]):
         del event
         # Section CSS allocates all available space on every resize.  No
         # rebuild is performed, so list identity, selection and scroll remain.
+        self._refresh_responsive_controls()
         self._refresh_headers()
+
+    def _refresh_responsive_controls(self) -> None:
+        """Promote overflow actions when the terminal has room for them."""
+        medium = self.size.width >= 100
+        wide = self.size.width >= 140
+        for button in self.query(".responsive-medium"):
+            button.display = medium
+        for button in self.query(".responsive-wide"):
+            button.display = wide
 
     def _row_ancestor(self, widget: Widget | None) -> BrowserListItem | QueueListItem | None:
         if widget is None:
@@ -950,13 +975,21 @@ class VLCQApp(App[None]):
         """Keep direct controls aligned with the same targeting predicates."""
         try:
             files_add = self.query_one("#files-add", Button)
+            files_up = self.query_one("#files-up", Button)
+            files_clear_selection = self.query_one("#files-clear-selection", Button)
             queue_remove = self.query_one("#queue-remove", Button)
             queue_up = self.query_one("#queue-up", Button)
             queue_down = self.query_one("#queue-down", Button)
             queue_clear = self.query_one("#queue-clear", Button)
+            queue_sort = self.query_one("#queue-sort", Button)
+            queue_undo = self.query_one("#queue-undo", Button)
+            queue_clear_all = self.query_one("#queue-clear-all", Button)
             player_pause = self.query_one("#player-pause", Button)
             player_previous = self.query_one("#player-previous", Button)
             player_next = self.query_one("#player-next", Button)
+            player_seek_back = self.query_one("#player-seek-back", Button)
+            player_seek_forward = self.query_one("#player-seek-forward", Button)
+            player_reconnect = self.query_one("#player-reconnect", Button)
         except NoMatches:
             return
         current = self.queue.current()
@@ -970,14 +1003,22 @@ class VLCQApp(App[None]):
             for entry in self.queue.entries()
         )
         files_add.disabled = not bool(self._paths_for_add())
+        files_up.disabled = self.browser_path == self.root
+        files_clear_selection.disabled = not self.selected_paths
         selected_index = self._queue_index()
         queue_remove.disabled = selected_index is None
         queue_up.disabled = selected_index is None or selected_index == 0
         queue_down.disabled = selected_index is None or selected_index >= len(self.queue.entries()) - 1
+        queue_clear.disabled = not clearable
+        queue_sort.disabled = not self.queue.entries()
+        queue_undo.disabled = not self.queue.undo_available
+        queue_clear_all.disabled = not self.queue.entries()
         player_pause.disabled = current is None or not connected
         player_next.disabled = not self.queue.entries() or not connected
         player_previous.disabled = not self.queue.entries() or not connected
-        queue_clear.disabled = not clearable
+        player_seek_back.disabled = current is None or not connected
+        player_seek_forward.disabled = current is None or not connected
+        player_reconnect.disabled = self.no_vlc
 
     def _refresh_headers(self) -> None:
         self._render_headers()
@@ -3014,6 +3055,14 @@ class VLCQApp(App[None]):
             self.action_search_filter()
         elif button_id == "files-add":
             await self.action_add_selected()
+        elif button_id == "files-up":
+            await self.action_parent()
+        elif button_id == "files-sort":
+            self.browser_reverse = not self.browser_reverse
+            await self.refresh_browser()
+            self.update_status("Reversed filename order")
+        elif button_id == "files-clear-selection":
+            await self.action_clear_selection()
         elif button_id == "queue-remove":
             await self.action_remove()
         elif button_id == "queue-up":
@@ -3022,12 +3071,31 @@ class VLCQApp(App[None]):
             await self.action_move_down()
         elif button_id == "queue-clear":
             self.action_clear_completed()
+        elif button_id == "queue-sort":
+            selected_entry_id = self._queue_selected_id()
+            await self._run_database_operation(self.queue.sort_natural)
+            self.refresh_queue(selected_entry_id=selected_entry_id, selection_captured=True)
+            self.update_status("Queue sorted naturally")
+        elif button_id == "queue-undo":
+            await self.action_undo()
+        elif button_id == "queue-clear-all":
+            self.action_clear_all()
         elif button_id == "player-previous":
             await self.action_previous()
         elif button_id == "player-pause":
             await self.action_pause()
         elif button_id == "player-next":
             await self.action_next()
+        elif button_id == "player-seek-back":
+            await self.action_seek(-10)
+        elif button_id == "player-seek-forward":
+            await self.action_seek(10)
+        elif button_id == "player-reconnect":
+            await self.action_reconnect()
+        elif button_id == "player-help":
+            self.action_help()
+        elif button_id == "player-quit":
+            self.action_quit_app()
         elif button_id == "files-actions":
             self._open_section_menu("files", button, button.region.x, button.region.y)
         elif button_id == "queue-actions":

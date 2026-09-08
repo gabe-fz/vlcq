@@ -115,7 +115,26 @@ async def test_headers_lead_with_color_coded_pane_specific_controls(tmp_path: Pa
         assert app.query_one("#files-open", Button).variant == "primary"
         assert app.query_one("#files-search", Button).variant == "success"
         assert app.query_one("#queue-remove", Button).variant == "error"
+        assert app.query_one("#files-sort", Button).display
+        assert app.query_one("#queue-undo", Button).display
+        assert app.query_one("#player-seek-back", Button).display
+        assert not app.query_one("#files-clear-selection", Button).display
+        assert not app.query_one("#player-help", Button).display
 
+        await pilot.resize_terminal(160, 30)
+        await pilot.pause()
+        assert app.query_one("#files-clear-selection", Button).display
+        assert app.query_one("#queue-clear-all", Button).display
+        assert app.query_one("#player-help", Button).display
+        assert app.query_one("#player-quit", Button).display
+        await pilot.resize_terminal(80, 30)
+        await pilot.pause()
+        assert not app.query_one("#files-sort", Button).display
+        assert not app.query_one("#queue-undo", Button).display
+        assert not app.query_one("#player-seek-back", Button).display
+
+        await pilot.resize_terminal(120, 30)
+        await pilot.pause()
         await pilot.click("#files-actions")
         files_actions = {str(button.label) for button in app.screen.query(Button)}
         assert "Reverse filename order" in files_actions

@@ -40,7 +40,9 @@ vlcq progress --root ~/Videos --json
 The main screen is a stacked **Files** section above a **Queue** section. Both start
 expanded and share the available list space; click `▾`/`▸` to collapse or restore either
 section. Compact, color-coded controls begin beside each section name so long metadata
-cannot push them to the right edge. Each header remains visible and its `…` menu contains
+cannot push them to the right edge. Wider terminals progressively expose additional
+pane-specific actions (navigation/sort/selection, queue management, and VLC/system controls)
+instead of leaving useful space empty. Each header remains visible and its `…` menu contains
 only that section’s actions. Right-clicking a row opens actions for that specific item,
 and `Shift+F10` is the keyboard fallback. Menus remain inside the terminal and scroll when
 needed.
