@@ -191,9 +191,9 @@ async def test_tree_progress_filters_direct_controls_and_seek_surface(tmp_path: 
 
         await pilot.click("#player-pause")
         assert app.queue.current() is not None and app.queue.current().state == "paused"
-        await pilot.click("#queue-play")
+        await pilot.click("#player-pause")
         assert app.queue.current() is not None and app.queue.current().state == "playing"
-        await pilot.click("#queue-next")
+        await pilot.click("#player-next")
         assert app.queue.current() is not None and app.queue.current().path == right.resolve()
 
         await pilot.click("#files-actions")

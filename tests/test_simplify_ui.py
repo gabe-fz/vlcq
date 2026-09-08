@@ -97,6 +97,39 @@ async def test_stacked_sections_collapse_and_resize_without_rebuilding(
 
 
 @pytest.mark.asyncio
+async def test_headers_lead_with_color_coded_pane_specific_controls(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    nested = root / "season"
+    make_files(nested, 2)
+    db = Database(tmp_path / "state.sqlite3")
+    app = VLCQApp(root=root, database=db, no_vlc=True)
+
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause(0.1)
+        folder = next(entry for entry in app.browser_entries if entry.is_dir)
+        await app._open_browser_folder(folder.path)
+        await pilot.pause()
+        assert app.query_one("#files-open", Button).region.x < 20
+        assert app.query_one("#queue-remove", Button).region.x < 20
+        assert "focus:" not in str(app.query_one("#files-title", Static).renderable)
+        assert app.query_one("#files-open", Button).variant == "primary"
+        assert app.query_one("#files-search", Button).variant == "success"
+        assert app.query_one("#queue-remove", Button).variant == "error"
+
+        await pilot.click("#files-actions")
+        files_actions = {str(button.label) for button in app.screen.query(Button)}
+        assert "Reverse filename order" in files_actions
+        assert not any("Play" in label for label in files_actions)
+        await pilot.press("escape")
+
+        await pilot.click("#queue-actions")
+        queue_actions = {str(button.label) for button in app.screen.query(Button)}
+        assert queue_actions == {"Sort naturally", "Clear queue", "Undo latest removal"}
+
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_one_line_rows_are_literal_compact_and_semantically_independent(tmp_path: Path) -> None:
     root = tmp_path / "library"
     root.mkdir()
@@ -289,7 +322,7 @@ async def test_on_demand_search_and_hidden_selection_summary(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_bottom_player_is_single_bounded_summary_and_menu_is_complete(tmp_path: Path) -> None:
+async def test_status_pane_integrates_player_metadata_notice_and_system_menu(tmp_path: Path) -> None:
     root = tmp_path / "library"
     video = make_files(root, 1)[0]
     db = Database(tmp_path / "state.sqlite3")
@@ -301,26 +334,26 @@ async def test_bottom_player_is_single_bounded_summary_and_menu_is_complete(tmp_
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause(0.1)
-        app.controller.status = VLCStatus("playing", 0, 0, video.resolve())
+        app.no_vlc = False
+        app.controller.client = object()  # type: ignore[assignment]
+        app.controller.status = VLCStatus("playing", 5_000, 20_000, video.resolve())
         app.refresh_playback()
         player = str(app.query_one("#player", Static).renderable)
+        metadata = str(app.query_one("#player-meta", Static).renderable)
         assert player.count(video.name) == 1
-        assert "?%" in str(app.query_one("#progress-percent", Static).renderable)
+        assert str(video.parent.resolve()) in player
+        assert "PLAYING" in metadata
+        assert "REMAINING  0:15" in metadata
+        assert "DURATION  0:20" in metadata
+        assert "25%" in str(app.query_one("#progress-percent", Static).renderable)
         app.update_status("A very long playback failure notice with complete details")
-        await pilot.click("#player-menu")
-        await pilot.pause()
-        full_notice = next(button for button in app.screen.query(Button) if str(button.label) == "Show full last notice")
-        await pilot.click(full_notice)
-        await pilot.pause()
-        assert "complete details" in str(app.query_one("#details-content", Static).renderable)
-        await pilot.click("#notice-close")
+        assert "complete details" in str(app.query_one("#notice", Static).renderable)
         await pilot.click("#files-toggle")
         await pilot.click("#queue-toggle")
         await pilot.pause()
         assert app.query_one("#player-line").display
         assert app.query_one("#progress-line").display
         assert app.query_one("#notice").display
-        assert app.query_one("#notice").region.height == 1
         async def overflow_action(label: str) -> Button:
             await pilot.click("#player-menu")
             await pilot.pause()
@@ -332,10 +365,19 @@ async def test_bottom_player_is_single_bounded_summary_and_menu_is_complete(tmp_
         await pilot.click("#player-menu")
         await pilot.pause()
         overflow_labels = {str(button.label) for button in app.screen.query(Button)}
-        assert {"Pause / resume", "Previous", "Next"}.isdisjoint(overflow_labels)
+        assert {
+            "Pause / resume",
+            "Previous",
+            "Next",
+            "Active player details",
+            "Show remaining time",
+            "Show full last notice",
+        }.isdisjoint(overflow_labels)
         reconnect = next(button for button in app.screen.query(Button) if str(button.label) == "Reconnect")
-        assert reconnect.disabled
+        assert not reconnect.disabled
         await pilot.press("escape")
+        app.no_vlc = True
+        app.controller.client = None
         await pilot.click("#player-pause")
         assert app.queue.current() is not None
         await overflow_action("Seek back 10s")
@@ -344,9 +386,6 @@ async def test_bottom_player_is_single_bounded_summary_and_menu_is_complete(tmp_
         assert app.queue.current() is None
         await pilot.click("#player-previous")
         assert app.queue.current() is not None
-        await overflow_action("Active player details")
-        assert "Full path:" in str(app.query_one("#details-content", Static).renderable)
-        await pilot.click("#details-close")
         await overflow_action("Help")
         await pilot.click("#help-close")
         await pilot.click("#player-menu")

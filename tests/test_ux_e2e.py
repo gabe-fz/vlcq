@@ -50,14 +50,16 @@ async def test_mouse_workflow_at_compact_and_wide_sizes(tmp_path: Path, size: tu
         assert app.browser_path == folder.resolve()
 
         await pilot.click(".browser-check")
-        await choose_menu_action(pilot, "#files-actions", "Add & play")
+        await pilot.press("A")
+        await pilot.pause()
         assert app.queue.entries() == []  # Cancel has no queue side effects.
         for selector in ("#resume-choice", "#start-over-choice", "#resume-cancel"):
             button = app.query_one(selector, Button)
             assert button.region.height == 1
             assert button.content_region.height == 1
         await pilot.click("#resume-cancel")
-        await choose_menu_action(pilot, "#files-actions", "Add & play")
+        await pilot.press("A")
+        await pilot.pause()
         await pilot.click("#resume-choice")
         await pilot.pause()
         assert app.queue.current() is not None
@@ -71,10 +73,11 @@ async def test_mouse_workflow_at_compact_and_wide_sizes(tmp_path: Path, size: tu
         await pilot.pause()
         queue_view = app.query_one("#queue", ListView)
         queue_view.focus()
-        queue_view.index = 0
+        queue_view.index = 1
         before_undo = len(app.queue.entries())
-        await choose_menu_action(pilot, "#queue-actions", "Move up")
-        await choose_menu_action(pilot, "#queue-actions", "Remove from queue")
+        await pilot.click("#queue-up")
+        await pilot.click("#queue-remove")
+        await pilot.pause()
         await choose_menu_action(pilot, "#queue-actions", "Undo latest removal")
         assert len(app.queue.entries()) == before_undo
 
@@ -88,7 +91,10 @@ async def test_mouse_workflow_at_compact_and_wide_sizes(tmp_path: Path, size: tu
 
         await choose_menu_action(pilot, "#player-menu", "Help")
         await pilot.click("#help-close")
-        assert any(state in str(app.query_one("#player").renderable).lower() for state in ("offline", "disconnected"))
+        assert any(
+            state in str(app.query_one("#player-meta").renderable).lower()
+            for state in ("offline", "disconnected")
+        )
         await choose_menu_action(pilot, "#player-menu", "Quit")
 
     db.close()

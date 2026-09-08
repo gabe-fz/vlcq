@@ -536,25 +536,6 @@ class QuitPrompt(ModalScreen[str | None]):
             self.dismiss(choices[event.button.id])
 
 
-class NoticePrompt(ModalScreen[None]):
-    BINDINGS: ClassVar = [Binding("escape", "cancel", "Close")]
-
-    def __init__(self, notice: str) -> None:
-        super().__init__()
-        self.notice = notice
-
-    def compose(self) -> ComposeResult:
-        yield Static(self.notice, id="details-content", classes="details-content", markup=False)
-        yield Button("Close", id="notice-close")
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "notice-close":
-            self.dismiss(None)
-
-
 class HelpPrompt(ModalScreen[None]):
     BINDINGS: ClassVar = [Binding("escape", "cancel", "Close")]
 
@@ -592,9 +573,10 @@ class VLCQApp(App[None]):
         border: none; content-align: center middle;
     }
     #files-toggle, #queue-toggle, #files-actions, #queue-actions, #player-menu { width: 3; min-width: 3; padding: 0; }
-    #files-open, #files-search, #files-add, #queue-play, #queue-next, #queue-clear,
-    #player-previous, #player-pause, #player-next { min-width: 5; }
-    .section-title { width: 1fr; height: 1; overflow-x: hidden; }
+    #files-open, #files-search, #files-add, #queue-remove, #queue-up, #queue-down,
+    #queue-clear, #player-previous, #player-pause, #player-next { min-width: 5; }
+    .section-name { width: auto; min-width: 7; height: 1; text-style: bold; }
+    .section-title { width: 1fr; height: 1; padding-left: 1; color: $text-muted; overflow-x: hidden; }
     .section-body { height: 1fr; min-height: 1; }
     .section.collapsed .section-body { display: none; }
     #browser, #queue { height: 1fr; min-height: 1; overflow-x: auto; overflow-y: auto; }
@@ -615,13 +597,15 @@ class VLCQApp(App[None]):
     .history-progress { color: $warning; }
     .history-completed { color: $success; }
     .queued-badge { color: $accent; }
+    #status-pane { height: auto; min-height: 7; background: $surface-darken-1; border-top: solid $accent; }
     #player-line { height: 1; min-height: 1; background: $boost; }
     #player { width: 1fr; height: 1; min-height: 1; padding: 0 1; overflow-x: hidden; }
+    #player-meta { height: 1; min-height: 1; padding: 0 1; overflow-x: hidden; }
     #progress-line { height: 2; min-height: 2; }
     #progress { width: 1fr; height: 2; min-height: 2; }
-    #progress-percent { width: 7; height: 2; min-height: 2; content-align: right middle; padding: 0 1; }
-    #player-actions { height: 1; min-height: 1; }
-    #notice { height: 1; min-height: 1; padding: 0 1; color: $text-muted; overflow-x: hidden; }
+    #progress-percent { width: 7; height: 2; min-height: 2; content-align: right middle; padding: 0 1; color: $accent-lighten-2; text-style: bold; }
+    #player-actions { height: 1; min-height: 1; background: $boost; }
+    #notice { height: auto; min-height: 1; padding: 0 1; color: $text; overflow-x: hidden; }
     #context-menu { position: absolute; background: $surface; border: round $accent; padding: 0; overflow-y: auto; }
     .context-action { width: 1fr; min-width: 20; height: 1; min-height: 1; margin: 0; padding: 0 1; border: none; content-align: left middle; }
     .dialog-actions { height: 1; min-height: 1; align-horizontal: center; }
@@ -631,7 +615,7 @@ class VLCQApp(App[None]):
     }
     .dialog-title, .details-content, .help-content { width: 80%; max-height: 12; padding: 1; background: $surface; border: solid $accent; }
     .details-content, .help-content { height: auto; overflow-y: auto; }
-    RootPrompt, SearchFilterPrompt, ResumePrompt, DetailsPrompt, ConfirmClear, ConfirmClearAll, QuitPrompt, NoticePrompt, HelpPrompt { align: center middle; }
+    RootPrompt, SearchFilterPrompt, ResumePrompt, DetailsPrompt, ConfirmClear, ConfirmClearAll, QuitPrompt, HelpPrompt { align: center middle; }
     RootPrompt > Input, SearchFilterPrompt > Input { width: 80%; background: $surface; }
     """
     BINDINGS: ClassVar = [
@@ -723,36 +707,41 @@ class VLCQApp(App[None]):
             with Vertical(id="files-section", classes="section"):
                 with Horizontal(id="files-header", classes="section-header"):
                     yield CompactButton("▾", id="files-toggle", tooltip="Collapse Files")
-                    yield Static("Files", id="files-title", classes="section-title")
-                    yield CompactButton("Open", id="files-open", tooltip="Open or change library root")
-                    yield CompactButton("Search", id="files-search", tooltip="Search and filter files")
-                    yield CompactButton("Add", id="files-add", tooltip="Add highlighted or selected files")
+                    yield Static("Files", classes="section-name")
+                    yield CompactButton("Open", id="files-open", variant="primary", tooltip="Open or change library root")
+                    yield CompactButton("Search", id="files-search", variant="success", tooltip="Search and filter files")
+                    yield CompactButton("Add", id="files-add", variant="warning", tooltip="Add highlighted or selected files")
                     yield CompactButton("…", id="files-actions", tooltip="More Files actions")
+                    yield Static(self.root.name, id="files-title", classes="section-title")
                 with Vertical(id="files-body", classes="section-body"):
                     yield Static("No folders or playable videos here — use Files actions to open a root.", id="files-empty")
                     yield ListView(id="browser")
             with Vertical(id="queue-section", classes="section"):
                 with Horizontal(id="queue-header", classes="section-header"):
                     yield CompactButton("▾", id="queue-toggle", tooltip="Collapse Queue")
-                    yield Static("Queue", id="queue-title", classes="section-title")
-                    yield CompactButton("Play", id="queue-play", tooltip="Play or pause current queue item")
-                    yield CompactButton("Next", id="queue-next", tooltip="Play next queue item")
-                    yield CompactButton("Clear", id="queue-clear", tooltip="Clear watched/completed queue entries")
+                    yield Static("Queue", classes="section-name")
+                    yield CompactButton("Remove", id="queue-remove", variant="error", tooltip="Remove highlighted queue item")
+                    yield CompactButton("↑", id="queue-up", variant="primary", tooltip="Move highlighted queue item up")
+                    yield CompactButton("↓", id="queue-down", variant="primary", tooltip="Move highlighted queue item down")
+                    yield CompactButton("Clear", id="queue-clear", variant="warning", tooltip="Clear watched/completed queue entries")
                     yield CompactButton("…", id="queue-actions", tooltip="More Queue actions")
+                    yield Static("0 entries", id="queue-title", classes="section-title")
                 with Vertical(id="queue-body", classes="section-body"):
                     yield Static("Queue is empty — use Files actions to add a video.", id="queue-empty")
                     yield ListView(id="queue")
-        with Horizontal(id="player-line"):
-            yield Static("Idle · disconnected", id="player")
-        with Horizontal(id="progress-line"):
-            yield ProgressBar(total=100, id="progress", show_eta=False)
-            yield Static("?%", id="progress-percent")
-        with Horizontal(id="player-actions"):
-            yield CompactButton("Previous", id="player-previous", tooltip="Previous queue item")
-            yield CompactButton("Play", id="player-pause", tooltip="Play or pause current item")
-            yield CompactButton("Next", id="player-next", tooltip="Next queue item")
-            yield CompactButton("…", id="player-menu", tooltip="More player and application actions")
-        yield Static("Ready", id="notice")
+        with Vertical(id="status-pane"):
+            with Horizontal(id="player-line"):
+                yield Static("No active media", id="player")
+            yield Static("PLAYER  IDLE  ·  VLC  DISCONNECTED  ·  TIME  --:--", id="player-meta")
+            with Horizontal(id="progress-line"):
+                yield ProgressBar(total=100, id="progress", show_eta=False)
+                yield Static("?%", id="progress-percent")
+            with Horizontal(id="player-actions"):
+                yield CompactButton("Previous", id="player-previous", variant="primary", tooltip="Previous queue item")
+                yield CompactButton("Play", id="player-pause", variant="success", tooltip="Play or pause current item")
+                yield CompactButton("Next", id="player-next", variant="primary", tooltip="Next queue item")
+                yield CompactButton("…", id="player-menu", variant="warning", tooltip="VLC and application actions")
+            yield Static("NOTICE  Ready", id="notice", markup=False)
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         del action, parameters
@@ -944,15 +933,12 @@ class VLCQApp(App[None]):
             discovery.append(self.history_filter.replace("not-completed", "not watched"))
         if discovery:
             selection += " · " + ", ".join(discovery)
-        location = self.root.name
-        if self.browser_path != self.root:
-            try:
-                location += f" · focus: {self.browser_path.relative_to(self.root)}"
-            except ValueError:
-                pass
-        title = f"Files · {location}{selection}"
+        # Keep the browsing focus in the tree rather than spending scarce
+        # header width repeating it. The root and selection/filter metadata
+        # follow the Files controls, where they can yield space first.
+        title = f"{self.root.name}{selection}"
         queue_count = len(self.queue.entries())
-        queue_title = f"Queue · {queue_count} entr{'y' if queue_count == 1 else 'ies'}"
+        queue_title = f"{queue_count} entr{'y' if queue_count == 1 else 'ies'}"
         try:
             self.query_one("#files-title", Static).update(title)
             self.query_one("#queue-title", Static).update(queue_title)
@@ -964,8 +950,9 @@ class VLCQApp(App[None]):
         """Keep direct controls aligned with the same targeting predicates."""
         try:
             files_add = self.query_one("#files-add", Button)
-            queue_play = self.query_one("#queue-play", Button)
-            queue_next = self.query_one("#queue-next", Button)
+            queue_remove = self.query_one("#queue-remove", Button)
+            queue_up = self.query_one("#queue-up", Button)
+            queue_down = self.query_one("#queue-down", Button)
             queue_clear = self.query_one("#queue-clear", Button)
             player_pause = self.query_one("#player-pause", Button)
             player_previous = self.query_one("#player-previous", Button)
@@ -983,9 +970,11 @@ class VLCQApp(App[None]):
             for entry in self.queue.entries()
         )
         files_add.disabled = not bool(self._paths_for_add())
-        queue_play.disabled = current is None or not connected
+        selected_index = self._queue_index()
+        queue_remove.disabled = selected_index is None
+        queue_up.disabled = selected_index is None or selected_index == 0
+        queue_down.disabled = selected_index is None or selected_index >= len(self.queue.entries()) - 1
         player_pause.disabled = current is None or not connected
-        queue_next.disabled = not self.queue.entries() or not connected
         player_next.disabled = not self.queue.entries() or not connected
         player_previous.disabled = not self.queue.entries() or not connected
         queue_clear.disabled = not clearable
@@ -999,7 +988,10 @@ class VLCQApp(App[None]):
             message = f"Undo expired after queue mutation · {message}"
         self._notice = message
         try:
-            self.query_one("#notice", Static).update(message)
+            notice = Text()
+            notice.append("NOTICE  ", style="bold magenta")
+            notice.append(message, style="white")
+            self.query_one("#notice", Static).update(notice)
         except NoMatches:
             pass
 
@@ -1783,22 +1775,51 @@ class VLCQApp(App[None]):
             position_ms = self.controller.status.position_ms if current else 0
             duration_ms = self.controller.status.duration_ms if current else 0
             connected = self.controller.client is not None
+        connection = "OFFLINE" if self.no_vlc else ("CONNECTED" if connected else "DISCONNECTED")
+        state_style = {
+            "playing": "bold green",
+            "paused": "bold yellow",
+            "failed": "bold red",
+            "unavailable": "bold red",
+        }.get(state, "bold cyan")
+        active = Text(no_wrap=True, overflow="ellipsis")
+        active.append("ACTIVE  ", style="bold magenta")
         if current is None:
-            player_text = f"Idle · {'offline' if self.no_vlc else ('connected' if connected else 'disconnected')}"
+            active.append("No active media", style="bright_black")
         else:
-            total = self._format_time(duration_ms) if duration_ms > 0 else "?"
-            player_text = (
-                f"{state.upper()} · {current.path.name} · {self._format_time(position_ms)} / {total} · "
-                f"{'offline' if self.no_vlc else ('connected' if connected else 'disconnected')}"
-            )
+            active.append(current.path.name, style="bold white")
+            active.append("  ·  SOURCE  ", style="bold cyan")
+            active.append(str(current.path.parent), style="cyan")
+
+        elapsed = self._format_time(position_ms) if current is not None else "--:--"
+        total = self._format_time(duration_ms) if duration_ms > 0 else "?"
+        remaining = self._format_time(max(0, duration_ms - position_ms)) if duration_ms > 0 else "?"
+        metadata = Text(no_wrap=True, overflow="ellipsis")
+        metadata.append("PLAYER  ", style="bold magenta")
+        metadata.append(state.upper(), style=state_style)
+        metadata.append("  ·  VLC  ", style="bold magenta")
+        metadata.append(connection, style="bold green" if connected else "bold red")
+        metadata.append("  ·  ELAPSED  ", style="bold cyan")
+        metadata.append(elapsed, style="white")
+        metadata.append("  ·  REMAINING  ", style="bold yellow")
+        metadata.append(remaining, style="yellow")
+        metadata.append("  ·  DURATION  ", style="bold cyan")
+        metadata.append(total, style="white")
+
         percent = min(100.0, position_ms * 100 / duration_ms) if duration_ms > 0 else 0.0
         try:
-            self.query_one("#player", Static).update(player_text)
+            self.query_one("#player", Static).update(active)
+            self.query_one("#player-meta", Static).update(metadata)
             self.query_one("#progress", ProgressBar).update(progress=percent)
             self.query_one("#progress-percent", Static).update(
                 f"{round(percent):d}%" if duration_ms > 0 else "?%"
             )
-            self.query_one("#notice", Static).update(self._notice)
+            pause_label = "Pause" if state == "playing" else "Play"
+            self.query_one("#player-pause", Button).label = pause_label
+            notice = Text()
+            notice.append("NOTICE  ", style="bold magenta")
+            notice.append(self._notice, style="white")
+            self.query_one("#notice", Static).update(notice)
         except NoMatches:
             return
         self._refresh_browser_history()
@@ -2560,27 +2581,14 @@ class VLCQApp(App[None]):
         return actions
 
     def _context_actions_for_files_section(self, target: SectionTarget) -> list[ContextAction]:
-        entry = self._browser_entry()
-        file_target = self._context_library_target(entry)
-        actions: list[ContextAction] = []
-        if file_target is not None:
-            actions.extend(
-                action
-                for action in self._context_actions_for_file(file_target)
-                if action.key != "add-end-file"
-            )
-        actions.extend(
-            [
-                ContextAction("open-root", "Open/change root", target),
-                ContextAction("parent", "Up", target, self.browser_path != self.root),
-                ContextAction("search-filter", "Search / filters…", target),
-                ContextAction("sort-files", "Reverse filename order", target),
-                ContextAction("next-selection", self._batch_label("Play next"), target, bool(self._paths_for_add())),
-                ContextAction("add-play-selection", self._batch_label("Add & play"), target, bool(self._paths_for_add())),
-                ContextAction("clear-selection", "Clear selection", target, bool(self.selected_paths)),
-            ]
-        )
-        return actions
+        """Return Files-only section actions; row actions stay on file rows."""
+        return [
+            ContextAction("open-root", "Open/change root", target),
+            ContextAction("parent", "Up", target, self.browser_path != self.root),
+            ContextAction("search-filter", "Search / filters…", target),
+            ContextAction("sort-files", "Reverse filename order", target),
+            ContextAction("clear-selection", "Clear selection", target, bool(self.selected_paths)),
+        ]
 
     def _batch_label(self, verb: str) -> str:
         paths = self._paths_for_add()
@@ -2603,15 +2611,12 @@ class VLCQApp(App[None]):
         )
 
     def _context_actions_for_queue_section(self, target: SectionTarget) -> list[ContextAction]:
-        actions = [
+        """Return queue-management actions without duplicating player transport."""
+        return [
             ContextAction("sort-queue", "Sort naturally", target, bool(self.queue.entries())),
             ContextAction("clear-all", "Clear queue", target, bool(self.queue.entries())),
             ContextAction("undo", "Undo latest removal", target, self.queue.undo_available),
         ]
-        queue_target = self._context_queue_target()
-        if queue_target is not None:
-            actions.extend(self._context_actions_for_queue(queue_target))
-        return actions
 
     def _context_queue_target(self) -> QueueTarget | None:
         index = self._queue_index()
@@ -2644,14 +2649,6 @@ class VLCQApp(App[None]):
             ContextAction("seek-back", "Seek back 10s", target, connected and current is not None),
             ContextAction("seek-forward", "Seek forward 10s", target, connected and current is not None),
             ContextAction("reconnect", "Reconnect", target, not self.no_vlc),
-            ContextAction("active-details", "Active player details", target, current is not None),
-            ContextAction(
-                "remaining",
-                "Show remaining time",
-                target,
-                current is not None and self.controller.status.duration_ms > 0,
-            ),
-            ContextAction("last-notice", "Show full last notice", target, len(self._notice) > 0),
             ContextAction("help", "Help", target),
             ContextAction("quit", "Quit", target),
         ]
@@ -2844,19 +2841,6 @@ class VLCQApp(App[None]):
             await self.action_seek(10)
         elif key == "reconnect":
             await self.action_reconnect()
-        elif key == "active-details":
-            current = self.queue.current()
-            if current is not None:
-                await self._open_details(BrowserEntry(current.path, current.path.name, False, True), pane="queue")
-        elif key == "remaining":
-            status = self.controller.status
-            if status.duration_ms > 0:
-                remaining = max(0, status.duration_ms - status.position_ms)
-                self.update_status(f"Remaining: {self._format_time(remaining)}")
-            else:
-                self.update_status("Remaining time is unknown")
-        elif key == "last-notice":
-            self.push_screen(NoticePrompt(self._notice))
         elif key == "help":
             self.action_help()
         elif key == "quit":
@@ -3030,10 +3014,12 @@ class VLCQApp(App[None]):
             self.action_search_filter()
         elif button_id == "files-add":
             await self.action_add_selected()
-        elif button_id == "queue-play":
-            await self.action_pause()
-        elif button_id == "queue-next":
-            await self.action_next()
+        elif button_id == "queue-remove":
+            await self.action_remove()
+        elif button_id == "queue-up":
+            await self.action_move_up()
+        elif button_id == "queue-down":
+            await self.action_move_down()
         elif button_id == "queue-clear":
             self.action_clear_completed()
         elif button_id == "player-previous":

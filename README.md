@@ -39,9 +39,11 @@ vlcq progress --root ~/Videos --json
 
 The main screen is a stacked **Files** section above a **Queue** section. Both start
 expanded and share the available list space; click `▾`/`▸` to collapse or restore either
-section. Each header remains visible and its `…` menu provides the section’s actions.
-Right-clicking a row opens the same contextual actions, and `Shift+F10` is the keyboard
-fallback. Menus remain inside the terminal and scroll when needed.
+section. Compact, color-coded controls begin beside each section name so long metadata
+cannot push them to the right edge. Each header remains visible and its `…` menu contains
+only that section’s actions. Right-clicking a row opens actions for that specific item,
+and `Shift+F10` is the keyboard fallback. Menus remain inside the terminal and scroll when
+needed.
 
 Rows are one line: filenames remain literal, including bracketed release tags, while
 folders, stems, bracketed spans, numeric runs, punctuation, and extensions use distinct
@@ -55,10 +57,11 @@ visible as outcomes. Unplayed rows omit a history badge. Click a folder to expan
 Full paths, resume/furthest positions, durations, watched threshold, fingerprints, and
 missing history are available through **Details**.
 
-The Files header exposes **Open**, **Search/filter**, **Add**, and `…`; Queue exposes
-**Play/pause**, **Next**, **Clear**, and `…`; the player exposes **Previous**, **Play/pause**,
-**Next**, and `…`. The overflow menus retain Details, resume/start-over, reorder, undo,
-reconnect, help, and quit. Search and **All / In progress / Not watched** filters discover
+The Files header exposes **Open**, **Search/filter**, **Add**, and file actions; Queue exposes
+**Remove**, **Move up/down**, **Clear**, and queue actions; the status pane exclusively owns
+**Previous**, **Play/pause**, **Next**, and VLC/application actions. Item context menus retain
+Details and resume/start-over, while section menus stay pane-specific. Search and
+**All / In progress / Not watched** filters discover
 the whole root without enqueueing results. The Files header keeps active search/filter and
 selected/hidden counts visible. Selections remain explicit across filtering, collapsing,
 and resizing. **Play now** always targets the highlighted item, while **Add to end**,
@@ -73,11 +76,13 @@ or changes queue outcome state. Set `VLCQ_WATCHED_PERCENT` to a whole number fro
 100; invalid values fail startup before database mutation. Automatic advancement uses a
 trustworthy resume without opening a modal.
 
-The bounded bottom area contains a player summary, a thick live progress track/percentage,
-a player action bar, and a one-line notice. The player overflow contains remaining time,
-relative seek, reconnect, active-player details, full notice access, Help, and Quit.
-Reconnect never selects or autoplays a queue item. Absolute seek is available only for
-connected matching media with a known positive duration; item history bars are inert.
+The bottom status pane is a color-coded metadata surface: it shows the active filename and
+source folder, player/VLC state, elapsed, remaining, and total time, a thick live progress
+track/percentage, transport controls, and the complete wrapping last notice. These are
+always visible metadata rather than overflow buttons. The player overflow is reserved for
+relative seek, reconnect, Help, and Quit. Reconnect never selects or autoplays a queue item.
+Absolute seek is available only for connected matching media with a known positive duration;
+item history bars are inert.
 
 ## TUI keys
 
@@ -110,7 +115,8 @@ mutation, automatic advancement, root change, or shutdown expires it. Missing me
 be restored as visibly missing, while unsafe or replaced paths are rejected.
 
 Empty sections show one short next-action hint, focused sections receive a distinct
-highlight, and queue rows display current-state or outcome indicators (`▶ PLAYING`,
+highlight, and the Files header reports the root without repeating the currently expanded
+folder. Queue rows display current-state or outcome indicators (`▶ PLAYING`,
 `Ⅱ PAUSED`, `■ STOPPED`, `→ SKIPPED`, `✓ COMPLETED`, `! MISSING`, and `× FAILED`). Hidden
 dotfiles and unsupported file types are not shown.
 
