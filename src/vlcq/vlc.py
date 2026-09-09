@@ -6,6 +6,8 @@ import re
 import secrets
 import shutil
 import socket
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -28,6 +30,90 @@ def _number(value: object) -> int:
         return 0
 
 
+@dataclass(frozen=True)
+class VLCPlaylistItem:
+    """A validated leaf in VLC's ephemeral playlist."""
+
+    playlist_id: str
+    path: Path
+
+    @property
+    def id(self) -> str:
+        return self.playlist_id
+
+    @property
+    def vlc_id(self) -> str:
+        return self.playlist_id
+
+
+# Descriptive aliases keep the playlist identity type discoverable to callers
+# that use either VLC's terminology or the controller's terminology.
+PlaylistItem = VLCPlaylistItem
+VLCPlaylistEntry = VLCPlaylistItem
+
+
+def _playlist_id(value: object) -> str:
+    if not isinstance(value, (str, int)) or isinstance(value, bool):
+        raise VLCError("VLC returned malformed playlist identity")
+    result = str(value)
+    if not result or result == "-1":
+        raise VLCError("VLC returned malformed playlist identity")
+    return result
+
+
+def _playlist_nodes(payload: object) -> Iterator[dict[str, object]]:
+    """Yield nested playlist nodes while ignoring unrelated JSON metadata."""
+    if isinstance(payload, dict):
+        yield cast(dict[str, object], payload)
+        for key in ("children", "playlist", "items"):
+            children = payload.get(key)
+            if isinstance(children, list):
+                for child in children:
+                    yield from _playlist_nodes(child)
+            elif children is not None:
+                raise VLCError("VLC returned malformed playlist structure")
+    elif isinstance(payload, list):
+        for child in payload:
+            yield from _playlist_nodes(child)
+    else:
+        raise VLCError("VLC returned malformed playlist structure")
+
+
+def parse_playlist(payload: object) -> list[VLCPlaylistItem]:
+    """Parse VLC's nested playlist response into safe, stable leaf identities."""
+    if not isinstance(payload, (dict, list)):
+        raise VLCError("unsupported VLC playlist response")
+    result: list[VLCPlaylistItem] = []
+    by_id: dict[str, Path] = {}
+    by_path: dict[Path, str] = {}
+    for node in _playlist_nodes(payload):
+        has_uri = "uri" in node
+        node_type = node.get("type")
+        if not has_uri:
+            if node_type == "leaf":
+                raise VLCError("VLC returned malformed playlist entry")
+            continue
+        playlist_id = _playlist_id(node.get("id"))
+        uri = node.get("uri")
+        if not isinstance(uri, str) or not uri:
+            raise VLCError("VLC returned malformed playlist entry")
+        try:
+            path = file_uri_to_path(uri)
+        except PathError as exc:
+            raise VLCError("VLC playlist contains unsafe media") from exc
+        previous_path = by_id.get(playlist_id)
+        previous_id = by_path.get(path)
+        if previous_path is not None and previous_path != path:
+            raise VLCError("VLC playlist contains ambiguous identities")
+        if previous_id is not None and previous_id != playlist_id:
+            raise VLCError("VLC playlist contains ambiguous identities")
+        if previous_path is None and previous_id is None:
+            by_id[playlist_id] = path
+            by_path[path] = playlist_id
+            result.append(VLCPlaylistItem(playlist_id, path))
+    return result
+
+
 def parse_status(payload: object) -> VLCStatus:
     if not isinstance(payload, dict):
         raise VLCError("unsupported VLC status response")
@@ -47,13 +133,19 @@ def parse_status(payload: object) -> VLCStatus:
                 # normally comes from currentplid + playlist.json.
                 uri = meta.get("uri")
     path = None
-    if uri:
+    if uri is not None:
+        if not isinstance(uri, str) or not uri:
+            raise VLCError("VLC reported malformed media identity")
         try:
-            path = file_uri_to_path(str(uri))
+            path = file_uri_to_path(uri)
         except PathError as exc:
             raise VLCError("VLC reported unsafe media") from exc
     return VLCStatus(
-        state, _number(payload.get("time")) * 1000, _number(payload.get("length")) * 1000, path
+        state,
+        _number(payload.get("time")) * 1000,
+        _number(payload.get("length")) * 1000,
+        path,
+        _current_playlist_id(payload),
     )
 
 
@@ -65,28 +157,6 @@ def _current_playlist_id(payload: object) -> str | None:
         return None
     playlist_id = str(value)
     return None if playlist_id == "-1" else playlist_id
-
-
-def _playlist_item_path(payload: object, playlist_id: str) -> Path | None:
-    """Find a current item's MRL in VLC's nested playlist response."""
-    pending = [payload]
-    while pending:
-        item = pending.pop()
-        if isinstance(item, list):
-            pending.extend(item)
-            continue
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("id")) == playlist_id:
-            uri = item.get("uri")
-            if not isinstance(uri, str) or not uri:
-                return None
-            try:
-                return file_uri_to_path(uri)
-            except PathError as exc:
-                raise VLCError("VLC reported unsafe media") from exc
-        pending.extend(cast(object, value) for value in item.values())
-    return None
 
 
 class VLCClient:
@@ -113,19 +183,29 @@ class VLCClient:
 
     async def _status_from_payload(self, payload: object) -> VLCStatus:
         status = parse_status(payload)
-        playlist_id = _current_playlist_id(payload)
+        playlist_id = status.playlist_id
         if status.path is not None or playlist_id is None:
             return status
         path = self._playlist_paths.get(playlist_id)
         if path is None:
-            response = await self._client.get("/requests/playlist.json")
-            playlist = self._response_payload(response)
-            path = _playlist_item_path(playlist, playlist_id)
-            if path is not None:
-                self._playlist_paths[playlist_id] = path
+            items = await self.playlist()
+            path = next((item.path for item in items if item.playlist_id == playlist_id), None)
         if path is None:
             return status
-        return VLCStatus(status.state, status.position_ms, status.duration_ms, path)
+        return VLCStatus(status.state, status.position_ms, status.duration_ms, path, playlist_id)
+
+    async def playlist(self) -> list[VLCPlaylistItem]:
+        """Inspect VLC's nested playlist without exposing its raw response."""
+        try:
+            response = await self._client.get("/requests/playlist.json")
+            items = parse_playlist(self._response_payload(response))
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
+            raise VLCError("VLC playlist inspection failed") from exc
+        self._playlist_paths = {item.playlist_id: item.path for item in items}
+        return items
+
+    async def inspect_playlist(self) -> list[VLCPlaylistItem]:
+        return await self.playlist()
 
     async def status(self) -> VLCStatus:
         try:
@@ -134,19 +214,65 @@ class VLCClient:
         except (httpx.HTTPError, json.JSONDecodeError) as exc:
             raise VLCError("VLC is unavailable") from exc
 
+    @staticmethod
+    def _validated_media_path(path: Path) -> Path:
+        try:
+            canonical = path.expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise VLCError("VLC media is unavailable") from exc
+        if not canonical.is_file():
+            raise VLCError("VLC media is unavailable")
+        return canonical
+
+    @staticmethod
+    def _validated_playlist_id(value: str | int) -> str:
+        return _playlist_id(value)
+
     async def command(self, command: str, **parameters: str | int) -> VLCStatus:
-        allowed = {"in_play", "pl_pause", "pl_stop", "seek"}
+        allowed = {
+            "in_play",
+            "in_enqueue",
+            "pl_pause",
+            "pl_stop",
+            "pl_next",
+            "pl_previous",
+            "pl_delete",
+            "pl_empty",
+            "seek",
+        }
         if command not in allowed:
             raise VLCError("unsupported VLC command")
         params: dict[str, str | int] = {"command": command, **parameters}
         try:
             response = await self._client.get("/requests/status.json", params=params)
-            return await self._status_from_payload(self._response_payload(response))
+            status = await self._status_from_payload(self._response_payload(response))
+            if command in {"in_enqueue", "pl_delete", "pl_empty"}:
+                self._playlist_paths.clear()
+            return status
         except (httpx.HTTPError, json.JSONDecodeError) as exc:
             raise VLCError("VLC command failed") from exc
 
     async def play(self, path: Path) -> VLCStatus:
-        return await self.command("in_play", input=path.as_uri())
+        canonical = self._validated_media_path(path)
+        return await self.command("in_play", input=canonical.as_uri())
+
+    async def enqueue(self, path: Path) -> VLCStatus:
+        canonical = self._validated_media_path(path)
+        return await self.command("in_enqueue", input=canonical.as_uri())
+
+    async def remove(self, playlist_id: str | int) -> VLCStatus:
+        return await self.command("pl_delete", id=self._validated_playlist_id(playlist_id))
+
+    async def replace_playlist(self, path: Path) -> VLCStatus:
+        """Clear VLC's ephemeral playlist and start one validated local item."""
+        await self.command("pl_empty")
+        return await self.play(path)
+
+    # Short aliases make the typed operations convenient for small controller
+    # fakes while keeping the public verbs explicit in the implementation.
+    replace = replace_playlist
+    enqueue_path = enqueue
+    remove_playlist_item = remove
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -198,6 +324,9 @@ class VLCProcess:
             self.executable,
             "--intf=macosx",
             "--no-media-library",
+            "--no-repeat",
+            "--no-loop",
+            "--no-random",
             "--extraintf=http",
             "--http-host=127.0.0.1",
             f"--http-port={self.port}",

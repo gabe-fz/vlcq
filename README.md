@@ -2,8 +2,10 @@
 
 `vlcq` is a folder-first Textual interface for a deterministic, persistent VLC 3
 video queue on macOS. It browses a lazily expandable library tree without automatically
-enqueueing its contents, sends VLC one selected item at a time, and records monotonic
-playback history plus a separate trustworthy resume position in SQLite.
+enqueueing its contents, and keeps VLC's ephemeral playlist bounded to the active item
+plus at most one `vlcq`-authorized successor. `vlcq` remains authoritative for queue
+order and records monotonic playback history plus a separate trustworthy resume position
+in SQLite.
 
 ## Install
 
@@ -92,6 +94,14 @@ relative seek, reconnect, Help, and Quit. Reconnect never selects or autoplays a
 Absolute seek is available only for connected matching media with a known positive duration;
 item history bars are inert.
 
+When `vlcq` owns VLC 3, VLC's native **Next** button is supported: the controller
+reconciles the observed staged successor into the authoritative queue without replaying
+it. The VLC process starts with repeat-current, repeat-all, and random playback explicitly
+disabled, regardless of saved VLC preferences. The window is never a full queue mirror;
+there is no native Previous support in this change, and media opened directly or through
+untracked VLC playlist navigation is rejected rather than adopted. Use `vlcq`'s **Previous**
+and **Next** controls (or `p` and `n`) for authoritative queue navigation.
+
 ## TUI keys
 
 | Key | Action |
@@ -159,8 +169,11 @@ An advisory lock prevents a second controller from independently mutating the
 queue. A second process exits clearly rather than risking corruption.
 
 VLC is launched as a dedicated process with its normal macOS video interface
-visible and an authenticated HTTP interface bound to `127.0.0.1`. The generated password, Authorization header, raw VLC
-responses, and media history are not logged. `vlcq` performs no non-loopback
+visible and an authenticated HTTP interface bound to `127.0.0.1`. Its launch command
+explicitly passes `--no-repeat`, `--no-loop`, and `--no-random`; users can still change
+VLC controls while it runs, but `vlcq` fails closed if VLC does not remain within the
+bounded window. The generated password, Authorization header, raw VLC responses, and media
+history are not logged. `vlcq` performs no non-loopback
 network requests and never deletes, moves, copies, or modifies media files.
 
 ## Private backup and rollback
@@ -200,4 +213,6 @@ VLCQ_REAL_VLC=1 .venv/bin/python -m pytest tests/test_integration_real_vlc.py
 ```
 
 It is skipped when not explicitly enabled or when the macOS VLC application is
-unavailable. This smoke test opens VLC briefly; it does not play or modify media.
+unavailable. The opt-in test uses generated temporary media and exercises native Next,
+natural transitions, bounded playlist contents, queue outcomes, and clean shutdown; it
+never uses user media or credentials.

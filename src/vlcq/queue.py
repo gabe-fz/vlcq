@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .database import Database
 from .models import QueueEntry
-from .paths import deduplicate_natural, is_beneath, natural_key, validate_video
+from .paths import VIDEO_EXTENSIONS, deduplicate_natural, is_beneath, natural_key, validate_video
 from .progress import is_watched
 
 
@@ -55,7 +55,15 @@ class QueueService:
         entries = self.database.queue_entries()
         changed = False
         for entry in entries:
-            if not entry.path.is_file() and entry.state != "missing":
+            # Diagnose missing files only when their canonical identity remains
+            # inside the active root. Unsafe rows stay visible and unchanged
+            # for recovery instead of being rewritten during a browse pass.
+            try:
+                canonical = entry.path.expanduser().resolve(strict=False)
+                confined = self.root is not None and is_beneath(canonical, self.root)
+            except (OSError, RuntimeError):
+                confined = False
+            if confined and not canonical.is_file() and entry.state != "missing":
                 self.database.set_state(entry.id, "missing")
                 changed = True
         return self.database.queue_entries() if changed else entries
@@ -138,7 +146,9 @@ class QueueService:
         self._invalidate_undo()
         return next(item for item in self.entries() if item.id == entry.id)
 
-    def next(self, completed: bool = False) -> QueueEntry | None:
+    def next(self, completed: bool = False, *, state: str = "playing") -> QueueEntry | None:
+        if state not in {"playing", "paused", "stopped"}:
+            raise ValueError("next state must be transient playback state")
         self._invalidate_undo()
         entries = self.entries()
         current = self.current()
@@ -150,10 +160,30 @@ class QueueService:
             if current.state not in {"missing", "failed", "completed", "skipped"}:
                 self.database.set_state(current.id, "completed" if completed else "skipped")
         for entry in entries[start + 1 :]:
-            if entry.path.is_file():
-                self.database.transition_current(entry.id, "playing")
+            canonical: Path | None = None
+            try:
+                canonical = entry.path.expanduser().resolve(strict=False)
+                safe_file = (
+                    self.root is not None
+                    and is_beneath(canonical, self.root)
+                    and canonical.suffix.casefold() in VIDEO_EXTENSIONS
+                    and canonical.is_file()
+                )
+            except (OSError, RuntimeError):
+                safe_file = False
+            if safe_file:
+                self.database.transition_current(entry.id, state)
                 return next(item for item in self.entries() if item.id == entry.id)
-            self.database.set_state(entry.id, "missing")
+            try:
+                confined = (
+                    canonical is not None
+                    and self.root is not None
+                    and is_beneath(canonical, self.root)
+                )
+            except (OSError, RuntimeError):
+                confined = False
+            if confined and canonical is not None and not canonical.is_file():
+                self.database.set_state(entry.id, "missing")
         self.database.transition_current(None)
         return None
 

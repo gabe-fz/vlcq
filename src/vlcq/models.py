@@ -102,3 +102,9 @@ class VLCStatus:
     position_ms: int = 0
     duration_ms: int = 0
     path: Path | None = None
+    playlist_id: str | None = None
+
+    @property
+    def vlc_id(self) -> str | None:
+        """Stable identity of the observed VLC playlist item, when available."""
+        return self.playlist_id

@@ -1825,6 +1825,8 @@ class VLCQApp(App[None]):
         self._render_headers()
 
     def refresh_playback(self) -> None:
+        if self.controller.last_error is not None:
+            self._notice = self.controller.last_error
         current = self.queue.current()
         if self.no_vlc:
             state = current.state if current else "idle"
@@ -1977,6 +1979,17 @@ class VLCQApp(App[None]):
     def _require_vlc_for_play(self) -> bool:
         if not self.no_vlc and self.controller.client is None:
             self.update_status("VLC unavailable — press r to retry")
+            return False
+        return True
+
+    async def _notify_queue_mutation(self) -> bool:
+        """Repair the owned VLC successor after a queue identity mutation."""
+        if self.no_vlc or self.controller.client is None:
+            return True
+        try:
+            await self.controller.synchronize_playlist()
+        except (OSError, RuntimeError, VLCError):
+            self.update_status("VLC playlist synchronization paused — press r to retry")
             return False
         return True
 
@@ -2217,6 +2230,7 @@ class VLCQApp(App[None]):
         except (OSError, PathError, RuntimeError, ValueError) as exc:
             self.update_status(f"Add failed: {exc}")
             return
+        await self._notify_queue_mutation()
         self.selected_paths.clear()
         await self.refresh_browser()
         self.refresh_queue()
@@ -2232,6 +2246,7 @@ class VLCQApp(App[None]):
         except (OSError, PathError, RuntimeError, ValueError) as exc:
             self.update_status(f"Play next failed: {exc}")
             return
+        await self._notify_queue_mutation()
         self.selected_paths.clear()
         await self.refresh_browser()
         self.refresh_queue()
@@ -2248,6 +2263,8 @@ class VLCQApp(App[None]):
         except (OSError, RuntimeError, ValueError) as exc:
             self.update_status(f"Undo refused: {exc}")
         else:
+            if restored:
+                await self._notify_queue_mutation()
             self.update_status("Removal undone" if restored else "Undo expired")
         self.refresh_queue()
 
@@ -2294,6 +2311,7 @@ class VLCQApp(App[None]):
         except (OSError, PathError) as exc:
             self.update_status(str(exc))
             return
+        await self._notify_queue_mutation()
         self.browser_path = self.root
         self._root_generation += 1
         self._tree_generation += 1
@@ -2429,6 +2447,7 @@ class VLCQApp(App[None]):
                     stop_confirmed=self.no_vlc or entry.state in {"playing", "paused"},
                 )
             )
+            await self._notify_queue_mutation()
         except (IndexError, OSError, RuntimeError, ValueError) as exc:
             self.update_status(f"Remove failed: {exc}")
         else:
@@ -2446,6 +2465,7 @@ class VLCQApp(App[None]):
         selected_entry_id = self._queue_selected_id()
         try:
             await self._run_database_operation(lambda: self.queue.move(index, 1))
+            await self._notify_queue_mutation()
         except (IndexError, OSError, RuntimeError) as exc:
             self.update_status(f"Move failed: {exc}")
         else:
@@ -2463,6 +2483,7 @@ class VLCQApp(App[None]):
         selected_entry_id = self._queue_selected_id()
         try:
             await self._run_database_operation(lambda: self.queue.move(index, -1))
+            await self._notify_queue_mutation()
         except (IndexError, OSError, RuntimeError) as exc:
             self.update_status(f"Move failed: {exc}")
         else:
@@ -2503,6 +2524,7 @@ class VLCQApp(App[None]):
                 self.update_status("Clear blocked: VLC stop could not be confirmed")
                 return
             await self._run_database_operation(lambda: self.queue.clear_all(stop_confirmed=True))
+            await self._notify_queue_mutation()
         except (OSError, RuntimeError, ValueError) as exc:
             self.update_status(f"Clear failed: {exc}")
             return
@@ -2884,6 +2906,7 @@ class VLCQApp(App[None]):
         elif key == "sort-queue":
             selected_entry_id = self._queue_selected_id()
             await self._run_database_operation(self.queue.sort_natural)
+            await self._notify_queue_mutation()
             self.refresh_queue(selected_entry_id=selected_entry_id, selection_captured=True)
             self.update_status("Queue sorted naturally")
         elif key == "clear-completed":
@@ -2931,6 +2954,7 @@ class VLCQApp(App[None]):
         except (OSError, PathError, RuntimeError, ValueError) as exc:
             self.update_status(f"Add failed: {exc}")
             return
+        await self._notify_queue_mutation()
         self.selected_paths.difference_update(paths)
         await self.refresh_browser()
         self.refresh_queue()
@@ -2945,6 +2969,7 @@ class VLCQApp(App[None]):
         except (OSError, PathError, RuntimeError, ValueError) as exc:
             self.update_status(f"Play next failed: {exc}")
             return
+        await self._notify_queue_mutation()
         self.selected_paths.difference_update(paths)
         await self.refresh_browser()
         self.refresh_queue()
@@ -3062,6 +3087,7 @@ class VLCQApp(App[None]):
                 except (OSError, RuntimeError, ValueError) as exc:
                     self.update_status(f"Clear failed: {exc}")
                     return
+                await self._notify_queue_mutation()
                 self.refresh_queue()
                 self.update_status("Completed queue entries cleared · Undo available")
 
@@ -3109,6 +3135,7 @@ class VLCQApp(App[None]):
         elif button_id == "queue-sort":
             selected_entry_id = self._queue_selected_id()
             await self._run_database_operation(self.queue.sort_natural)
+            await self._notify_queue_mutation()
             self.refresh_queue(selected_entry_id=selected_entry_id, selection_captured=True)
             self.update_status("Queue sorted naturally")
         elif button_id == "queue-undo":

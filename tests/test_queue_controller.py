@@ -8,7 +8,7 @@ from vlcq.controller import PlaybackController, ResumeChoiceRequired
 from vlcq.database import Database
 from vlcq.models import VLCStatus
 from vlcq.queue import QueueService
-from vlcq.vlc import VLCError
+from vlcq.vlc import VLCError, VLCPlaylistItem
 
 
 class FakeClient:
@@ -40,6 +40,36 @@ class FakeProcess:
         self.stopped = True
 
 
+class PlaylistFakeClient(FakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.playlist_items: list[VLCPlaylistItem] = []
+        self._next_id = 100
+        self.removed: list[str] = []
+        self.enqueued: list[Path] = []
+
+    async def replace_playlist(self, path: Path) -> VLCStatus:
+        self.playlist_items = [VLCPlaylistItem(str(self._next_id), path.resolve())]
+        self._next_id += 1
+        self.played.append(path.resolve())
+        return VLCStatus("playing", path=path.resolve(), playlist_id=self.playlist_items[0].playlist_id)
+
+    async def playlist(self) -> list[VLCPlaylistItem]:
+        return list(self.playlist_items)
+
+    async def enqueue(self, path: Path) -> VLCStatus:
+        item = VLCPlaylistItem(str(self._next_id), path.resolve())
+        self._next_id += 1
+        self.playlist_items.append(item)
+        self.enqueued.append(path.resolve())
+        return VLCStatus("playing", path=self.playlist_items[0].path, playlist_id=self.playlist_items[0].playlist_id)
+
+    async def remove(self, playlist_id: str) -> VLCStatus:
+        self.removed.append(playlist_id)
+        self.playlist_items = [item for item in self.playlist_items if item.playlist_id != playlist_id]
+        return VLCStatus("playing", path=self.playlist_items[0].path if self.playlist_items else None)
+
+
 def setup_queue(tmp_path: Path) -> tuple[Database, QueueService, list[Path]]:
     root = tmp_path / "show"
     root.mkdir()
@@ -51,6 +81,337 @@ def setup_queue(tmp_path: Path) -> tuple[Database, QueueService, list[Path]]:
     queue.open(root)
     queue.add(videos)
     return db, queue, videos
+
+
+@pytest.mark.asyncio
+async def test_playlist_window_is_bounded_and_refreshes_successor_without_replay(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "show"
+    root.mkdir()
+    videos = [root / f"e{index}.mkv" for index in range(1, 4)]
+    for video in videos:
+        video.write_bytes(video.name.encode())
+    db = Database(tmp_path / "db.sqlite3")
+    queue = QueueService(db)
+    queue.open(root)
+    queue.add(videos)
+    client = PlaylistFakeClient()
+    controller = PlaybackController(queue, process=FakeProcess())  # type: ignore[arg-type]
+    controller.client = client  # type: ignore[assignment]
+
+    await controller.play_index(0)
+    assert [item.path for item in client.playlist_items] == [videos[0].resolve(), videos[1].resolve()]
+    assert len(client.played) == 1
+    active_id = controller.active_vlc_id
+
+    queue.move(2, -1)
+    await controller.synchronize_playlist()
+    assert [item.path for item in client.playlist_items] == [videos[0].resolve(), videos[2].resolve()]
+    assert len(client.played) == 1
+    assert controller.active_vlc_id == active_id
+    assert controller.staged_path == videos[2].resolve()
+
+    queue.remove(1)
+    queue.remove(1)
+    await controller.synchronize_playlist()
+    assert [item.path for item in client.playlist_items] == [videos[0].resolve()]
+    assert controller.staged_vlc_id is None
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_successor_selection_skips_missing_and_unsafe_rows_without_staging(
+    tmp_path: Path,
+) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    outside = tmp_path / "private" / "outside.mkv"
+    outside.parent.mkdir()
+    outside.write_bytes(b"outside")
+    client = PlaylistFakeClient()
+    controller = PlaybackController(queue, process=FakeProcess())  # type: ignore[arg-type]
+    controller.client = client  # type: ignore[assignment]
+    await controller.play_index(0)
+    client.enqueued.clear()
+
+    videos[1].unlink()
+    media_id = db.ensure_media(outside)
+    db.connection.execute(
+        "INSERT INTO queue_entries(queue_id,position,media_id,state) VALUES(?,?,?,'queued')",
+        (db.active_queue_id(), 2, media_id),
+    )
+    unsafe_id = queue.entries()[-1].id
+    await controller.synchronize_playlist(force=True)
+
+    assert queue.entries()[1].state == "missing"
+    assert queue.entries()[-1].id == unsafe_id
+    assert queue.entries()[-1].state == "queued"
+    assert controller.staged_vlc_id is None
+    assert [item.path for item in client.playlist_items] == [videos[0].resolve()]
+    assert client.enqueued == []
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_playlist_window_reconnect_invalidates_ephemeral_ids(tmp_path: Path) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    controller = PlaybackController(queue, process=FakeProcess())  # type: ignore[arg-type]
+    controller.active_vlc_id = "active"
+    controller.staged_vlc_id = "staged"
+    controller.staged_queue_id = queue.entries()[1].id
+    controller.staged_path = videos[1]
+    controller._window_signature = (queue.entries()[0].id, queue.entries()[1].id)
+    controller._playlist_sync_invalidated = False
+
+    controller._invalidate_playlist_window()
+    assert controller.active_vlc_id is None
+    assert controller.staged_vlc_id is None
+    assert controller.staged_queue_id is None
+    assert controller.staged_path is None
+    assert controller._window_signature is None
+    assert controller._playlist_sync_invalidated
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_native_next_adopts_staged_successor_without_replaying_it(tmp_path: Path) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    client = PlaylistFakeClient()
+    controller = PlaybackController(queue, process=FakeProcess())  # type: ignore[arg-type]
+    controller.client = client  # type: ignore[assignment]
+    await controller.play_index(0)
+    staged_id = controller.staged_vlc_id
+    generation = controller.playback_generation
+    assert staged_id is not None
+
+    await controller._observe(
+        VLCStatus("playing", 1_000, 10_000, videos[1].resolve(), staged_id),
+        generation=generation,
+    )
+
+    assert queue.entries()[0].state == "skipped"
+    assert queue.current() is not None and queue.current().path == videos[1].resolve()
+    assert queue.entries()[1].state == "playing"
+    assert client.played == [videos[0].resolve()]
+    assert [item.path for item in client.playlist_items] == [videos[1].resolve()]
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_unexpected_media_is_not_adopted_or_written_to_history(tmp_path: Path) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    unexpected = videos[0].with_name("unexpected.mkv")
+    unexpected.write_bytes(b"unexpected")
+    client = PlaylistFakeClient()
+    controller = PlaybackController(queue, process=FakeProcess())  # type: ignore[arg-type]
+    controller.client = client  # type: ignore[assignment]
+    await controller.play_index(0)
+    before = [(entry.id, entry.state) for entry in queue.entries()]
+    media_count = db.connection.execute("SELECT COUNT(*) FROM media").fetchone()[0]
+
+    await controller._observe(VLCStatus("playing", path=unexpected.resolve()))
+
+    assert [(entry.id, entry.state) for entry in queue.entries()] == before
+    assert db.connection.execute("SELECT COUNT(*) FROM media").fetchone()[0] == media_count
+    assert client.played == [videos[0].resolve()]
+    assert controller.last_error is not None
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_or_no_longer_staged_successor_fails_closed(tmp_path: Path) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    client = PlaylistFakeClient()
+    controller = PlaybackController(queue, process=FakeProcess())  # type: ignore[arg-type]
+    controller.client = client  # type: ignore[assignment]
+    await controller.play_index(0)
+    staged_id = controller.staged_vlc_id
+    generation = controller.playback_generation
+    assert staged_id is not None
+    videos[1].unlink()
+
+    await controller._observe(
+        VLCStatus("playing", path=videos[1], playlist_id=staged_id), generation=generation
+    )
+
+    assert queue.current() is not None and queue.current().path == videos[0].resolve()
+    assert queue.entries()[1].state == "missing"
+    assert client.played == [videos[0].resolve()]
+    assert controller.staged_vlc_id is None
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_no_longer_staged_successor_is_not_adopted_after_reorder(tmp_path: Path) -> None:
+    root = tmp_path / "show"
+    root.mkdir()
+    videos = [root / f"e{index}.mkv" for index in range(1, 4)]
+    for video in videos:
+        video.write_bytes(video.name.encode())
+    db = Database(tmp_path / "db.sqlite3")
+    queue = QueueService(db)
+    queue.open(root)
+    queue.add(videos)
+    client = PlaylistFakeClient()
+    controller = PlaybackController(queue, process=FakeProcess())  # type: ignore[arg-type]
+    controller.client = client  # type: ignore[assignment]
+    await controller.play_index(0)
+    staged_id = controller.staged_vlc_id
+    generation = controller.playback_generation
+    assert staged_id is not None
+    queue.move(1, 1)
+
+    await controller._observe(
+        VLCStatus("playing", path=videos[1].resolve(), playlist_id=staged_id), generation=generation
+    )
+
+    assert queue.current() is not None and queue.current().path == videos[0].resolve()
+    assert [entry.path for entry in queue.entries()] == [
+        videos[0].resolve(), videos[2].resolve(), videos[1].resolve()
+    ]
+    assert client.played == [videos[0].resolve()]
+    assert controller.staged_vlc_id is None
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_native_transition_classifies_completion_from_near_end_evidence(
+    tmp_path: Path,
+) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    client = PlaylistFakeClient()
+    controller = PlaybackController(queue, process=FakeProcess())  # type: ignore[arg-type]
+    controller.client = client  # type: ignore[assignment]
+    await controller.play_index(0)
+    active_id = controller.active_vlc_id
+    staged_id = controller.staged_vlc_id
+    generation = controller.playback_generation
+    assert active_id is not None and staged_id is not None
+
+    await controller._observe(
+        VLCStatus("playing", 9_000, 10_000, videos[0].resolve(), active_id),
+        generation=generation,
+    )
+    await controller._observe(
+        VLCStatus("playing", 500, 10_000, videos[1].resolve(), staged_id),
+        generation=generation,
+    )
+
+    first = queue.entries()[0]
+    progress = db.progress_for(videos[0])
+    assert first.state == "completed"
+    assert progress["completion_observed"] == 1
+    assert progress["position_ms"] == 10_000
+    assert progress["resume_position_ms"] == 10_000
+    assert queue.current() is not None and queue.current().path == videos[1].resolve()
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_earlier_native_transition_records_skip_and_last_trustworthy_progress(
+    tmp_path: Path,
+) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    client = PlaylistFakeClient()
+    controller = PlaybackController(queue, process=FakeProcess())  # type: ignore[arg-type]
+    controller.client = client  # type: ignore[assignment]
+    await controller.play_index(0)
+    active_id = controller.active_vlc_id
+    staged_id = controller.staged_vlc_id
+    generation = controller.playback_generation
+    assert active_id is not None and staged_id is not None
+
+    await controller._observe(
+        VLCStatus("playing", 2_000, 10_000, videos[0].resolve(), active_id),
+        generation=generation,
+    )
+    await controller._observe(
+        VLCStatus("playing", 500, 10_000, videos[1].resolve(), staged_id),
+        generation=generation,
+    )
+
+    first = queue.entries()[0]
+    progress = db.progress_for(videos[0])
+    assert first.state == "skipped"
+    assert progress["completion_observed"] == 0
+    assert progress["position_ms"] == 2_000
+    assert progress["resume_position_ms"] == 2_000
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_native_advancement_keeps_playlist_window_bounded(tmp_path: Path) -> None:
+    root = tmp_path / "show"
+    root.mkdir()
+    videos = [root / f"e{index}.mkv" for index in range(1, 4)]
+    for video in videos:
+        video.write_bytes(video.name.encode())
+    db = Database(tmp_path / "db.sqlite3")
+    queue = QueueService(db)
+    queue.open(root)
+    queue.add(videos)
+    client = PlaylistFakeClient()
+    controller = PlaybackController(queue, process=FakeProcess())  # type: ignore[arg-type]
+    controller.client = client  # type: ignore[assignment]
+    await controller.play_index(0)
+
+    first_staged = controller.staged_vlc_id
+    assert first_staged is not None
+    await controller._observe(
+        VLCStatus("playing", path=videos[1].resolve(), playlist_id=first_staged),
+        generation=controller.playback_generation,
+    )
+    assert [item.path for item in client.playlist_items] == [
+        videos[1].resolve(),
+        videos[2].resolve(),
+    ]
+    second_staged = controller.staged_vlc_id
+    assert second_staged is not None
+
+    await controller._observe(
+        VLCStatus("playing", path=videos[2].resolve(), playlist_id=second_staged),
+        generation=controller.playback_generation,
+    )
+    assert [item.path for item in client.playlist_items] == [videos[2].resolve()]
+    assert len(client.playlist_items) <= 2
+    assert len(client.played) == 1
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_and_duplicate_successor_observations_do_not_transition_twice(
+    tmp_path: Path,
+) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    client = PlaylistFakeClient()
+    controller = PlaybackController(queue, process=FakeProcess())  # type: ignore[arg-type]
+    controller.client = client  # type: ignore[assignment]
+    await controller.play_index(0)
+    staged_id = controller.staged_vlc_id
+    generation = controller.playback_generation
+    assert staged_id is not None
+
+    await controller._observe(
+        VLCStatus("playing", path=videos[1].resolve(), playlist_id=staged_id),
+        generation=generation - 1,
+    )
+    assert queue.current() is not None and queue.current().path == videos[0].resolve()
+
+    await controller._observe(
+        VLCStatus("playing", path=videos[1].resolve(), playlist_id=staged_id),
+        generation=generation,
+    )
+    assert queue.current() is not None and queue.current().path == videos[1].resolve()
+    states = [entry.state for entry in queue.entries()]
+    assert states.count("playing") == 1
+    after_first = [(entry.id, entry.state) for entry in queue.entries()]
+
+    await controller._observe(
+        VLCStatus("playing", 2_000, 10_000, videos[1].resolve(), staged_id),
+        generation=generation + 1,
+    )
+    assert [(entry.id, entry.state) for entry in queue.entries()] == after_first
+    db.close()
 
 
 @pytest.mark.asyncio

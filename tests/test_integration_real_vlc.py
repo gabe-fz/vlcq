@@ -50,7 +50,7 @@ async def test_real_vlc_temporary_media_play_seek_pause_stop_and_reconnect(
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         pytest.skip("ffmpeg is required to generate temporary integration media")
-    media_paths = [tmp_path / "generated-1.mp4", tmp_path / "generated-2.mp4"]
+    media_paths = [tmp_path / f"generated-{index}.mp4" for index in range(1, 4)]
     for media in media_paths:
         result = await asyncio.to_thread(
             subprocess.run,
@@ -63,7 +63,7 @@ async def test_real_vlc_temporary_media_play_seek_pause_stop_and_reconnect(
                 "-i",
                 "color=c=black:s=160x90:r=10",
                 "-t",
-                "3",
+                "4",
                 "-pix_fmt",
                 "yuv420p",
                 "-c:v",
@@ -90,7 +90,7 @@ async def test_real_vlc_temporary_media_play_seek_pause_stop_and_reconnect(
 
         # Seed only temporary history, then exercise the same policy used by
         # the CLI and TUI for a persisted resume point.
-        database.set_resume_position(media_paths[0], 1_000, 3_000)
+        database.set_resume_position(media_paths[0], 1_000, 4_000)
         await controller.play_with_policy(0, choice="resume")
         await asyncio.sleep(0.5)
         status = await controller.client.status() if controller.client is not None else None
@@ -105,23 +105,46 @@ async def test_real_vlc_temporary_media_play_seek_pause_stop_and_reconnect(
         assert await controller.stop_playback()
 
         # Replaying the first temporary file should naturally advance to the
-        # second without an interactive resume prompt.
+        # second without an interactive resume prompt. The first observation
+        # can be a direct playing-to-playing transition, with no stopped poll.
         await controller.play_index(0)
-        for _ in range(20):
-            if queue.entries()[0].state == "completed":
+        for _ in range(30):
+            if queue.current() is not None and queue.current().path == media_paths[1].resolve():
                 break
             await asyncio.sleep(0.5)
         assert queue.entries()[0].state == "completed"
         assert database.progress_for(media_paths[0])["completion_observed"] == 1
         active = queue.current()
         assert active is not None and active.path == media_paths[1].resolve()
+        client = controller.client
+        assert client is not None
+        window = await client.playlist()
+        assert [item.path for item in window] == [
+            media_paths[1].resolve(),
+            media_paths[2].resolve(),
+        ]
+        assert len(window) <= 2
+
+        # Exercise VLC's native Next directly. It must adopt the staged third
+        # file without issuing another in_play command.
+        await client.command("pl_next")
+        for _ in range(10):
+            if queue.current() is not None and queue.current().path == media_paths[2].resolve():
+                break
+            await asyncio.sleep(0.5)
+        assert queue.current() is not None and queue.current().path == media_paths[2].resolve()
+        assert queue.entries()[1].state == "skipped"
+        window = await client.playlist()
+        assert [item.path for item in window] == [media_paths[2].resolve()]
+        assert len(window) <= 2
 
         assert await controller.stop_playback()
         active_index = next(
             index for index, entry in enumerate(queue.entries()) if entry.id == active.id
         )
         queue.remove(active_index, stop_confirmed=True)
-        assert media_paths[1].is_file()
+        await controller.synchronize_playlist(force=True)
+        assert media_paths[2].is_file()
 
         # Overlapping recovery requests share one owned lifecycle and never
         # select or autoplay the remaining queue.
