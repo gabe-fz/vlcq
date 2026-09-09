@@ -42,9 +42,12 @@ expanded and share the available list space; click `▾`/`▸` to collapse or re
 section. Each section’s compact root/count metadata appears immediately after its name,
 followed by color-coded controls. Metadata is width-limited so it cannot push controls to
 the right edge. Wider terminals progressively expose additional
-pane-specific actions (navigation/sort/selection/details, queue management/details, and
-VLC/system controls) instead of leaving useful space empty. Each header remains visible and its `…` menu contains
-only that section’s actions. Right-clicking a row opens actions for that specific item,
+pane-specific actions (file navigation/sort/selection, queue management, and VLC/system
+controls) instead of leaving useful space empty. Unavailable contextual actions such as
+**Undo**, **Clear selection**, or **Clear watched** stay out of the bar. The `…` control appears
+only while useful actions remain hidden and never duplicates buttons already on screen.
+Right-clicking a row
+opens actions for that specific item,
 and `Shift+F10` is the keyboard fallback. Menus remain inside the terminal and scroll when
 needed.
 
@@ -62,8 +65,10 @@ missing history are available through **Details**.
 
 The Files header exposes **Open**, **Search/filter**, **Add**, and file actions; Queue exposes
 **Remove**, **Move up/down**, **Clear**, and queue actions; the status pane exclusively owns
-**Previous**, **Play/pause**, **Next**, and VLC/application actions. Item context menus retain
-Details and resume/start-over, while section menus stay pane-specific. Search and
+**Previous**, **Play/pause**, **Next**, and VLC/application actions. File item context menus
+retain history **Details** where the player status cannot represent them; Queue omits Details
+because active metadata is already in the status pane. Item resume/start-over actions remain
+contextual, while section menus stay pane-specific. Search and
 **All / In progress / Not watched** filters discover
 the whole root without enqueueing results. The Files header keeps active search/filter and
 selected/hidden counts visible. Selections remain explicit across filtering, collapsing,

@@ -33,9 +33,17 @@ async def test_mouse_workflow_at_compact_and_wide_sizes(tmp_path: Path, size: tu
         app.refresh_playback()  # Polling while a menu is open must not retarget it.
         await pilot.pause()
         button = next(button for button in app.screen.query(Button) if str(button.label).startswith(prefix))
-        # The menu exposes only the action appropriate to this source.
+        # The menu exposes only currently hidden actions appropriate to this source.
         await pilot.click(button)
         await pilot.pause()
+
+    async def undo_queue(pilot) -> None:
+        undo = app.query_one("#queue-undo", Button)
+        if undo.display:
+            await pilot.click(undo)
+            await pilot.pause()
+        else:
+            await choose_menu_action(pilot, "#queue-actions", "Undo latest removal")
 
     async with app.run_test(size=size) as pilot:
         browser = app.query_one("#browser", ListView)
@@ -78,15 +86,15 @@ async def test_mouse_workflow_at_compact_and_wide_sizes(tmp_path: Path, size: tu
         await pilot.click("#queue-up")
         await pilot.click("#queue-remove")
         await pilot.pause()
-        await choose_menu_action(pilot, "#queue-actions", "Undo latest removal")
+        await undo_queue(pilot)
         assert len(app.queue.entries()) == before_undo
 
         await choose_menu_action(pilot, "#queue-actions", "Clear queue")
         await pilot.click("#clear-all-confirm")
         await pilot.pause()
         assert app.queue.entries() == []
-        # Clear's undo is exposed from the same Queue menu.
-        await choose_menu_action(pilot, "#queue-actions", "Undo latest removal")
+        # Undo is direct when space permits and falls back to Queue overflow.
+        await undo_queue(pilot)
         assert len(app.queue.entries()) == before_undo
 
         await choose_menu_action(pilot, "#player-menu", "Help")

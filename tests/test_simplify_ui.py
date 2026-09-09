@@ -118,37 +118,66 @@ async def test_headers_lead_with_color_coded_pane_specific_controls(tmp_path: Pa
         assert app.query_one("#files-search", Button).variant == "success"
         assert app.query_one("#queue-remove", Button).variant == "error"
         assert app.query_one("#files-sort", Button).display
-        assert app.query_one("#queue-undo", Button).display
+        assert not app.query_one("#queue-undo", Button).display
         assert app.query_one("#player-seek-back", Button).display
         assert not app.query_one("#files-clear-selection", Button).display
+        assert not app.query_one("#files-actions", Button).display
         assert not app.query_one("#player-help", Button).display
+        assert app.query_one("#player-menu", Button).display
+        await pilot.click("#player-menu")
+        assert {str(button.label) for button in app.screen.query(Button)} == {"Help", "Quit"}
+        await pilot.press("escape")
 
         await pilot.resize_terminal(160, 30)
         await pilot.pause()
-        assert app.query_one("#files-select", Button).display
-        assert app.query_one("#files-clear-selection", Button).display
-        assert app.query_one("#files-details", Button).display
-        assert app.query_one("#queue-clear-all", Button).display
-        assert app.query_one("#queue-details", Button).display
+        assert not app.query_one("#files-clear-selection", Button).display
+        assert not app.query_one("#queue-clear-all", Button).display
         assert app.query_one("#player-help", Button).display
         assert app.query_one("#player-quit", Button).display
+        assert not app.query_one("#files-actions", Button).display
+        assert not app.query_one("#queue-actions", Button).display
+        assert not app.query_one("#player-menu", Button).display
+
+        selected_path = (nested / "episode-00.mkv").resolve()
+        app.selected_paths.add(selected_path)
+        app.queue.add([selected_path])
+        app.refresh_queue()
+        await pilot.pause()
+        assert app.query_one("#files-clear-selection", Button).display
+        assert app.query_one("#queue-clear-all", Button).display
+
         await pilot.resize_terminal(80, 30)
         await pilot.pause()
         assert not app.query_one("#files-sort", Button).display
         assert not app.query_one("#queue-undo", Button).display
         assert not app.query_one("#player-seek-back", Button).display
+        assert app.query_one("#files-actions", Button).display
+        assert app.query_one("#queue-actions", Button).display
+        assert app.query_one("#player-menu", Button).display
 
-        await pilot.resize_terminal(120, 30)
-        await pilot.pause()
         await pilot.click("#files-actions")
         files_actions = {str(button.label) for button in app.screen.query(Button)}
-        assert "Reverse filename order" in files_actions
-        assert not any("Play" in label for label in files_actions)
+        assert files_actions == {"Up", "Reverse filename order", "Clear selection"}
         await pilot.press("escape")
-
         await pilot.click("#queue-actions")
         queue_actions = {str(button.label) for button in app.screen.query(Button)}
-        assert queue_actions == {"Sort naturally", "Clear queue", "Undo latest removal"}
+        assert queue_actions == {"Clear queue"}
+        await pilot.press("escape")
+        queue_entry = app.queue.entries()[0]
+        row_actions = app._context_actions_for_queue(
+            QueueTarget(queue_entry.id, app._root_generation)
+        )
+        assert "Details" not in {action.label for action in row_actions}
+
+        await pilot.click("#player-menu")
+        player_actions = {str(button.label) for button in app.screen.query(Button)}
+        assert player_actions == {
+            "Seek back 10s",
+            "Seek forward 10s",
+            "Reconnect",
+            "Help",
+            "Quit",
+        }
 
     db.close()
 

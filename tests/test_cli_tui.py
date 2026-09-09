@@ -285,16 +285,8 @@ async def test_tui_browse_select_add_and_parent_without_auto_enqueue(tmp_path: P
         assert [e.path.name for e in app.queue.entries()] == ["e1.mkv"]
         await pilot.press("left")
         assert app.browser_path == root.resolve()
-        await pilot.click("#files-actions")
-        await pilot.pause()
-        reverse = next(button for button in app.screen.query(Button) if str(button.label) == "Reverse filename order")
-        await pilot.click(reverse)
+        await pilot.click("#files-sort")
         assert app.browser_reverse is True
-        await pilot.click("#queue-actions")
-        await pilot.pause()
-        queue_sort = next(button for button in app.screen.query(Button) if str(button.label) == "Sort naturally")
-        await pilot.click(queue_sort)
-        assert app.query_one("#queue-section").has_class("focused")
         await pilot.click("#queue-actions")
         await pilot.pause()
         clear = next(button for button in app.screen.query(Button) if str(button.label) == "Clear queue")
