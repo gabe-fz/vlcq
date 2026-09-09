@@ -187,6 +187,34 @@ class QueueService:
         self.database.transition_current(None)
         return None
 
+    def reconcile_successor(
+        self,
+        current_id: int,
+        successor_id: int,
+        successor_state: str,
+        *,
+        progress_path: Path | None = None,
+        position_ms: int = 0,
+        duration_ms: int = 0,
+        completed: bool = False,
+        trustworthy: bool = True,
+        resume_position_ms: int | None = None,
+    ) -> QueueEntry:
+        """Atomically adopt a VLC-started successor and record old-item history."""
+        self.database.reconcile_successor_transition(
+            current_id,
+            successor_id,
+            successor_state,
+            progress_path=progress_path,
+            position_ms=position_ms,
+            duration_ms=duration_ms,
+            completed=completed,
+            trustworthy=trustworthy,
+            resume_position_ms=resume_position_ms,
+        )
+        self._invalidate_undo()
+        return next(entry for entry in self.entries() if entry.id == successor_id)
+
     def previous(self) -> QueueEntry | None:
         self._invalidate_undo()
         entries = self.entries()

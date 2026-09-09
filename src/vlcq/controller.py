@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from collections.abc import Callable
 from pathlib import Path
 
@@ -715,30 +716,37 @@ class PlaybackController:
                 status.playlist_id or self.staged_vlc_id,
             )
 
-            def transition() -> QueueEntry | None:
-                if old_status is not None:
-                    trustworthy = not (
-                        old_status.state == "stopped" and old_status.position_ms == 0
-                    )
-                    self.queue.update_progress(
-                        current.path,
-                        old_status.duration_ms if near_end else old_status.position_ms,
-                        old_status.duration_ms,
-                        completed=near_end,
-                        trustworthy=trustworthy or near_end,
-                        resume_position_ms=(
-                            old_status.duration_ms if near_end else old_status.position_ms
-                        ),
-                    )
-                return self.queue.next(
+            successor_state = (
+                observed.state if observed.state in {"playing", "paused", "stopped"} else "playing"
+            )
+
+            def transition() -> QueueEntry:
+                trustworthy = old_status is not None and not (
+                    old_status.state == "stopped" and old_status.position_ms == 0
+                )
+                return self.queue.reconcile_successor(
+                    current.id,
+                    successor.id,
+                    successor_state,
+                    progress_path=current.path if old_status is not None else None,
+                    position_ms=(
+                        old_status.duration_ms if near_end and old_status is not None
+                        else old_status.position_ms if old_status is not None
+                        else 0
+                    ),
+                    duration_ms=old_status.duration_ms if old_status is not None else 0,
                     completed=near_end,
-                    state=observed.state if observed.state in {"playing", "paused", "stopped"} else "playing",
+                    trustworthy=trustworthy or near_end,
+                    resume_position_ms=(
+                        old_status.duration_ms if near_end and old_status is not None
+                        else old_status.position_ms if old_status is not None
+                        else None
+                    ),
                 )
 
             try:
                 adopted = await self._run_database_operation(transition)
-            except (OSError, RuntimeError, ValueError) as exc:
-                del exc
+            except (OSError, RuntimeError, ValueError, sqlite3.Error):
                 self.last_error = "VLC successor transition could not be recorded; press r to retry"
                 self._invalidate_playlist_window()
                 return
@@ -778,16 +786,29 @@ class PlaybackController:
                 await self._reconcile_staged_successor(status, generation)
             return
         current = self.queue.current()
-        observed_path = status.path or expected_path or (current.path if current else None)
-        if current is None or observed_path is None:
+        if current is None:
             return
-        path_matches = self._same_path(observed_path, current.path)
+        path_matches = status.path is not None and self._same_path(status.path, current.path)
         identity_matches = (
-            self.active_vlc_id is None
-            or status.playlist_id is None
-            or status.playlist_id == self.active_vlc_id
+            status.playlist_id is not None
+            and self.active_vlc_id is not None
+            and status.playlist_id == self.active_vlc_id
         )
-        if not path_matches or not identity_matches:
+        path_conflicts = status.path is not None and not path_matches
+        identity_conflicts = (
+            status.playlist_id is not None
+            and self.active_vlc_id is not None
+            and not identity_matches
+        )
+        if not (path_matches or identity_matches) or path_conflicts or identity_conflicts:
+            self.last_error = (
+                "VLC reported unexpected or unidentified media; "
+                "playback advancement is paused — press r to retry"
+            )
+            self._invalidate_playlist_window()
+            return
+        observed_path = status.path or expected_path or current.path
+        if not self._same_path(observed_path, current.path):
             self.last_error = "VLC reported unexpected media; playback advancement is paused — press r to retry"
             self._invalidate_playlist_window()
             return

@@ -18,6 +18,32 @@ def test_process_uses_visible_macos_interface() -> None:
     assert all(flag in arguments for flag in ("--no-repeat", "--no-loop", "--no-random"))
 
 
+@pytest.mark.asyncio
+async def test_process_stop_signals_only_the_owned_process() -> None:
+    class FakeProcessHandle:
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self.terminated = False
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.returncode = 0
+
+        async def wait(self) -> int:
+            return 0
+
+    owned = FakeProcessHandle()
+    unrelated = FakeProcessHandle()
+    process = VLCProcess("/Applications/VLC.app/Contents/MacOS/VLC")
+    process.process = owned  # type: ignore[assignment]
+
+    await process.stop()
+
+    assert owned.terminated
+    assert not unrelated.terminated
+    assert process.process is None
+
+
 @pytest.mark.parametrize(
     "banner",
     [b"VLC media player 3.0.21 Vetinari\n", b"VLC version 3.0.17.3 Vetinari\n"],
@@ -232,6 +258,29 @@ async def test_client_playlist_operations_are_typed_and_encoded(tmp_path: Path) 
         "in_play",
     ]
     assert requests[-1].url.params["input"] == first.resolve().as_uri()
+    await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["enqueue", "remove", "replace_playlist"])
+async def test_client_playlist_operations_report_http_failures(
+    tmp_path: Path, operation: str
+) -> None:
+    video = tmp_path / "episode.mkv"
+    video.write_bytes(b"x")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(500, headers={"content-type": "application/json"}, json={})
+
+    client = VLCClient(9999, "secret", transport=httpx.MockTransport(handler))
+    with pytest.raises(VLCError, match="command failed"):
+        if operation == "enqueue":
+            await client.enqueue(video)
+        elif operation == "remove":
+            await client.remove("42")
+        else:
+            await client.replace_playlist(video)
     await client.close()
 
 

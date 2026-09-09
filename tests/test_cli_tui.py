@@ -297,6 +297,51 @@ async def test_tui_browse_select_add_and_parent_without_auto_enqueue(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_tui_queue_mutation_routes_notify_playlist_synchronization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "show"
+    root.mkdir()
+    videos = [root / f"episode-{index}.mkv" for index in range(1, 5)]
+    for video in videos:
+        video.write_bytes(video.name.encode())
+    db = Database(tmp_path / "db.sqlite3")
+    app = VLCQApp(root=root, database=db, no_vlc=True)
+    notifications: list[tuple[str, ...]] = []
+
+    async def notified() -> bool:
+        notifications.append(tuple(entry.path.name for entry in app.queue.entries()))
+        return True
+
+    monkeypatch.setattr(app, "_notify_queue_mutation", notified)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await app._add_paths(videos[:3])
+        await app._play_next_paths([videos[3]])
+
+        queue_view = app.query_one("#queue", ListView)
+        queue_view.focus()
+        queue_view.index = 0
+        monkeypatch.setattr(app, "_queue_has_focus", lambda: True)
+        monkeypatch.setattr(app, "_queue_index", lambda: 0)
+        await app.action_move_down()
+        await app.action_remove()
+        await app.action_undo()
+        await app._dispatch_context_action(
+            tui_module.ContextAction(
+                "sort-queue",
+                "Sort",
+                tui_module.SectionTarget("queue", app._root_generation),
+            )
+        )
+        await app._perform_clear_all()
+        await pilot.pause()
+
+    assert len(notifications) == 7
+    assert app.queue.entries() == []
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_tui_lists_scroll_to_show_long_names_and_all_rows(tmp_path: Path) -> None:
     root = tmp_path / "show"
     root.mkdir()

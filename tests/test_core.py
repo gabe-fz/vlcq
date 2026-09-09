@@ -169,6 +169,35 @@ def test_open_repairs_stale_transient_rows_without_changing_queue_content(
     db.close()
 
 
+def test_open_repairs_invalid_current_and_selected_identities(tmp_path: Path) -> None:
+    root = tmp_path / "show"
+    videos = [touch(root / name, name.encode()) for name in ("one.mkv", "two.mkv")]
+    db = Database(tmp_path / "db.sqlite3")
+    queue = QueueService(db)
+    queue.open(root)
+    queue.add(videos)
+    entries = queue.entries()
+    for entry in entries:
+        db.set_state(entry.id, "stopped")
+    db.connection.execute(
+        "INSERT INTO settings(key,value) VALUES('current_entry','999999') "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+    )
+    db.connection.execute(
+        "INSERT INTO settings(key,value) VALUES('selected_entry','999999') "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+    )
+    content = {path: path.read_bytes() for path in videos}
+
+    queue.open(root)
+
+    assert db.get_current_id() is None
+    assert db.get_selected_id() is None
+    assert [entry.state for entry in queue.entries()] == ["queued", "queued"]
+    assert {path: path.read_bytes() for path in videos} == content
+    db.close()
+
+
 def test_play_next_uses_front_when_saved_current_is_not_active(tmp_path: Path) -> None:
     root = tmp_path / "show"
     videos = [touch(root / name) for name in ("one.mkv", "two.mkv", "three.mkv")]

@@ -198,6 +198,30 @@ async def test_native_next_adopts_staged_successor_without_replaying_it(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_identity_free_observation_fails_closed_without_history_update(
+    tmp_path: Path,
+) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    client = PlaylistFakeClient()
+    controller = PlaybackController(queue, process=FakeProcess())  # type: ignore[arg-type]
+    controller.client = client  # type: ignore[assignment]
+    await controller.play_index(0)
+    before = dict(db.progress_for(videos[0]))
+
+    await controller._observe(
+        VLCStatus("playing", 4_000, 10_000),
+        generation=controller.playback_generation,
+        expected_path=videos[0],
+    )
+
+    assert dict(db.progress_for(videos[0])) == before
+    assert queue.current() is not None and queue.current().path == videos[0].resolve()
+    assert controller.last_error is not None
+    assert controller.active_vlc_id is None
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_unexpected_media_is_not_adopted_or_written_to_history(tmp_path: Path) -> None:
     db, queue, videos = setup_queue(tmp_path)
     unexpected = videos[0].with_name("unexpected.mkv")
@@ -304,6 +328,45 @@ async def test_native_transition_classifies_completion_from_near_end_evidence(
     assert progress["position_ms"] == 10_000
     assert progress["resume_position_ms"] == 10_000
     assert queue.current() is not None and queue.current().path == videos[1].resolve()
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_native_transition_rolls_back_history_when_queue_update_fails(
+    tmp_path: Path,
+) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    client = PlaylistFakeClient()
+    controller = PlaybackController(queue, process=FakeProcess())  # type: ignore[arg-type]
+    controller.client = client  # type: ignore[assignment]
+    await controller.play_index(0)
+    active_id = controller.active_vlc_id
+    staged_id = controller.staged_vlc_id
+    generation = controller.playback_generation
+    first = queue.entries()[0]
+    assert active_id is not None and staged_id is not None
+
+    await controller._observe(
+        VLCStatus("playing", 9_000, 10_000, videos[0].resolve(), active_id),
+        generation=generation,
+    )
+    before = dict(db.progress_for(videos[0]))
+    db.connection.execute(
+        "CREATE TRIGGER reject_completed_transition "
+        "BEFORE UPDATE OF state ON queue_entries "
+        f"WHEN OLD.id={first.id} AND NEW.state='completed' "
+        "BEGIN SELECT RAISE(ABORT, 'injected transition failure'); END"
+    )
+
+    await controller._observe(
+        VLCStatus("playing", 500, 10_000, videos[1].resolve(), staged_id),
+        generation=generation,
+    )
+
+    assert dict(db.progress_for(videos[0])) == before
+    assert queue.current() is not None and queue.current().id == first.id
+    assert [entry.state for entry in queue.entries()] == ["playing", "queued"]
+    assert controller.last_error is not None
     db.close()
 
 

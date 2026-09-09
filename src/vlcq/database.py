@@ -345,6 +345,67 @@ class Database:
             self.connection.execute("ROLLBACK")
             raise
 
+    def reconcile_successor_transition(
+        self,
+        current_id: int,
+        successor_id: int,
+        successor_state: str,
+        *,
+        progress_path: Path | None = None,
+        position_ms: int = 0,
+        duration_ms: int = 0,
+        completed: bool = False,
+        trustworthy: bool = True,
+        resume_position_ms: int | None = None,
+    ) -> None:
+        """Atomically persist history and adopt an observed VLC successor."""
+        if successor_state not in {"playing", "paused", "stopped"}:
+            raise ValueError("successor state must be transient playback state")
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            queue_id = self._active_queue_id()
+            saved_current = self.get_current_id()
+            rows = self.connection.execute(
+                "SELECT id,state FROM queue_entries WHERE queue_id=? AND id IN (?,?)",
+                (queue_id, current_id, successor_id),
+            ).fetchall()
+            states = {int(row["id"]): str(row["state"]) for row in rows}
+            if saved_current != current_id or set(states) != {current_id, successor_id}:
+                raise ValueError("observed VLC transition no longer matches the active queue")
+            if progress_path is not None:
+                self.merge_progress(
+                    progress_path,
+                    position_ms,
+                    duration_ms,
+                    completed,
+                    trustworthy=trustworthy,
+                    resume_position_ms=resume_position_ms,
+                )
+            if states[current_id] not in {"missing", "failed", "completed", "skipped"}:
+                self.connection.execute(
+                    "UPDATE queue_entries SET state=? WHERE id=? AND queue_id=?",
+                    ("completed" if completed else "skipped", current_id, queue_id),
+                )
+            self.connection.execute(
+                "UPDATE queue_entries SET state='queued' "
+                "WHERE queue_id=? AND id NOT IN (?,?) "
+                "AND state IN ('playing','paused','stopped')",
+                (queue_id, current_id, successor_id),
+            )
+            self.connection.execute(
+                "UPDATE queue_entries SET state=? WHERE id=? AND queue_id=?",
+                (successor_state, successor_id, queue_id),
+            )
+            self.connection.execute(
+                "INSERT INTO settings(key,value) VALUES('current_entry',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(successor_id),),
+            )
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
     def normalize_active_queue(self) -> None:
         """Repair stale identities and transient rows without changing content."""
         self.connection.execute("BEGIN IMMEDIATE")
