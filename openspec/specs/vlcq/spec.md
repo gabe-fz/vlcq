@@ -309,15 +309,27 @@ The bottom player area SHALL use a bounded, slightly taller layout showing the a
 - **THEN** the notice remains one line, complete error information is available on demand, and Files and Queue retain usable viewports
 
 ### Requirement: Authoritative queue semantics
-`vlcq`, not VLC, SHALL own queue order and SHALL send VLC one active item at a time. Only explicitly selected videos SHALL enter the queue. The persisted queue highlight SHALL be independent of the persisted current playback item. At most one entry SHALL have a transient playback state of playing, paused, or stopped, and that entry MUST be the persisted current playback item. Changing the current item SHALL return every prior non-terminal transient entry to pending; completed, skipped, failed, and missing outcomes and all playback history SHALL remain unchanged. Opening an existing queue SHALL transactionally repair stale transient states and invalid current or selected identities without deleting queue entries, changing order, modifying history, or accessing media destructively. Natural completion SHALL persist final progress and start the next item. Manual next SHALL mark the current entry skipped unless completion was independently established. Activating a highlighted item for playback SHALL update the current playback identity without conflating it with highlight persistence, and reordering SHALL persist immediately. Missing files SHALL remain visible as missing and be skipped with a warning. Queue state SHALL survive controller crashes, and only one controller SHALL mutate the database at a time.
+`vlcq`, not VLC, SHALL own queue order and SHALL stage in VLC no more than the active item and the next eligible queue item needed for native Next interoperability. Only explicitly selected videos SHALL enter either queue. The persisted queue highlight SHALL be independent of the persisted current playback item. At most one entry SHALL have a transient playback state of playing, paused, or stopped, and that entry MUST be the persisted current playback item. Changing the current item SHALL return every prior non-terminal transient entry to pending; completed, skipped, failed, and missing outcomes and all playback history SHALL remain unchanged. Opening an existing queue SHALL transactionally repair stale transient states and invalid current or selected identities without deleting queue entries, changing order, modifying history, or accessing media destructively. Natural completion SHALL persist final progress and start or adopt the next item. Manual next through either `vlcq` or the owned VLC interface SHALL mark the current entry skipped unless completion was independently established. An observed VLC transition SHALL advance the authoritative queue only when the new local media identity matches the staged successor; unexpected media SHALL NOT be adopted or associated with queue history. Activating a highlighted item for playback SHALL update the current playback identity without conflating it with highlight persistence, and reordering SHALL persist immediately and update the staged successor without restarting the active item. Missing files SHALL remain visible as missing and be skipped with a warning. Queue state SHALL survive controller crashes, and only one controller SHALL mutate the database at a time.
 
 #### Scenario: Natural completion
-- **WHEN** `vlcq` conservatively observes the active item ending naturally
-- **THEN** it records completion and starts the next queued item
+- **WHEN** `vlcq` conservatively observes the active item ending naturally or transitioning to the staged successor after independent near-end evidence
+- **THEN** it records completion and makes the next queued item current without restarting media that VLC already started
 
 #### Scenario: Manual skip
-- **WHEN** the user advances before independently observed completion
-- **THEN** the current entry becomes skipped rather than completed
+- **WHEN** the user advances through `vlcq` or the owned VLC interface before independently observed completion
+- **THEN** the current entry becomes skipped and the staged successor becomes the persisted current item
+
+#### Scenario: Native Next has no successor
+- **WHEN** the active item has no eligible successor in the authoritative queue
+- **THEN** VLC contains no fabricated successor and `vlcq` does not restart or invent a queue item
+
+#### Scenario: Unexpected VLC media transition
+- **WHEN** VLC reports media other than the active item or its staged successor
+- **THEN** `vlcq` pauses automatic advancement, does not adopt that media, and does not write its observations to queue history
+
+#### Scenario: Successor changes while playing
+- **WHEN** a queue mutation changes the item immediately after the active item
+- **THEN** `vlcq` updates VLC's staged successor without restarting or seeking the active item
 
 #### Scenario: Switch away from a stopped item
 - **WHEN** a stopped current item exists and playback is activated on another queue entry
@@ -332,11 +344,15 @@ The bottom player area SHALL use a bounded, slightly taller layout showing the a
 - **THEN** the invalid identities are cleared and stale transient entries become pending without autoplay or media-file modification
 
 ### Requirement: Owned VLC process
-`vlcq` SHALL launch VLC directly as a dedicated instance, validate required VLC 3 command-line flags, record the owned PID, and verify process identity before signaling it. It MUST NOT terminate or control an unrelated VLC process. Incompatible installations SHALL produce an actionable error.
+`vlcq` SHALL launch VLC directly as a dedicated instance, validate required VLC 3 command-line flags, record the owned PID, and verify process identity before signaling it. The dedicated instance SHALL start with repeat-current, repeat-all, and random playback explicitly disabled regardless of saved VLC preferences. It MUST NOT terminate or control an unrelated VLC process. Incompatible installations SHALL produce an actionable error.
 
 #### Scenario: Existing unrelated VLC instance
 - **WHEN** VLC is already running outside `vlcq`
 - **THEN** `vlcq` starts and controls its dedicated instance without terminating the unrelated process
+
+#### Scenario: Saved repeat preference
+- **WHEN** the user's VLC preferences previously enabled repeat-current, repeat-all, or random playback
+- **THEN** the dedicated instance starts with those modes disabled so native Next follows the staged queue order
 
 ### Requirement: Secure VLC HTTP control
 The owned VLC instance SHALL expose its HTTP interface only on `127.0.0.1`, on a selected local port, with a high-entropy per-session password. Session data SHALL live in a mode-0700 directory and mode-0600 file. Readiness probing SHALL have a bounded timeout. The client SHALL reject redirects and unexpected response content or types. Passwords, authorization headers, raw responses, and full media history MUST NOT be logged or printed.
@@ -346,11 +362,15 @@ The owned VLC instance SHALL expose its HTTP interface only on `127.0.0.1`, on a
 - **THEN** `vlcq` rejects the response without exposing credentials or guessing queue advancement
 
 ### Requirement: Playback observation
-While the controller runs, `vlcq` SHALL poll VLC status for the current local media URI, state, elapsed time, duration, and position. Parsing SHALL tolerate missing or changed fields and fail closed for malformed or non-local media URIs. Polling MAY be frequent while playing, slower while paused, and use bounded backoff while stopped or unavailable. Progress SHALL flush promptly on pause, stop, item change, skip, shutdown, and observed completion.
+While the controller runs, `vlcq` SHALL poll VLC status for the current local media URI, stable VLC playlist identity, state, elapsed time, duration, and position. Parsing SHALL tolerate missing or changed fields and fail closed for malformed or non-local media URIs. Polling SHALL distinguish observations of the active item, the staged successor, and unexpected media before changing queue state or history. Polling MAY be frequent while playing, slower while paused, and use bounded backoff while stopped or unavailable. Progress SHALL flush promptly on pause, stop, item change, skip, shutdown, and observed completion.
 
 #### Scenario: Malformed observed URI
 - **WHEN** VLC reports malformed, remote, or otherwise non-local media
 - **THEN** `vlcq` refuses to associate that observation with local progress or automatic advancement
+
+#### Scenario: Direct transition without stopped observation
+- **WHEN** VLC changes directly from the active item to the staged successor between polls
+- **THEN** `vlcq` captures the last trustworthy active-item observation, classifies the transition conservatively, and adopts the already-playing successor without replaying it
 
 ### Requirement: Conservative progress semantics
 `vlcq` SHALL persist raw position and duration and derive display percentages. Maximum progress for the same unchanged file MUST NOT decrease due to stale or zero observations. Seeking near the end or manually stopping SHALL NOT prove completion. Completion SHALL use an explicit natural-ended state when reliable or conservative configurable inference based on continuous recent playback and the expected stopped transition. The database SHALL store maximum progress separately from `completion_observed`; uncertain completion SHALL retain progress without setting that flag.
