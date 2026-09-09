@@ -199,6 +199,26 @@ class PlaybackController:
         client = self.client
         if client is None:
             raise VLCError("VLC is not connected")
+        if (
+            current is not None
+            and not items
+            and self.active_vlc_id is None
+            and self.status.state == "stopped"
+            and self.status.path is None
+            and self.status.playlist_id is None
+        ):
+            # A newly connected VLC instance is intentionally idle even when
+            # the database retains a current queue identity. Reconnect must not
+            # load or autoplay that item; an explicit play action will replace
+            # the empty playlist and establish fresh ephemeral identities.
+            self.staged_vlc_id = None
+            self.staged_queue_id = None
+            self.staged_path = None
+            self._active_queue_id = None
+            self._window_signature = signature
+            self._playlist_sync_invalidated = False
+            self.last_error = None
+            return
         remove = getattr(client, "remove", None)
         enqueue = getattr(client, "enqueue", None)
         if not callable(remove) or not callable(enqueue):
@@ -789,6 +809,23 @@ class PlaybackController:
             return
         current = self.queue.current()
         if current is None:
+            return
+        if (
+            status.state == "stopped"
+            and status.path is None
+            and status.playlist_id is None
+            and self.active_vlc_id is None
+            and self.last_error is None
+        ):
+            # Freshly launched VLC reports an identity-free stopped state. It
+            # is not unexpected media, and reconnect is required to remain
+            # idle until the user explicitly chooses what to play.
+            self.status = status
+            self._last_valid_status = None
+            if current.state in {"playing", "paused"}:
+                await self._run_database_operation(
+                    lambda: self.queue.set_current_state(current.id, "stopped")
+                )
             return
         path_matches = status.path is not None and self._same_path(status.path, current.path)
         identity_matches = (

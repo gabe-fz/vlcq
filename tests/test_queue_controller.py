@@ -151,6 +151,53 @@ async def test_completed_item_replay_is_serialized_against_polling(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_idle_reconnect_preserves_completed_item_start_over(tmp_path: Path) -> None:
+    class IdleClient(PlaylistFakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.status_observed = asyncio.Event()
+
+        async def status(self) -> VLCStatus:
+            self.status_observed.set()
+            return VLCStatus("stopped")
+
+    db, queue, videos = setup_queue(tmp_path)
+    completed = queue.play_now(0)
+    db.set_state(completed.id, "completed")
+    db.merge_progress(
+        videos[0],
+        10_000,
+        10_000,
+        completed=True,
+        trustworthy=True,
+        resume_position_ms=10_000,
+    )
+    client = IdleClient()
+    controller = PlaybackController(queue, process=FakeProcess())  # type: ignore[arg-type]
+    controller.client = client  # type: ignore[assignment]
+    controller._running = True
+    poll = asyncio.create_task(controller._poll())
+
+    await asyncio.wait_for(client.status_observed.wait(), 1)
+    await asyncio.sleep(0)
+    assert controller.client is client
+    assert controller.last_error is None
+    assert client.playlist_items == []
+    assert queue.current() is not None and queue.current().state == "completed"
+
+    controller._running = False
+    poll.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await poll
+    assert await controller.play_with_policy(0, choice="start_over") is True
+    assert controller.client is client
+    assert controller.last_error is None
+    assert queue.current() is not None and queue.current().state == "playing"
+    assert client.played == [videos[0].resolve()]
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_playlist_window_is_bounded_and_refreshes_successor_without_replay(
     tmp_path: Path,
 ) -> None:
