@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -81,6 +82,72 @@ def setup_queue(tmp_path: Path) -> tuple[Database, QueueService, list[Path]]:
     queue.open(root)
     queue.add(videos)
     return db, queue, videos
+
+
+@pytest.mark.asyncio
+async def test_completed_item_replay_is_serialized_against_polling(tmp_path: Path) -> None:
+    class BlockingReplayClient(PlaylistFakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.replace_started = asyncio.Event()
+            self.release_replace = asyncio.Event()
+            self.status_calls = 0
+
+        async def status(self) -> VLCStatus:
+            self.status_calls += 1
+            active = self.playlist_items[0]
+            return VLCStatus("playing", path=active.path, playlist_id=active.playlist_id)
+
+        async def replace_playlist(self, path: Path) -> VLCStatus:
+            self.replace_started.set()
+            await self.release_replace.wait()
+            return await super().replace_playlist(path)
+
+    db, queue, videos = setup_queue(tmp_path)
+    old_current = queue.play_now(1)
+    db.merge_progress(
+        videos[0],
+        10_000,
+        10_000,
+        completed=True,
+        trustworthy=True,
+        resume_position_ms=10_000,
+    )
+    client = BlockingReplayClient()
+    client.playlist_items = [VLCPlaylistItem("old", videos[1].resolve())]
+    controller = PlaybackController(queue, process=FakeProcess())  # type: ignore[arg-type]
+    controller.client = client  # type: ignore[assignment]
+    controller.status = VLCStatus(
+        "playing", path=videos[1].resolve(), playlist_id="old"
+    )
+    controller.active_vlc_id = "old"
+    controller._active_queue_id = old_current.id
+
+    replay = asyncio.create_task(controller.play_with_policy(0, choice="start_over"))
+    await asyncio.wait_for(client.replace_started.wait(), 1)
+    calls_during_final_capture = client.status_calls
+    controller._running = True
+    poll = asyncio.create_task(controller._poll())
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    # A poll of the old VLC item here would compare it with the newly selected
+    # queue item and disconnect with the reported unexpected-media error.
+    assert client.status_calls == calls_during_final_capture
+
+    client.release_replace.set()
+    assert await asyncio.wait_for(replay, 1) is True
+    await asyncio.sleep(0)
+    controller._running = False
+    poll.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await poll
+
+    assert controller.client is client
+    assert controller.last_error is None
+    assert queue.current() is not None and queue.current().path == videos[0].resolve()
+    assert queue.entries()[0].state == "playing"
+    db.close()
 
 
 @pytest.mark.asyncio

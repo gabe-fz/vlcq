@@ -285,7 +285,7 @@ class PlaybackController:
             return False
         if status.path is not None and not self._same_path(status.path, expected):
             return False
-        await self._observe(
+        await self._observe_locked(
             status, generation=generation, expected_path=expected, allow_advance=False
         )
         return True
@@ -639,16 +639,19 @@ class PlaybackController:
             self.last_error = "VLC playback or playlist synchronization failed — press r to retry"
             raise
 
+    async def _next_locked(self, completed: bool = False) -> None:
+        await self._capture_final_observation_locked()
+        self._near_end_seen = False
+        self._generation += 1
+        entry = await self._run_database_operation(lambda: self.queue.next(completed))
+        if entry and self.client:
+            await self._play_automatic_entry_locked(entry)
+        elif self.client:
+            await self._synchronize_playlist_window_locked(force=True)
+
     async def next(self, completed: bool = False) -> None:
         async with self._transition_lock:
-            await self._capture_final_observation_locked()
-            self._near_end_seen = False
-            self._generation += 1
-            entry = await self._run_database_operation(lambda: self.queue.next(completed))
-            if entry and self.client:
-                await self._play_automatic_entry_locked(entry)
-            elif self.client:
-                await self._synchronize_playlist_window_locked(force=True)
+            await self._next_locked(completed)
 
     async def previous(self) -> None:
         async with self._transition_lock:
@@ -676,98 +679,97 @@ class PlaybackController:
             status.path is None or path_matches
         ) and (status.playlist_id is None or id_matches)
 
-    async def _reconcile_staged_successor(
+    async def _reconcile_staged_successor_locked(
         self, status: VLCStatus, generation: int | None
     ) -> None:
-        """Adopt a VLC-started successor without sending another play command."""
-        async with self._transition_lock:
-            if generation is not None and generation != self._generation:
-                return
-            if not self._status_matches_staged(status):
-                self.last_error = "VLC reported media outside the vlcq playback window; press r to retry"
-                self._invalidate_playlist_window()
-                return
-            current = self.queue.current()
-            successor = self._next_eligible_entry()
-            staged_id = self.staged_queue_id
-            if (
-                current is None
-                or successor is None
-                or staged_id is None
-                or successor.id != staged_id
-                or self.staged_path is None
-                or not self._same_path(successor.path, self.staged_path)
-                or not successor.path.is_file()
-            ):
-                self.last_error = "VLC successor is no longer staged; press r to reconnect"
-                self._invalidate_playlist_window()
-                return
-            old_status = self._last_valid_status
-            if old_status is None or old_status.path is None or not self._same_path(
-                old_status.path, current.path
-            ):
-                old_status = self.status if self._same_path(self.status.path, current.path) else None
-            near_end = self._near_end_seen
-            observed = VLCStatus(
-                status.state,
-                status.position_ms,
-                status.duration_ms,
-                successor.path,
-                status.playlist_id or self.staged_vlc_id,
+        """Adopt a VLC-started successor while holding the transition lock."""
+        if generation is not None and generation != self._generation:
+            return
+        if not self._status_matches_staged(status):
+            self.last_error = "VLC reported media outside the vlcq playback window; press r to retry"
+            self._invalidate_playlist_window()
+            return
+        current = self.queue.current()
+        successor = self._next_eligible_entry()
+        staged_id = self.staged_queue_id
+        if (
+            current is None
+            or successor is None
+            or staged_id is None
+            or successor.id != staged_id
+            or self.staged_path is None
+            or not self._same_path(successor.path, self.staged_path)
+            or not successor.path.is_file()
+        ):
+            self.last_error = "VLC successor is no longer staged; press r to reconnect"
+            self._invalidate_playlist_window()
+            return
+        old_status = self._last_valid_status
+        if old_status is None or old_status.path is None or not self._same_path(
+            old_status.path, current.path
+        ):
+            old_status = self.status if self._same_path(self.status.path, current.path) else None
+        near_end = self._near_end_seen
+        observed = VLCStatus(
+            status.state,
+            status.position_ms,
+            status.duration_ms,
+            successor.path,
+            status.playlist_id or self.staged_vlc_id,
+        )
+
+        successor_state = (
+            observed.state if observed.state in {"playing", "paused", "stopped"} else "playing"
+        )
+
+        def transition() -> QueueEntry:
+            trustworthy = old_status is not None and not (
+                old_status.state == "stopped" and old_status.position_ms == 0
+            )
+            return self.queue.reconcile_successor(
+                current.id,
+                successor.id,
+                successor_state,
+                progress_path=current.path if old_status is not None else None,
+                position_ms=(
+                    old_status.duration_ms if near_end and old_status is not None
+                    else old_status.position_ms if old_status is not None
+                    else 0
+                ),
+                duration_ms=old_status.duration_ms if old_status is not None else 0,
+                completed=near_end,
+                trustworthy=trustworthy or near_end,
+                resume_position_ms=(
+                    old_status.duration_ms if near_end and old_status is not None
+                    else old_status.position_ms if old_status is not None
+                    else None
+                ),
             )
 
-            successor_state = (
-                observed.state if observed.state in {"playing", "paused", "stopped"} else "playing"
-            )
+        try:
+            adopted = await self._run_database_operation(transition)
+        except (OSError, RuntimeError, ValueError, sqlite3.Error):
+            self.last_error = "VLC successor transition could not be recorded; press r to retry"
+            self._invalidate_playlist_window()
+            return
+        if adopted is None or adopted.id != successor.id:
+            self.last_error = "VLC successor transition did not match the queue; press r to retry"
+            self._invalidate_playlist_window()
+            return
+        self._generation += 1
+        self._near_end_seen = False
+        self.status = observed
+        self._last_valid_status = observed
+        self.active_vlc_id = observed.playlist_id
+        self._active_queue_id = adopted.id
+        self.staged_vlc_id = None
+        self.staged_queue_id = None
+        self.staged_path = None
+        self._window_signature = None
+        self._playlist_sync_invalidated = True
+        await self._synchronize_playlist_window_locked(force=True)
 
-            def transition() -> QueueEntry:
-                trustworthy = old_status is not None and not (
-                    old_status.state == "stopped" and old_status.position_ms == 0
-                )
-                return self.queue.reconcile_successor(
-                    current.id,
-                    successor.id,
-                    successor_state,
-                    progress_path=current.path if old_status is not None else None,
-                    position_ms=(
-                        old_status.duration_ms if near_end and old_status is not None
-                        else old_status.position_ms if old_status is not None
-                        else 0
-                    ),
-                    duration_ms=old_status.duration_ms if old_status is not None else 0,
-                    completed=near_end,
-                    trustworthy=trustworthy or near_end,
-                    resume_position_ms=(
-                        old_status.duration_ms if near_end and old_status is not None
-                        else old_status.position_ms if old_status is not None
-                        else None
-                    ),
-                )
-
-            try:
-                adopted = await self._run_database_operation(transition)
-            except (OSError, RuntimeError, ValueError, sqlite3.Error):
-                self.last_error = "VLC successor transition could not be recorded; press r to retry"
-                self._invalidate_playlist_window()
-                return
-            if adopted is None or adopted.id != successor.id:
-                self.last_error = "VLC successor transition did not match the queue; press r to retry"
-                self._invalidate_playlist_window()
-                return
-            self._generation += 1
-            self._near_end_seen = False
-            self.status = observed
-            self._last_valid_status = observed
-            self.active_vlc_id = observed.playlist_id
-            self._active_queue_id = adopted.id
-            self.staged_vlc_id = None
-            self.staged_queue_id = None
-            self.staged_path = None
-            self._window_signature = None
-            self._playlist_sync_invalidated = True
-            await self._synchronize_playlist_window_locked(force=True)
-
-    async def _observe(
+    async def _observe_locked(
         self,
         status: VLCStatus,
         *,
@@ -783,7 +785,7 @@ class PlaybackController:
             return
         if self._status_matches_staged(status):
             if allow_advance:
-                await self._reconcile_staged_successor(status, generation)
+                await self._reconcile_staged_successor_locked(status, generation)
             return
         current = self.queue.current()
         if current is None:
@@ -854,29 +856,53 @@ class PlaybackController:
                 )
             )
             if allow_advance and (generation is None or generation == self._generation):
-                await self.next(completed=True)
+                await self._next_locked(completed=True)
             self._near_end_seen = False
+
+    async def _observe(
+        self,
+        status: VLCStatus,
+        *,
+        generation: int | None = None,
+        expected_path: Path | None = None,
+        allow_advance: bool = True,
+    ) -> None:
+        async with self._transition_lock:
+            await self._observe_locked(
+                status,
+                generation=generation,
+                expected_path=expected_path,
+                allow_advance=allow_advance,
+            )
 
     async def _poll(self) -> None:
         delay = 1.0
         while self._running and self.client:
             client = self.client
-            generation = self._generation
-            expected_path = self._current_expected_path()
             try:
-                status = await client.status()
-                await self._observe(
-                    status, generation=generation, expected_path=expected_path
-                )
-                if self.client is client and self.last_error is None:
-                    await self.synchronize_playlist()
-                elif self.client is client and self.last_error is not None:
-                    # Do not repair or delete an unexpected VLC item. Retire
-                    # this connection and let an explicit reconnect establish
-                    # a fresh owned playlist window.
-                    self.client = None
-                    await client.close()
-                    break
+                # Status collection and interpretation belong to the same
+                # serialized transition boundary as play/replay. Otherwise a
+                # poll can observe the old VLC item after the queue has already
+                # switched to a completed item being replayed and falsely
+                # retire a healthy connection as unexpected media.
+                async with self._transition_lock:
+                    if self.client is not client:
+                        continue
+                    generation = self._generation
+                    expected_path = self._current_expected_path()
+                    status = await client.status()
+                    await self._observe_locked(
+                        status, generation=generation, expected_path=expected_path
+                    )
+                    if self.client is client and self.last_error is None:
+                        await self._synchronize_playlist_window_locked()
+                    elif self.client is client and self.last_error is not None:
+                        # Do not repair or delete an unexpected VLC item. Retire
+                        # this connection and let an explicit reconnect establish
+                        # a fresh owned playlist window.
+                        self.client = None
+                        await client.close()
+                        break
                 delay = (
                     1.0
                     if status.state == "playing"
