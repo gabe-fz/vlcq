@@ -16,6 +16,7 @@ from vlcq.tui import (
     HistoricalCoverage,
     ItemProgress,
     QueueTarget,
+    SubtitleSubitem,
     VLCQApp,
 )
 
@@ -242,7 +243,10 @@ async def test_video_rows_add_compact_subtitle_subitems_without_changing_metadat
         assert checkbox.region.width <= 3
         assert checkbox.region.height == 1
         assert all(row.region.height == 2 for row in browser.children)
-        assert all("↳ Subtitles:" in str(row.query_one(".subtitle-subitem", Button).label) for row in browser.children)
+        assert all(
+            "↳ Subtitles:" in str(row.query_one(SubtitleSubitem).renderable)
+            for row in browser.children
+        )
         queue_row = app.query_one("#queue", ListView).children[0]
         assert queue_row.region.height == 2
         assert "×" in str(queue_row.query_one(Label).renderable)

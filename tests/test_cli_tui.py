@@ -14,7 +14,7 @@ from vlcq.cli import _resolve_paths, main
 from vlcq.database import Database
 from vlcq.paths import PathError
 from vlcq.queue import QueueService
-from vlcq.tui import VLCQApp
+from vlcq.tui import SubtitleSubitem, VLCQApp
 from vlcq.vlc import VLCError
 
 
@@ -377,7 +377,7 @@ async def test_tui_lists_scroll_to_show_long_names_and_all_rows(tmp_path: Path) 
             assert len(view.displayed_children) >= 5
             assert all(row.region.height == 2 for row in view.displayed_children[:5])
             assert all(
-                "↳ Subtitles:" in str(row.query_one(".subtitle-subitem", Button).label)
+                "↳ Subtitles:" in str(row.query_one(SubtitleSubitem).renderable)
                 for row in view.displayed_children[:5]
             )
 

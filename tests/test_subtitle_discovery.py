@@ -217,8 +217,10 @@ async def test_ffprobe_rejects_nonzero_malformed_excess_and_timeout(
 
 
 @pytest.mark.asyncio
-async def test_ffprobe_argument_vector_uses_uri_and_no_shell(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    video = tmp_path / "-leading-dash.mkv"
+async def test_ffprobe_argument_vector_uses_canonical_path_and_no_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    video = tmp_path / "-leading dash [test].mkv"
     video.write_bytes(b"media")
     calls: list[tuple[object, ...]] = []
 
@@ -252,5 +254,5 @@ async def test_ffprobe_argument_vector_uses_uri_and_no_shell(tmp_path: Path, mon
     streams = await FFProbeAdapter(executable="ffprobe").probe(video)
     assert streams == ()
     assert calls and calls[0][0] == "ffprobe"
-    assert video.resolve().as_uri() in calls[0]
+    assert calls[0][-2:] == ("-i", str(video.resolve()))
     assert "shell" not in calls[0]

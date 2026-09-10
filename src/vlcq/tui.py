@@ -185,12 +185,14 @@ class ItemProgress(Static):
         self.update(text)
 
 
-class SubtitleSubitem(CompactButton):
-    """An always-visible subtitle child row that owns subtitle interaction."""
+class SubtitleSubitem(Static):
+    """An always-visible, focusable subtitle child row."""
+
+    can_focus = True
 
     def __init__(self, path: Path, renderable: Text) -> None:
         self.path = path
-        super().__init__(renderable, classes="subtitle-subitem")
+        super().__init__(renderable, classes="subtitle-subitem", markup=False)
 
 
 class BrowserListItem(ListItem):
@@ -220,7 +222,7 @@ class BrowserListItem(ListItem):
             super().__init__(Label(renderable, classes="row-label", markup=False), classes=classes)
         else:
             marker = "☑" if selected else "☐"
-            subtitle = subtitle_renderable or Text("  ↳ Subtitles: ○ Inspecting…", no_wrap=True)
+            subtitle = subtitle_renderable or Text("↳ Subtitles: ○ Inspecting…", no_wrap=True)
             super().__init__(
                 Vertical(
                     Horizontal(
@@ -261,7 +263,7 @@ class QueueListItem(ListItem):
     ) -> None:
         del history_visible
         self.entry_id = entry.id
-        subtitle = subtitle_renderable or Text("  ↳ Subtitles: ○ Inspecting…", no_wrap=True)
+        subtitle = subtitle_renderable or Text("↳ Subtitles: ○ Inspecting…", no_wrap=True)
         super().__init__(
             Vertical(
                 Horizontal(
@@ -764,8 +766,8 @@ class VLCQApp(App[None]):
     .browser-row, .queue-row { width: 1fr; height: 1; min-height: 1; }
     .browser-check { width: 3; min-width: 3; height: 1; min-height: 1; margin: 0; padding: 0; border: none; }
     .subtitle-subitem {
-        width: 1fr; height: 1; min-height: 1; margin: 0; padding: 0;
-        border: none; content-align: left middle; color: $text-muted;
+        width: 100%; height: 1; min-height: 1; margin: 0; padding: 0;
+        border: none; content-align: left middle; text-align: left; color: $text-muted;
     }
     .subtitle-subitem:hover, .subtitle-subitem:focus { color: $text; background: $boost; }
     .row-label { width: auto; height: 1; min-height: 1; overflow-x: hidden; }
@@ -1022,8 +1024,9 @@ class VLCQApp(App[None]):
             return
         subtitle = self._subtitle_ancestor(widget)
         if subtitle is not None:
-            if event.button == 3:
+            if event.button in {1, 3}:
                 event.stop()
+                subtitle.focus()
                 self._open_subtitle_subitem(subtitle)
             return
         row = self._row_ancestor(widget)
@@ -1422,7 +1425,7 @@ class VLCQApp(App[None]):
 
     def _subtitle_renderable(self, path: Path, *, depth: int = 0) -> Text:
         canonical = path.expanduser().resolve(strict=False)
-        prefix = "  " * max(0, depth) + "  ↳ Subtitles: "
+        prefix = "  " * max(0, depth) + "↳ Subtitles: "
         text = Text(prefix, style="bright_black", no_wrap=True, overflow="ellipsis")
         snapshot = self._subtitle_snapshots.get(canonical)
         current = self.controller.status.path is not None and self.controller._same_path(
@@ -1451,13 +1454,13 @@ class VLCQApp(App[None]):
         if planned is None and snapshot is not None:
             planned = snapshot.planned_choice
         if planned is not None:
-            text.append("★ Planned: ", style="bold cyan")
+            text.append("★ Selected for playback: ", style="bold cyan")
             text.append(self._subtitle_choice_label(planned), style="cyan")
             return text
         if self.database.remember_subtitles_by_show():
             descriptor = self.database.show_subtitle_preference(canonical, root=self.root)
             if descriptor is not None:
-                text.append("★ Planned: ", style="bold cyan")
+                text.append("★ Selected for playback: ", style="bold cyan")
                 text.append(self._subtitle_descriptor_label(descriptor), style="cyan")
                 return text
         if snapshot is not None:
@@ -1476,7 +1479,7 @@ class VLCQApp(App[None]):
     def _update_subtitle_row(self, row: BrowserListItem | QueueListItem, path: Path) -> None:
         try:
             depth = row.depth if isinstance(row, BrowserListItem) else 0
-            row.query_one(SubtitleSubitem).label = self._subtitle_renderable(path, depth=depth)
+            row.query_one(SubtitleSubitem).update(self._subtitle_renderable(path, depth=depth))
         except NoMatches:
             pass
 
@@ -3613,9 +3616,6 @@ class VLCQApp(App[None]):
         event.stop()
         button = event.button
         button_id = button.id
-        if isinstance(button, SubtitleSubitem):
-            self._open_subtitle_subitem(button)
-            return
         if button.has_class("browser-check"):
             row = self._row_ancestor(button)
             if isinstance(row, BrowserListItem):

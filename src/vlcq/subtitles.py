@@ -979,7 +979,7 @@ class FFProbeAdapter:
             "-show_entries",
             "stream=index,codec_name,codec_type:stream_tags=language,title:stream_disposition=forced,hearing_impaired,default",
             "-i",
-            canonical.as_uri(),
+            str(canonical),
         ]
         async with self._semaphore:
             process: asyncio.subprocess.Process | None = None
