@@ -382,6 +382,40 @@ async def test_controller_persists_only_qualified_disjoint_coverage(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_pause_captures_a_final_observation_before_resetting_coverage(
+    tmp_path: Path,
+) -> None:
+    class FinalObservationClient(PlaylistFakeClient):
+        async def status(self) -> VLCStatus:
+            active = self.playlist_items[0]
+            return observed_status(
+                "playing", 5_000, 60_000, active.path, active.playlist_id, 5.0
+            )
+
+    db, queue, videos = setup_queue(tmp_path)
+    client = FinalObservationClient()
+    controller = PlaybackController(queue, process=FakeProcess())  # type: ignore[arg-type]
+    controller.client = client  # type: ignore[assignment]
+    await controller.play_index(0)
+    active_id = controller.active_vlc_id
+    assert active_id is not None
+    generation = controller.playback_generation
+    for second in range(5):
+        await controller._observe(
+            observed_status(
+                "playing", second * 1_000, 60_000,
+                videos[0], active_id, float(second),
+            ),
+            generation=generation,
+        )
+
+    assert db.progress_for(videos[0])["coverage_ms"] == 0
+    await controller.toggle_pause()
+    assert db.progress_for(videos[0])["coverage_ranges"] == ((0, 5_000),)
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_identity_free_observation_fails_closed_without_history_update(
     tmp_path: Path,
 ) -> None:

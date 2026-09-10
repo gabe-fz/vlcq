@@ -625,6 +625,11 @@ class PlaybackController:
 
     async def toggle_pause(self) -> None:
         async with self._transition_lock:
+            if self.status.state == "playing":
+                # Preserve the last observed portion of a qualified run before
+                # the pause command invalidates continuity. A failed or stale
+                # final poll remains conservative and awards nothing.
+                await self._capture_final_observation_locked()
             self._reset_playback_evidence()
             self._generation += 1
             if self.client:
