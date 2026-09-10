@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 import sqlite3
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
@@ -18,8 +20,11 @@ from .progress import (
     is_watched,
     merge_intervals,
 )
+from .subtitles import SubtitleDescriptor, SubtitleError, scoped_show_key
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+SUBTITLE_REMEMBER_SETTING = "remember_subtitles_by_show"
+SUBTITLE_ENGLISH_SETTING = "prefer_english_subtitles"
 
 
 def _locked_method(method: Callable[..., Any]) -> Callable[..., Any]:
@@ -81,6 +86,7 @@ class Database:
         )
         self.connection.row_factory = sqlite3.Row
         self._selected_identity_invalidated = False
+        self.last_preference_error: str | None = None
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA busy_timeout=5000")
         self.connection.execute("PRAGMA foreign_keys=ON")
@@ -165,6 +171,14 @@ class Database:
                     "position INTEGER NOT NULL, media_id INTEGER NOT NULL REFERENCES media(id), "
                     "state TEXT NOT NULL DEFAULT 'queued', UNIQUE(queue_id, position))"
                 ),
+                (
+                    "CREATE TABLE subtitle_preferences("
+                    "show_key_hash TEXT PRIMARY KEY, descriptor_version INTEGER NOT NULL, "
+                    "descriptor_json TEXT NOT NULL, updated_at TEXT NOT NULL, "
+                    "CHECK(descriptor_version=1), CHECK(length(descriptor_json)<=4096))"
+                ),
+                "INSERT INTO settings(key,value) VALUES('remember_subtitles_by_show','0')",
+                "INSERT INTO settings(key,value) VALUES('prefer_english_subtitles','1')",
             ),
             SCHEMA_VERSION,
         )
@@ -189,6 +203,14 @@ class Database:
                             "CHECK(start_ms>=0 AND end_ms>start_ms), "
                             "PRIMARY KEY(media_id,start_ms,end_ms))"
                         ),
+                        (
+                            "CREATE TABLE subtitle_preferences("
+                            "show_key_hash TEXT PRIMARY KEY, descriptor_version INTEGER NOT NULL, "
+                            "descriptor_json TEXT NOT NULL, updated_at TEXT NOT NULL, "
+                            "CHECK(descriptor_version=1), CHECK(length(descriptor_json)<=4096))"
+                        ),
+                        "INSERT INTO settings(key,value) VALUES('remember_subtitles_by_show','0')",
+                        "INSERT INTO settings(key,value) VALUES('prefer_english_subtitles','1')",
                     ),
                     SCHEMA_VERSION,
                 )
@@ -203,6 +225,28 @@ class Database:
                             "CHECK(start_ms>=0 AND end_ms>start_ms), "
                             "PRIMARY KEY(media_id,start_ms,end_ms))"
                         ),
+                        (
+                            "CREATE TABLE subtitle_preferences("
+                            "show_key_hash TEXT PRIMARY KEY, descriptor_version INTEGER NOT NULL, "
+                            "descriptor_json TEXT NOT NULL, updated_at TEXT NOT NULL, "
+                            "CHECK(descriptor_version=1), CHECK(length(descriptor_json)<=4096))"
+                        ),
+                        "INSERT INTO settings(key,value) VALUES('remember_subtitles_by_show','0')",
+                        "INSERT INTO settings(key,value) VALUES('prefer_english_subtitles','1')",
+                    ),
+                    SCHEMA_VERSION,
+                )
+            elif version == 3:
+                self._transactional_schema_change(
+                    (
+                        (
+                            "CREATE TABLE subtitle_preferences("
+                            "show_key_hash TEXT PRIMARY KEY, descriptor_version INTEGER NOT NULL, "
+                            "descriptor_json TEXT NOT NULL, updated_at TEXT NOT NULL, "
+                            "CHECK(descriptor_version=1), CHECK(length(descriptor_json)<=4096))"
+                        ),
+                        "INSERT INTO settings(key,value) VALUES('remember_subtitles_by_show','0')",
+                        "INSERT INTO settings(key,value) VALUES('prefer_english_subtitles','1')",
                     ),
                     SCHEMA_VERSION,
                 )
@@ -261,6 +305,95 @@ class Database:
             "AND q.id=CAST(s.value AS INTEGER)"
         ).fetchone()
         return Path(row[0]) if row else None
+
+    def get_setting_bool(self, key: str, default: bool) -> bool:
+        if key not in {SUBTITLE_REMEMBER_SETTING, SUBTITLE_ENGLISH_SETTING}:
+            raise ValueError("unknown subtitle setting")
+        row = self.connection.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        if row is None:
+            return default
+        value = row[0]
+        if value in {"1", 1}:
+            return True
+        if value in {"0", 0}:
+            return False
+        self.last_preference_error = f"invalid value for {key}; using its safe default"
+        return default
+
+    def set_setting_bool(self, key: str, value: bool) -> None:
+        if key not in {SUBTITLE_REMEMBER_SETTING, SUBTITLE_ENGLISH_SETTING}:
+            raise ValueError("unknown subtitle setting")
+        self.connection.execute(
+            "INSERT INTO settings(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, "1" if value else "0"),
+        )
+
+    def remember_subtitles_by_show(self) -> bool:
+        return self.get_setting_bool(SUBTITLE_REMEMBER_SETTING, False)
+
+    def set_remember_subtitles_by_show(self, enabled: bool) -> None:
+        self.set_setting_bool(SUBTITLE_REMEMBER_SETTING, bool(enabled))
+
+    def prefer_english_subtitles(self) -> bool:
+        return self.get_setting_bool(SUBTITLE_ENGLISH_SETTING, True)
+
+    def set_prefer_english_subtitles(self, enabled: bool) -> None:
+        self.set_setting_bool(SUBTITLE_ENGLISH_SETTING, bool(enabled))
+
+    # Explicit aliases are convenient at controller and UI call sites.
+    get_remember_subtitles_by_show = remember_subtitles_by_show
+    get_prefer_english_subtitles = prefer_english_subtitles
+
+    def get_subtitle_preference(self, show_key_hash: str) -> SubtitleDescriptor | None:
+        if not re.fullmatch(r"[0-9a-f]{24}:[0-9a-f]{64}", show_key_hash):
+            return None
+        row = self.connection.execute(
+            "SELECT descriptor_version,descriptor_json FROM subtitle_preferences "
+            "WHERE show_key_hash=?",
+            (show_key_hash,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            if int(row[0]) != 1 or len(str(row[1])) > 4096:
+                raise SubtitleError("invalid subtitle preference row")
+            return SubtitleDescriptor.from_dict(json.loads(str(row[1])))
+        except (ValueError, TypeError, json.JSONDecodeError, SubtitleError):
+            self.last_preference_error = "ignored malformed subtitle preference"
+            return None
+
+    def show_subtitle_preference(self, path: Path, root: Path | str | None = None) -> SubtitleDescriptor | None:
+        active_root = Path(root) if root is not None else self.get_root()
+        if active_root is None:
+            return None
+        key = scoped_show_key(path, active_root)
+        return self.get_subtitle_preference(key) if key is not None else None
+
+    def upsert_subtitle_preference(
+        self, path: Path, descriptor: SubtitleDescriptor, root: Path | str | None = None
+    ) -> bool:
+        active_root = Path(root) if root is not None else self.get_root()
+        if active_root is None or not isinstance(descriptor, SubtitleDescriptor):
+            return False
+        key = scoped_show_key(path, active_root)
+        if key is None:
+            return False
+        encoded = json.dumps(descriptor.to_dict(), separators=(",", ":"), sort_keys=True)
+        if len(encoded) > 4096:
+            raise ValueError("subtitle preference is too large")
+        self.connection.execute(
+            "INSERT INTO subtitle_preferences(show_key_hash,descriptor_version,descriptor_json,updated_at) "
+            "VALUES(?,?,?,?) ON CONFLICT(show_key_hash) DO UPDATE SET "
+            "descriptor_version=excluded.descriptor_version,descriptor_json=excluded.descriptor_json,"
+            "updated_at=excluded.updated_at",
+            (key, 1, encoded, datetime.now(UTC).isoformat()),
+        )
+        return True
+
+    # Names used by integrations that call the feature a show memory.
+    get_show_subtitle_preference = show_subtitle_preference
+    save_show_subtitle_preference = upsert_subtitle_preference
 
     def _entry_belongs_to_active_queue(self, entry_id: int) -> bool:
         try:

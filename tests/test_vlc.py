@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
-from vlcq.vlc import VLCClient, VLCError, VLCProcess, parse_playlist, parse_status
+from vlcq.subtitles import SubtitleTrack
+from vlcq.vlc import (
+    VLCClient,
+    VLCError,
+    VLCProcess,
+    parse_playlist,
+    parse_status,
+    parse_subtitle_tracks,
+)
 
 
 def test_process_uses_visible_macos_interface() -> None:
@@ -97,6 +106,26 @@ async def test_validate_version_rejects_unsupported_major(
     monkeypatch.setattr("vlcq.vlc.asyncio.create_subprocess_exec", create_probe)
     with pytest.raises(VLCError, match="requires a compatible VLC 3"):
         await VLCProcess("/Applications/VLC.app/Contents/MacOS/VLC")._validate_version()
+
+
+def test_parse_subtitle_fixture_and_fail_closed_variants() -> None:
+    fixture = json.loads(Path("tests/fixtures/vlc3_subtitle_status.json").read_text())
+    tracks = parse_subtitle_tracks(fixture)
+    assert isinstance(tracks[0], SubtitleTrack)
+    assert [(track.track_id, track.language, track.title) for track in tracks] == [
+        ("1", "en", "English Full Dialogue"),
+        ("2", "en", "English Signs Songs"),
+    ]
+    assert tracks[0].full_dialogue is True
+    assert tracks[1].signs_songs is True
+    assert tracks[1].full_dialogue is False
+    assert parse_subtitle_tracks({"state": "stopped"}) == ()
+    with pytest.raises(VLCError, match="malformed"):
+        parse_subtitle_tracks({"information": {"category": []}})
+    with pytest.raises(VLCError, match="malformed"):
+        parse_subtitle_tracks(
+            {"information": {"category": {"Stream 1": "not metadata"}}}
+        )
 
 
 def test_parse_status_is_tolerant_and_rejects_remote_media(tmp_path: Path) -> None:
@@ -207,6 +236,28 @@ async def test_client_resolves_current_media_from_playlist(tmp_path: Path) -> No
     # number of HTTP requests once the media identity has been established.
     assert (await client.status()).path == video.resolve()
     assert [request.url.path for request in requests].count("/requests/playlist.json") == 1
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_subtitle_operations_use_exact_vlc3_parameters() -> None:
+    fixture = json.loads(Path("tests/fixtures/vlc3_subtitle_status.json").read_text())
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json=fixture,
+            headers={"content-type": "text/plain"},
+        )
+
+    client = VLCClient(9999, "secret", transport=httpx.MockTransport(handler))
+    assert len(await client.subtitle_tracks()) == 2
+    await client.select_subtitle("2")
+    await client.disable_subtitles()
+    subtitle_requests = [request for request in requests if request.url.params.get("command") == "subtitle_track"]
+    assert [request.url.params["val"] for request in subtitle_requests] == ["2", "-1"]
     await client.close()
 
 

@@ -13,6 +13,14 @@ from .progress import (
     PlaybackObservation,
 )
 from .queue import QueueService
+from .subtitles import (
+    SubtitleChoice,
+    SubtitleSnapshot,
+    SubtitleTarget,
+    SubtitleTrack,
+    choose_english_track,
+    match_remembered_track,
+)
 from .vlc import VLCClient, VLCError, VLCPlaylistItem, VLCProcess
 
 NATURAL_END_WINDOW_MS = 3_000
@@ -90,12 +98,43 @@ class PlaybackController:
         self._window_signature: tuple[int | None, int | None] | None = None
         self._playlist_sync_invalidated = True
         self.last_error: str | None = None
+        self.subtitle_error: str | None = None
+        self._subtitle_generation = -1
+        self._subtitle_attempts = 0
+        self._subtitle_automatic_done = False
+        self._subtitle_explicit_done = False
+        self._subtitle_explicit_requested = False
+        self._subtitle_choice: SubtitleChoice | None = None
+        self.subtitle_retry_limit = 3
         self.observation_timeout = 0.75
         self.readiness_timeout = 3.0
 
     @property
     def playback_generation(self) -> int:
         return self._generation
+
+    @property
+    def current_subtitle_choice(self) -> SubtitleChoice | None:
+        return self._subtitle_choice
+
+    def _ensure_subtitle_generation_state(self) -> None:
+        if self._subtitle_generation == self._generation:
+            return
+        self._subtitle_generation = self._generation
+        self._subtitle_attempts = 0
+        self._subtitle_automatic_done = False
+        self._subtitle_explicit_done = False
+        self._subtitle_explicit_requested = False
+        self._subtitle_choice = None
+        self.subtitle_error = None
+
+    def reset_subtitle_policy(self) -> None:
+        """Allow a preference toggle to request one fresh automatic attempt."""
+        self._ensure_subtitle_generation_state()
+        if not self._subtitle_explicit_done:
+            self._subtitle_attempts = 0
+            self._subtitle_automatic_done = False
+            self.subtitle_error = None
 
     async def _run_database_operation[Result](self, operation: Callable[[], Result]) -> Result:
         return await asyncio.to_thread(self.queue.database.run_serialized, operation)
@@ -316,6 +355,226 @@ class PlaybackController:
     sync_playlist_window = synchronize_playlist
     synchronize = synchronize_playlist
 
+    def _current_subtitle_target_locked(self) -> SubtitleTarget | None:
+        self._ensure_subtitle_generation_state()
+        current = self.queue.current()
+        if current is None or self.client is None or self.status.state == "unavailable":
+            return None
+        if self.status.path is not None and not self._same_path(self.status.path, current.path):
+            return None
+        if (
+            self.status.playlist_id is not None
+            and self.active_vlc_id is not None
+            and self.status.playlist_id != self.active_vlc_id
+        ):
+            return None
+        playlist_id = self.active_vlc_id or self.status.playlist_id
+        if playlist_id is None and self.status.path is None:
+            return None
+        return SubtitleTarget(self._generation, current.id, current.path.resolve(), playlist_id)
+
+    def current_subtitle_target_for_path(self, path: Path) -> SubtitleTarget | None:
+        target = self._current_subtitle_target_locked()
+        if target is None or not self._same_path(target.path, path):
+            return None
+        return target
+
+    def _validate_subtitle_target_locked(self, target: SubtitleTarget) -> QueueEntry:
+        current_target = self._current_subtitle_target_locked()
+        current = self.queue.current()
+        if (
+            current is None
+            or current_target is None
+            or target.generation != self._generation
+            or target.queue_entry_id != current.id
+            or not self._same_path(target.path, current.path)
+            or (
+                target.playlist_id is not None
+                and current_target.playlist_id is not None
+                and target.playlist_id != current_target.playlist_id
+            )
+        ):
+            raise VLCError("subtitle action expired because playback changed")
+        return current
+
+    @staticmethod
+    def _validate_subtitle_tracks(value: object) -> tuple[SubtitleTrack, ...]:
+        if not isinstance(value, (tuple, list)) or not all(
+            isinstance(track, SubtitleTrack) for track in value
+        ):
+            raise VLCError("VLC returned malformed subtitle tracks")
+        return tuple(value)
+
+    async def _subtitle_tracks_locked(self, target: SubtitleTarget) -> SubtitleSnapshot:
+        self._validate_subtitle_target_locked(target)
+        client = self.client
+        if client is None:
+            raise VLCError("VLC is not connected")
+        method = getattr(client, "subtitle_tracks", None)
+        if not callable(method):
+            raise VLCError("VLC subtitle controls are unavailable")
+        tracks = self._validate_subtitle_tracks(await method())
+        status_method = getattr(client, "status", None)
+        if callable(status_method):
+            fresh_status = await status_method()
+            if not isinstance(fresh_status, VLCStatus) or fresh_status.state == "unavailable":
+                raise VLCError("VLC media changed while discovering subtitles")
+            if fresh_status.path is not None and not self._same_path(fresh_status.path, target.path):
+                raise VLCError("VLC media changed while discovering subtitles")
+            if (
+                fresh_status.playlist_id is not None
+                and target.playlist_id is not None
+                and fresh_status.playlist_id != target.playlist_id
+            ):
+                raise VLCError("VLC playlist changed while discovering subtitles")
+            if fresh_status.path is None and fresh_status.playlist_id is None:
+                raise VLCError("VLC media identity disappeared while discovering subtitles")
+        self._validate_subtitle_target_locked(target)
+        return SubtitleSnapshot(target, tracks)
+
+    async def discover_subtitles(self, target: SubtitleTarget | None = None) -> SubtitleSnapshot:
+        async with self._transition_lock:
+            actual = target or self._current_subtitle_target_locked()
+            if actual is None:
+                raise VLCError("subtitle selection requires the validated current media")
+            return await self._subtitle_tracks_locked(actual)
+
+    async def _issue_subtitle_locked(
+        self, target: SubtitleTarget, track_id: str | None
+    ) -> VLCStatus:
+        self._validate_subtitle_target_locked(target)
+        client = self.client
+        if client is None:
+            raise VLCError("VLC is not connected")
+        method = getattr(client, "select_subtitle", None)
+        if not callable(method):
+            raise VLCError("VLC subtitle controls are unavailable")
+        response = await method(track_id)
+        if not isinstance(response, VLCStatus):
+            raise VLCError("VLC returned malformed subtitle selection status")
+        if response.state == "unavailable":
+            raise VLCError("VLC rejected the subtitle selection")
+        self._validate_subtitle_target_locked(target)
+        if response.path is not None and not self._same_path(response.path, target.path):
+            raise VLCError("VLC changed media while selecting subtitles")
+        if (
+            response.playlist_id is not None
+            and target.playlist_id is not None
+            and response.playlist_id != target.playlist_id
+        ):
+            raise VLCError("VLC changed playlist identity while selecting subtitles")
+        return response
+
+    async def select_subtitle(
+        self, target: SubtitleTarget, choice: SubtitleChoice
+    ) -> SubtitleChoice:
+        """Apply one explicit choice without touching queue or playback state."""
+        # Set intent before waiting for the transition lock. If automatic
+        # discovery is awaiting VLC, a queued manual action still wins the
+        # race and cannot be overwritten by the delayed automatic command.
+        self._ensure_subtitle_generation_state()
+        self._subtitle_explicit_requested = True
+        async with self._transition_lock:
+            self._ensure_subtitle_generation_state()
+            try:
+                snapshot = await self._subtitle_tracks_locked(target)
+                selected = choice
+                if choice.mode == "track":
+                    assert choice.track is not None
+                    fresh = next(
+                        (track for track in snapshot.tracks if track.track_id == choice.track.track_id),
+                        None,
+                    )
+                    if fresh is None:
+                        raise VLCError("subtitle choice is no longer available")
+                    selected = SubtitleChoice.track_choice(fresh)
+                    track_id = fresh.track_id
+                else:
+                    track_id = None
+                await self._issue_subtitle_locked(target, track_id)
+            except (VLCError, OSError, RuntimeError) as exc:
+                self._subtitle_explicit_requested = False
+                self.subtitle_error = f"Subtitle selection failed; playback continues: {exc}"
+                raise
+            self._subtitle_explicit_done = True
+            self._subtitle_automatic_done = True
+            self._subtitle_choice = selected
+            self.subtitle_error = None
+            if self.queue.database.remember_subtitles_by_show():
+                descriptor = selected.descriptor()
+                await self._run_database_operation(
+                    lambda: self.queue.database.upsert_subtitle_preference(
+                        target.path, descriptor, root=self.queue.root
+                    )
+                )
+            return selected
+
+    def _automatic_choice_locked(
+        self, path: Path, tracks: tuple[SubtitleTrack, ...]
+    ) -> SubtitleChoice | None:
+        database = self.queue.database
+        if database.remember_subtitles_by_show():
+            remembered = database.show_subtitle_preference(path, root=self.queue.root)
+            if remembered is not None:
+                if remembered.mode == "off":
+                    return SubtitleChoice.off()
+                match = match_remembered_track(remembered, tracks)
+                if match is not None:
+                    return SubtitleChoice.track_choice(match)
+        if not database.prefer_english_subtitles():
+            return None
+        english = choose_english_track(tracks)
+        return SubtitleChoice.track_choice(english) if english is not None else None
+
+    async def _apply_automatic_subtitles_locked(self) -> SubtitleChoice | None:
+        self._ensure_subtitle_generation_state()
+        if (
+            self._subtitle_automatic_done
+            or self._subtitle_explicit_done
+            or self._subtitle_explicit_requested
+        ):
+            return None
+        target = self._current_subtitle_target_locked()
+        if target is None or self.client is None:
+            return None
+        if self._subtitle_attempts >= self.subtitle_retry_limit:
+            self._subtitle_automatic_done = True
+            return None
+        self._subtitle_attempts += 1
+        try:
+            snapshot = await self._subtitle_tracks_locked(target)
+            if self._subtitle_explicit_requested:
+                return None
+            if not snapshot.tracks:
+                if self._subtitle_attempts >= self.subtitle_retry_limit:
+                    self._subtitle_automatic_done = True
+                return None
+            choice = self._automatic_choice_locked(target.path, snapshot.tracks)
+            if choice is None:
+                self._subtitle_automatic_done = True
+                self.subtitle_error = None
+                return None
+            await self._issue_subtitle_locked(
+                target, None if choice.mode == "off" else choice.track.track_id  # type: ignore[union-attr]
+            )
+        except (VLCError, OSError, RuntimeError, AttributeError, TypeError) as exc:
+            if self._subtitle_attempts >= self.subtitle_retry_limit:
+                self._subtitle_automatic_done = True
+                self.subtitle_error = (
+                    f"Automatic subtitle selection stopped after {self.subtitle_retry_limit} attempts; "
+                    f"playback continues: {exc}"
+                )
+            return None
+        self._subtitle_automatic_done = True
+        self._subtitle_choice = choice
+        self.subtitle_error = None
+        return choice
+
+    async def apply_automatic_subtitles(self) -> SubtitleChoice | None:
+        """Try the bounded per-generation subtitle policy under the transition lock."""
+        async with self._transition_lock:
+            return await self._apply_automatic_subtitles_locked()
+
     async def _capture_final_observation_locked(self) -> bool:
         """Capture a bounded matching status, retaining the last valid value."""
         client = self.client
@@ -463,6 +722,7 @@ class PlaybackController:
                         allow_resume_reset=True,
                     )
                 )
+            await self._apply_automatic_subtitles_locked()
         except (VLCError, OSError, TimeoutError):
             await self._run_database_operation(
                 lambda: self.queue.set_current_state(entry.id, "failed")
@@ -720,6 +980,7 @@ class PlaybackController:
                         allow_resume_reset=True,
                     )
                 )
+            await self._apply_automatic_subtitles_locked()
         except (VLCError, OSError, TimeoutError):
             await self._run_database_operation(
                 lambda: self.queue.set_current_state(entry_id, "failed")
@@ -892,6 +1153,7 @@ class PlaybackController:
         self._window_signature = None
         self._playlist_sync_invalidated = True
         await self._synchronize_playlist_window_locked(force=True)
+        await self._apply_automatic_subtitles_locked()
 
     async def _record_coverage_evidence(
         self,
@@ -1080,6 +1342,8 @@ class PlaybackController:
                     )
                     if self.client is client and self.last_error is None:
                         await self._synchronize_playlist_window_locked()
+                        if self.client is client and self.last_error is None:
+                            await self._apply_automatic_subtitles_locked()
                     elif self.client is client and self.last_error is not None:
                         # Do not repair or delete an unexpected VLC item. Retire
                         # this connection and let an explicit reconnect establish

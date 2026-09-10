@@ -145,6 +145,7 @@ async def test_headers_lead_with_color_coded_pane_specific_controls(tmp_path: Pa
         assert app.query_one("#queue-actions", Button).display
         await pilot.click("#queue-actions")
         assert {str(button.label) for button in app.screen.query(Button)} == {
+            "☐ Remember subtitles by show", "☑ Prefer English subtitles",
             "Reconnect", "Help", "Quit", "Last notice details"
         }
         await pilot.press("escape")
@@ -183,7 +184,8 @@ async def test_headers_lead_with_color_coded_pane_specific_controls(tmp_path: Pa
         await pilot.click("#queue-actions")
         queue_actions = {str(button.label) for button in app.screen.query(Button)}
         assert queue_actions == {
-            "Details", "Clear queue", "Reconnect", "Help", "Quit", "Last notice details"
+            "Details", "Clear queue", "☐ Remember subtitles by show",
+            "☑ Prefer English subtitles", "Reconnect", "Help", "Quit", "Last notice details"
         }
         await pilot.press("escape")
         queue_entry = app.queue.entries()[0]

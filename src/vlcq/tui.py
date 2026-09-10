@@ -23,6 +23,7 @@ from .database import Database
 from .models import BrowserEntry, HistoryProjection, QueueEntry
 from .paths import VIDEO_EXTENSIONS, PathError, is_beneath, list_folder, natural_key
 from .queue import QueueService
+from .subtitles import SubtitleChoice, SubtitleSnapshot, SubtitleTarget
 from .vlc import VLCError
 
 
@@ -45,12 +46,14 @@ class FileTarget:
     path: Path
     root_generation: int
     selected_paths: tuple[Path, ...] = ()
+    playback_generation: int | None = None
 
 
 @dataclass(frozen=True)
 class QueueTarget:
     entry_id: int
     root_generation: int
+    playback_generation: int | None = None
 
 
 @dataclass(frozen=True)
@@ -378,6 +381,67 @@ class DetailsPrompt(ModalScreen[str | None]):
             self.dismiss(None)
 
 
+class SubtitlePicker(ModalScreen[SubtitleChoice | None]):
+    """A bounded, keyboard and mouse friendly picker for current VLC tracks."""
+
+    BINDINGS: ClassVar = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, snapshot: SubtitleSnapshot, active: SubtitleChoice | None = None) -> None:
+        super().__init__()
+        self.snapshot = snapshot
+        self.active = active
+        self.choices = [SubtitleChoice.off(), *(SubtitleChoice.track_choice(track) for track in snapshot.tracks)]
+
+    def compose(self) -> ComposeResult:
+        yield Static("Subtitles", classes="dialog-title")
+        with VerticalScroll(id="subtitle-picker-list"):
+            for index, choice in enumerate(self.choices):
+                if choice.mode == "off":
+                    label = "Off"
+                else:
+                    assert choice.track is not None
+                    label = choice.track.label
+                is_active = self._is_active(choice)
+                yield Button(
+                    ("● " if is_active else "○ ") + label,
+                    id=f"subtitle-choice-{index}",
+                    classes="subtitle-choice",
+                )
+        yield Button("Cancel", id="subtitle-cancel")
+
+    def _is_active(self, choice: SubtitleChoice) -> bool:
+        if self.active is not None:
+            if self.active.mode != choice.mode:
+                return False
+            if choice.mode == "off":
+                return True
+            return self.active.track is not None and choice.track is not None and self.active.track.track_id == choice.track.track_id
+        if choice.mode == "track" and choice.track is not None:
+            return choice.track.active is True
+        return False
+
+    def on_mount(self) -> None:
+        first = next(iter(self.query(Button)), None)
+        if first is not None:
+            first.focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id
+        if button_id == "subtitle-cancel":
+            self.dismiss(None)
+            return
+        if button_id is None or not button_id.startswith("subtitle-choice-"):
+            return
+        try:
+            index = int(button_id.rsplit("-", 1)[1])
+            self.dismiss(self.choices[index])
+        except (IndexError, ValueError):
+            self.dismiss(None)
+
+
 class ActionMenu(ModalScreen[ContextAction | None]):
     BINDINGS: ClassVar = [Binding("escape", "cancel", "Close")]
 
@@ -549,6 +613,8 @@ class HelpPrompt(ModalScreen[None]):
             "d remove · J/K reorder · r retry · c clear watched · ? help · q quit · Shift+F10 menu. "
             "Use VLC's visible controls for ordinary transport, or vlcq keyboard shortcuts. "
             "Native Next is supported; native Previous and arbitrary VLC playlist navigation are not. "
+            "Subtitles… is available only on the validated current row; Queue … contains the "
+            "Remember subtitles by show and Prefer English subtitles toggles. "
             "Files and Queue headers expose frequent mouse actions; use Queue … for Help, reconnect, and Quit.",
             classes="help-content",
             markup=False,
@@ -607,6 +673,9 @@ class VLCQApp(App[None]):
     }
     .dialog-title, .details-content, .help-content { width: 80%; max-height: 12; padding: 1; background: $surface; border: solid $accent; }
     .details-content, .help-content { height: auto; overflow-y: auto; }
+    #subtitle-picker-list { width: 80%; max-height: 12; padding: 0; background: $surface; border: solid $accent; overflow-y: auto; }
+    .subtitle-choice { width: 1fr; min-width: 20; height: 1; min-height: 1; margin: 0; padding: 0 1; border: none; content-align: left middle; }
+    SubtitlePicker { align: center middle; }
     RootPrompt, SearchFilterPrompt, ResumePrompt, DetailsPrompt, ConfirmClear, ConfirmClearAll, QuitPrompt, HelpPrompt, NoticeDetailsPrompt { align: center middle; }
     RootPrompt > Input, SearchFilterPrompt > Input { width: 80%; background: $surface; }
     """
@@ -1734,8 +1803,9 @@ class VLCQApp(App[None]):
         self._render_headers()
 
     def refresh_playback(self) -> None:
-        if self.controller.last_error is not None and self._notice != self.controller.last_error:
-            self.update_status(self.controller.last_error)
+        notice = self.controller.last_error or self.controller.subtitle_error
+        if notice is not None and self._notice != notice:
+            self.update_status(notice)
         self._refresh_browser_history()
         self.refresh_queue()
 
@@ -2525,6 +2595,9 @@ class VLCQApp(App[None]):
         selected = tuple(sorted(self.selected_paths, key=lambda path: natural_key(str(path))))
         return FileTarget(highlighted.path, self._root_generation, selected)
 
+    def _subtitle_action_enabled(self, path: Path) -> bool:
+        return not self.no_vlc and self.controller.current_subtitle_target_for_path(path) is not None
+
     def _target_batch_label(self, target: FileTarget, verb: str) -> str:
         paths = target.selected_paths or (target.path,)
         if len(paths) == 1 and not target.selected_paths:
@@ -2553,6 +2626,22 @@ class VLCQApp(App[None]):
                     ContextAction("add-end-file", self._target_batch_label(target, "Add to end"), target),
                     ContextAction("play-next-file", self._target_batch_label(target, "Play next"), target),
                     ContextAction("add-play-file", self._target_batch_label(target, "Add & play"), target),
+                    *(
+                        [
+                            ContextAction(
+                                "subtitle-file",
+                                "Subtitles…",
+                                FileTarget(
+                                    target.path,
+                                    target.root_generation,
+                                    target.selected_paths,
+                                    self.controller.playback_generation,
+                                ),
+                            )
+                        ]
+                        if self._subtitle_action_enabled(entry.path)
+                        else []
+                    ),
                     ContextAction("details-file", "Details", target),
                 ]
             )
@@ -2605,8 +2694,20 @@ class VLCQApp(App[None]):
             actions.append(ContextAction("undo", "Undo latest removal", target))
         if not wide and self.queue.entries():
             actions.append(ContextAction("clear-all", "Clear queue", target))
+        remember = self.database.remember_subtitles_by_show()
+        english = self.database.prefer_english_subtitles()
         actions.extend(
             [
+                ContextAction(
+                    "toggle-remember",
+                    ("☑ " if remember else "☐ ") + "Remember subtitles by show",
+                    target,
+                ),
+                ContextAction(
+                    "toggle-prefer-english",
+                    ("☑ " if english else "☐ ") + "Prefer English subtitles",
+                    target,
+                ),
                 ContextAction("reconnect", "Reconnect", target, not self.no_vlc),
                 ContextAction("help", "Help", target),
                 ContextAction("quit", "Quit", target),
@@ -2637,6 +2738,21 @@ class VLCQApp(App[None]):
             ContextAction("move-up", "Move up", target),
             ContextAction("move-down", "Move down", target),
             ContextAction("remove-queue", "Remove from queue", target),
+            *(
+                [
+                    ContextAction(
+                        "subtitle-queue",
+                        "Subtitles…",
+                        QueueTarget(
+                            target.entry_id,
+                            target.root_generation,
+                            self.controller.playback_generation,
+                        ),
+                    )
+                ]
+                if self._subtitle_action_enabled(entry.path)
+                else []
+            ),
             ContextAction("details-queue", "Details", target),
         ]
 
@@ -2723,6 +2839,34 @@ class VLCQApp(App[None]):
             return None
         return entry
 
+    async def _finish_subtitle_choice(
+        self, target: SubtitleTarget, choice: SubtitleChoice
+    ) -> None:
+        try:
+            selected = await self.controller.select_subtitle(target, choice)
+        except (VLCError, OSError, RuntimeError) as exc:
+            self.update_status(f"Subtitle selection failed; playback continues: {exc}")
+            return
+        label = "Off" if selected.mode == "off" else selected.track.label  # type: ignore[union-attr]
+        self.update_status(f"Subtitles selected: {label}")
+
+    async def _open_subtitles_for_path(self, path: Path) -> None:
+        target = self.controller.current_subtitle_target_for_path(path)
+        if target is None:
+            self.update_status("Subtitles are available only for the validated current media")
+            return
+        try:
+            snapshot = await self.controller.discover_subtitles(target)
+        except (VLCError, OSError, RuntimeError) as exc:
+            self.update_status(f"Subtitle discovery failed; playback continues: {exc}")
+            return
+
+        def chosen(choice: SubtitleChoice | None) -> None:
+            if choice is not None:
+                self.run_worker(self._finish_subtitle_choice(target, choice), exclusive=True)
+
+        self.push_screen(SubtitlePicker(snapshot, self.controller.current_subtitle_choice), chosen)
+
     async def _dispatch_context_action(self, action: ContextAction) -> None:
         target = action.target
         if isinstance(target, FileTarget) and not self._valid_file_target(target):
@@ -2736,6 +2880,18 @@ class VLCQApp(App[None]):
             self.update_status("Action expired after the library root changed")
             return
         key = action.key
+        if key in {"subtitle-file", "subtitle-queue"}:
+            captured_generation = (
+                target.playback_generation
+                if isinstance(target, (FileTarget, QueueTarget))
+                else None
+            )
+            if (
+                captured_generation is not None
+                and captured_generation != self.controller.playback_generation
+            ):
+                self.update_status("Subtitle action expired after playback changed")
+                return
         if key == "files-toggle":
             self._toggle_section("files")
         elif key == "queue-toggle":
@@ -2783,6 +2939,8 @@ class VLCQApp(App[None]):
             self._render_browser_rows()
         elif key == "clear-selection":
             await self.action_clear_selection()
+        elif key == "subtitle-file" and isinstance(target, FileTarget):
+            await self._open_subtitles_for_path(target.path)
         elif key == "details-file" and isinstance(target, FileTarget):
             await self._open_details(BrowserEntry(target.path, target.path.name, False, True), pane="browser")
         elif key == "sort-queue":
@@ -2810,12 +2968,35 @@ class VLCQApp(App[None]):
             await self.action_move_down()
         elif key == "remove-queue":
             await self.action_remove_target(target)
+        elif key == "subtitle-queue" and isinstance(target, QueueTarget):
+            assert queue_entry is not None
+            await self._open_subtitles_for_path(queue_entry.path)
         elif key == "details-queue" and isinstance(target, QueueTarget):
             assert queue_entry is not None
             await self._open_details(
                 BrowserEntry(queue_entry.path, queue_entry.path.name, False, True),
                 pane="queue",
             )
+        elif key == "toggle-remember" and isinstance(target, SectionTarget):
+            enabled = not self.database.remember_subtitles_by_show()
+            await self._run_database_operation(
+                lambda: self.database.set_remember_subtitles_by_show(enabled)
+            )
+            self.controller.reset_subtitle_policy()
+            self.update_status(
+                "Remember subtitles by show " + ("enabled" if enabled else "disabled; saved choices retained")
+            )
+            if enabled and not self.no_vlc:
+                await self.controller.apply_automatic_subtitles()
+        elif key == "toggle-prefer-english" and isinstance(target, SectionTarget):
+            enabled = not self.database.prefer_english_subtitles()
+            await self._run_database_operation(
+                lambda: self.database.set_prefer_english_subtitles(enabled)
+            )
+            self.controller.reset_subtitle_policy()
+            self.update_status("Prefer English subtitles " + ("enabled" if enabled else "disabled"))
+            if enabled and not self.no_vlc:
+                await self.controller.apply_automatic_subtitles()
         elif key == "reconnect":
             await self.action_reconnect()
         elif key == "notice-details":
@@ -2906,10 +3087,36 @@ class VLCQApp(App[None]):
     def action_context_menu(self) -> None:
         if self._browser_has_focus():
             source = self.focused
-            self._open_section_menu("files", source, source.region.x if source else 1, source.region.y if source else 1)
+            entry = self._browser_entry()
+            if entry is not None and not entry.is_dir:
+                row = next(
+                    (
+                        row for row in self.query_one("#browser", ListView).children
+                        if isinstance(row, BrowserListItem) and row.path == entry.path
+                    ),
+                    None,
+                )
+                if isinstance(row, BrowserListItem):
+                    self._open_row_menu(
+                        row,
+                        source.region.x if source else 1,
+                        source.region.y if source else 1,
+                    )
+            else:
+                self._open_section_menu("files", source, source.region.x if source else 1, source.region.y if source else 1)
         elif self._queue_has_focus():
             source = self.focused
-            self._open_section_menu("queue", source, source.region.x if source else 1, source.region.y if source else 1)
+            index = self._queue_index()
+            if index is not None:
+                queue_row = self.query_one("#queue", ListView).children[index]
+                if isinstance(queue_row, QueueListItem):
+                    self._open_row_menu(
+                        queue_row,
+                        source.region.x if source else 1,
+                        source.region.y if source else 1,
+                    )
+            else:
+                self._open_section_menu("queue", source, source.region.x if source else 1, source.region.y if source else 1)
         else:
             source = self.query_one("#queue-actions", Button)
             self._open_section_menu("queue", source, source.region.x, source.region.y)

@@ -16,6 +16,8 @@ import httpx
 
 from .models import VLCStatus
 from .paths import PathError, file_uri_to_path
+from .subtitles import SubtitleError, SubtitleTrack
+from .subtitles import parse_subtitle_tracks as _parse_subtitle_tracks
 
 
 class VLCError(RuntimeError):
@@ -72,6 +74,15 @@ def _playlist_id(value: object) -> str:
     return result
 
 
+def _subtitle_id(value: object) -> str:
+    if not isinstance(value, (str, int)) or isinstance(value, bool):
+        raise VLCError("VLC returned malformed subtitle identity")
+    result = str(value)
+    if not re.fullmatch(r"[0-9]{1,6}", result):
+        raise VLCError("VLC returned malformed subtitle identity")
+    return result
+
+
 def _playlist_nodes(payload: object) -> Iterator[dict[str, object]]:
     """Yield nested playlist nodes while ignoring unrelated JSON metadata."""
     if isinstance(payload, dict):
@@ -123,6 +134,13 @@ def parse_playlist(payload: object) -> list[VLCPlaylistItem]:
             by_path[path] = playlist_id
             result.append(VLCPlaylistItem(playlist_id, path))
     return result
+
+
+def parse_subtitle_tracks(payload: object) -> tuple[SubtitleTrack, ...]:
+    try:
+        return _parse_subtitle_tracks(payload)
+    except SubtitleError as exc:
+        raise VLCError(str(exc)) from exc
 
 
 def parse_status(payload: object) -> VLCStatus:
@@ -288,6 +306,7 @@ class VLCClient:
             "pl_empty",
             "seek",
             "rate",
+            "subtitle_track",
         }
         if command not in allowed:
             raise VLCError("unsupported VLC command")
@@ -317,6 +336,22 @@ class VLCClient:
         if not math.isfinite(rate) or rate <= 0:
             raise VLCError("playback rate must be finite and positive")
         return await self.command("rate", val=str(rate))
+
+    async def subtitle_tracks(self) -> tuple[SubtitleTrack, ...]:
+        """Enumerate subtitle streams from the current VLC status payload."""
+        try:
+            response = await self._client.get("/requests/status.json")
+            return parse_subtitle_tracks(self._response_payload(response))
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
+            raise VLCError("VLC subtitle inspection failed") from exc
+
+    async def select_subtitle(self, track_id: str | int | None) -> VLCStatus:
+        """Select one current stream, or ``None`` to send VLC's Off value."""
+        value = "-1" if track_id is None else _subtitle_id(track_id)
+        return await self.command("subtitle_track", val=value)
+
+    async def disable_subtitles(self) -> VLCStatus:
+        return await self.select_subtitle(None)
 
     async def play(self, path: Path) -> VLCStatus:
         canonical = self._validated_media_path(path)

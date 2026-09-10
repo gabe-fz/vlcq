@@ -1,0 +1,34 @@
+{
+  "state": "playing",
+  "time": 0,
+  "length": 29,
+  "rate": 1,
+  "currentplid": 2,
+  "information": {
+    "category": {
+      "Stream 0": {
+        "Codec": "araw",
+        "Description": "Generated audio",
+        "Type": "Audio",
+        "Sample_rate": "8000 Hz",
+        "Language": "English",
+        "Bits_per_sample": "16"
+      },
+      "Stream 1": {
+        "Description": "English Full Dialogue",
+        "Type": "Subtitle",
+        "Language": "English",
+        "Codec": "Text subtitles with various tags (subt)"
+      },
+      "Stream 2": {
+        "Description": "English Signs Songs",
+        "Type": "Subtitle",
+        "Language": "English",
+        "Codec": "Text subtitles with various tags (subt)"
+      },
+      "meta": {
+        "filename": "generated.mkv"
+      }
+    }
+  }
+}

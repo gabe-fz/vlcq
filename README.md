@@ -38,10 +38,12 @@ their one-line headers and Queue application menu remain reachable.
 
 The Files header provides **Open**, **Search/filter**, **Add**, and an overflow menu. The
 Queue header provides removal, reorder, clear actions, and an overflow menu. Right-click
-opens row-specific actions; `Shift+F10` is the keyboard menu fallback. Queue overflow
-always provides **Reconnect**, **Help**, and **Quit**, even with an empty queue or no
-selected row. Queue **Details** is available on demand and is not a persistent player
-panel.
+opens row-specific actions; `Shift+F10` is the keyboard menu fallback. Matching current
+Files and Queue rows also provide **Subtitles…**; inactive or stale rows do not, and
+opening any menu never loads or probes media. Queue overflow always provides **Reconnect**,
+**Help**, **Quit**, **Remember subtitles by show**, and **Prefer English subtitles**, even
+with an empty queue or no selected row. Queue **Details** is available on demand and is
+not a persistent player panel.
 
 Files are shown in one lazy inline tree. Multiple branches can remain expanded. Search
 is case-insensitive, recursive, asynchronous, and root-confined. **All**, **In progress**,
@@ -104,6 +106,26 @@ VLC's native **Next** is supported because vlcq stages and validates one authori
 successor. Native Previous and arbitrary VLC playlist navigation are not supported;
 unexpected media fails closed instead of inheriting history. Reconnect creates no
 duplicate process/poll loop and never selects, loads, or autoplays media.
+
+### Subtitle selection and preferences
+
+**Subtitles…** lists `Off` and only the tracks reported by the current owned VLC
+playback generation. Track IDs are used only for that immediate command; remembered
+choices store language and recognized full-dialogue, signs/songs, forced, and SDH
+characteristics so IDs and per-episode titles can change. If **Remember subtitles by
+show** is enabled, a successful vlcq choice (including **Off**) for a confidently
+inferred show wins over all automation. Otherwise, enabled **Prefer English subtitles**
+tries confidently identified English full-dialogue first, then other English tracks;
+within a class it prefers non-forced and non-SDH tracks. If metadata is missing or no
+English track is identifiable, VLC's existing/default choice is preserved.
+
+Show inference is deliberately conservative: season folders or explicit `S01E02`,
+`1x02`, and `Episode 02` filename evidence are accepted, while generic names, unsafe
+paths, and ambiguous root-level files are not. Preferences are scoped by a hash of the
+canonical library root and show identity; absolute media paths are not stored in the
+subtitle preference table. Discovery and selection use only the authenticated
+127.0.0.1 VLC HTTP endpoint. Delayed tracks, stale menus, rejected commands, and
+reconnects fail with bounded notices while playback continues.
 
 Relevant connection transitions, errors, and action feedback use a dismissible one-line
 notice that reserves no space while hidden. Its complete last text is available from
@@ -173,11 +195,12 @@ half-open millisecond intervals tied to the existing canonical file fingerprint.
 poll event log, attention tracking, telemetry, remote request, VLC credential, raw status
 payload, or unrelated media path is recorded.
 
-Schema version 3 adds nullable coverage initialization and range storage transactionally.
-Version 1/2 queue order, current/selected identities, resume position, legacy maximum,
-completion, fingerprints, and timestamps are retained. Migration deliberately infers no
-coverage from old maximum/completion evidence. A migration failure rolls back and reports
-recovery guidance without replacing the database.
+Schema version 4 adds subtitle toggles and a bounded semantic show-preference table;
+the English preference defaults on and show remembering defaults off. Version 1/2/3
+queue order, current/selected identities, resume position, legacy maximum, completion,
+fingerprints, timestamps, and coverage ranges are retained. Migration deliberately
+infers no coverage from old maximum/completion evidence. A migration failure rolls back
+and reports recovery guidance without replacing the database.
 
 Before upgrading an important database, close vlcq and take a private SQLite backup that
 includes WAL state:
@@ -187,13 +210,13 @@ includes WAL state:
 import sqlite3
 from pathlib import Path
 source = Path.home() / "Library/Application Support/vlcq/vlcq.sqlite3"
-backup = source.with_name("vlcq.sqlite3.before-v3")
+backup = source.with_name("vlcq.sqlite3.before-v4")
 with sqlite3.connect(source) as src, sqlite3.connect(backup) as dst:
     src.backup(dst)
 PY
 ```
 
-Older binaries reject schema 3. Rollback means closing vlcq and restoring the backup—not
+Older binaries reject schema 4. Rollback means closing vlcq and restoring the backup—not
 decrementing `PRAGMA user_version` or deleting tables. Progress after the backup will be
 lost.
 
@@ -207,7 +230,7 @@ requests and never deletes, moves, copies, or edits media.
 .venv/bin/pytest
 .venv/bin/ruff check .
 .venv/bin/mypy src
-openspec validate simplify-progress-with-watched-coverage --strict
+openspec validate subtitle-selection-preferences --strict
 VLCQ_REAL_VLC=1 .venv/bin/pytest tests/test_integration_real_vlc.py
 ```
 

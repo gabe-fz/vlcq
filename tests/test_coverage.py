@@ -177,7 +177,7 @@ def test_legacy_migration_preserves_queue_identities_without_inferred_ranges(
     connection.close()
 
     db = Database(path)
-    assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 4
     assert db.get_current_id() == 7
     assert db.get_selected_id() == 7
     history = db.history_for(video, root=root)

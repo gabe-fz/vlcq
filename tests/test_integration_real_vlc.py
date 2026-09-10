@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import struct
 import subprocess
 import wave
 from pathlib import Path
@@ -11,7 +12,109 @@ import pytest
 from vlcq.controller import PlaybackController
 from vlcq.database import Database
 from vlcq.queue import QueueService
+from vlcq.subtitles import SubtitleChoice
 from vlcq.vlc import VLCError, VLCProcess
+
+
+def _ebml_id(value: int) -> bytes:
+    return value.to_bytes((value.bit_length() + 7) // 8, "big")
+
+
+def _ebml_size(value: int) -> bytes:
+    for width in range(1, 9):
+        if value < (1 << (7 * width)) - 1:
+            return ((1 << (7 * width)) | value).to_bytes(width, "big")
+    raise ValueError("temporary fixture is too large")
+
+
+def _ebml_element(identifier: int, value: object) -> bytes:
+    if isinstance(value, int):
+        value = value.to_bytes(max(1, (value.bit_length() + 7) // 8), "big")
+    elif isinstance(value, float):
+        value = struct.pack(">d", value)
+    elif isinstance(value, str):
+        value = value.encode()
+    elif not isinstance(value, bytes):
+        raise TypeError("unsupported EBML value")
+    return _ebml_id(identifier) + _ebml_size(len(value)) + value
+
+
+def _write_generated_multitrack_mkv(path: Path) -> None:
+    """Create disposable PCM plus two semantic subtitle tracks without user media."""
+    ebml = b"".join(
+        (
+            _ebml_element(0x4286, 1),
+            _ebml_element(0x42F7, 1),
+            _ebml_element(0x42F2, 4),
+            _ebml_element(0x42F3, 8),
+            _ebml_element(0x4282, "matroska"),
+            _ebml_element(0x4287, 4),
+            _ebml_element(0x4285, 2),
+        )
+    )
+    info = _ebml_element(
+        0x1549A966,
+        _ebml_element(0x2AD7B1, 1_000_000)
+        + _ebml_element(0x4D80, "vlcq-real-vlc-probe")
+        + _ebml_element(0x5741, "vlcq-real-vlc-probe"),
+    )
+
+    def subtitle_entry(number: int, uid: int, title: str, *, forced: bool = False) -> bytes:
+        fields = (
+            _ebml_element(0xD7, number)
+            + _ebml_element(0x73C5, uid)
+            + _ebml_element(0x83, 17)
+            + _ebml_element(0x88, 0)
+            + _ebml_element(0x536E, title)
+            + _ebml_element(0x22B59C, "eng")
+            + _ebml_element(0x86, "S_TEXT/UTF8")
+        )
+        if forced:
+            fields += _ebml_element(0x55AA, 1)
+        return _ebml_element(0xAE, fields)
+
+    audio_fields = (
+        _ebml_element(0xD7, 1)
+        + _ebml_element(0x73C5, 101)
+        + _ebml_element(0x83, 2)
+        + _ebml_element(0x88, 1)
+        + _ebml_element(0x86, "A_PCM/INT/LIT")
+        + _ebml_element(0x536E, "Generated audio")
+        + _ebml_element(
+            0xE1,
+            _ebml_element(0xB5, 8_000.0)
+            + _ebml_element(0x9F, 1)
+            + _ebml_element(0x6264, 16),
+        )
+    )
+    tracks = _ebml_element(
+        0x1654AE6B,
+        _ebml_element(0xAE, audio_fields)
+        + subtitle_entry(2, 202, "English Full Dialogue")
+        + subtitle_entry(3, 303, "English Signs Songs", forced=True),
+    )
+    blocks = []
+    for index in range(1_500):
+        blocks.append(
+            _ebml_element(
+                0xA3,
+                b"\x81" + struct.pack(">hB", index * 20, 0) + b"\0\0" * 160,
+            )
+        )
+    blocks.extend(
+        (
+            _ebml_element(0xA3, b"\x82\0\0\x00Hello generated full dialogue"),
+            _ebml_element(0xA3, b"\x83\0\0\x00[MUSIC] generated signs"),
+        )
+    )
+    cluster = _ebml_element(0x1F43B675, _ebml_element(0xE7, 0) + b"".join(blocks))
+    segment = info + tracks + cluster
+    path.write_bytes(
+        _ebml_element(0x1A45DFA3, ebml)
+        + _ebml_id(0x18538067)
+        + _ebml_size(len(segment))
+        + segment
+    )
 
 
 @pytest.mark.asyncio
@@ -201,6 +304,53 @@ async def test_real_vlc_temporary_media_play_seek_pause_stop_and_reconnect(
         assert queue.current() is not None
         assert queue.current().id == saved_current.id
         assert queue.current().state == "stopped"
+    finally:
+        await controller.stop()
+        database.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    os.environ.get("VLCQ_REAL_VLC") != "1",
+    reason="set VLCQ_REAL_VLC=1 for installed VLC 3 subtitle smoke test",
+)
+async def test_real_vlc_subtitle_enumeration_selection_and_off(tmp_path: Path) -> None:
+    """Exercise the VLC 3 subtitle adapter with only a generated disposable file."""
+    executable = Path("/Applications/VLC.app/Contents/MacOS/VLC")
+    if not executable.is_file():
+        pytest.skip("macOS VLC application is not installed")
+    media = tmp_path / "generated-subtitle-probe.mkv"
+    _write_generated_multitrack_mkv(media)
+    database = Database(tmp_path / "subtitle-integration.sqlite3")
+    queue = QueueService(database)
+    queue.open(tmp_path)
+    queue.add([media])
+    # Do not let the default English policy consume the explicit command under test.
+    database.set_prefer_english_subtitles(False)
+    controller = PlaybackController(queue, process=VLCProcess(executable))
+    try:
+        try:
+            await controller.start()
+            await controller.play_index(0)
+        except (OSError, TimeoutError, VLCError) as exc:
+            pytest.skip(f"VLC subtitle startup unavailable in this environment: {exc}")
+        snapshot = await controller.discover_subtitles()
+        assert len(snapshot.tracks) >= 2
+        assert {track.language for track in snapshot.tracks} >= {"en"}
+        client = controller.client
+        assert client is not None
+        before = await client.status()
+        selected = await controller.select_subtitle(
+            snapshot.target, SubtitleChoice.track_choice(snapshot.tracks[0])
+        )
+        assert selected.track is not None
+        after_track = await client.status()
+        assert after_track.path == before.path == media.resolve()
+        await controller.select_subtitle(snapshot.target, SubtitleChoice.off())
+        after_off = await client.status()
+        assert after_off.path == media.resolve()
+        assert queue.current() is not None and queue.current().path == media.resolve()
+        assert media.is_file()
     finally:
         await controller.stop()
         database.close()
