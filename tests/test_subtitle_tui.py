@@ -8,7 +8,13 @@ from textual.widgets import Button, Static
 
 from vlcq.database import Database
 from vlcq.models import VLCStatus
-from vlcq.subtitles import SubtitleChoice, SubtitleSnapshot, SubtitleTarget, SubtitleTrack
+from vlcq.subtitles import (
+    SubtitleCandidate,
+    SubtitleChoice,
+    SubtitleSnapshot,
+    SubtitleTarget,
+    SubtitleTrack,
+)
 from vlcq.tui import (
     ActionMenu,
     QueueTarget,
@@ -79,7 +85,7 @@ async def test_subtitle_subitem_is_visible_and_video_menu_no_longer_owns_subtitl
     current = make_video(root, "current.mkv")
     inactive = make_video(root, "inactive.mkv")
     db = Database(tmp_path / "state.sqlite3")
-    app = VLCQApp(root=root, database=db, no_vlc=False)
+    app = VLCQApp(root=root, database=db, no_vlc=True)
     app.queue.add([current, inactive])
     entry = app.queue.play_now(0)
     app.controller.status = VLCStatus("playing", path=current.resolve(), playlist_id="vlc-1")
@@ -92,7 +98,7 @@ async def test_subtitle_subitem_is_visible_and_video_menu_no_longer_owns_subtitl
         current_subtitle = rows[0].query_one(SubtitleSubitem)
         inactive_subtitle = rows[1].query_one(SubtitleSubitem)
         assert "● Active: Off" in str(current_subtitle.label)
-        assert "★ Planned: Prefer English" in str(inactive_subtitle.label)
+        assert "Subtitles:" in str(inactive_subtitle.label)
         current_actions = app._context_actions_for_queue(QueueTarget(entry.id, app._root_generation))
         inactive_entry = app.queue.entries()[1]
         inactive_actions = app._context_actions_for_queue(
@@ -153,6 +159,37 @@ async def test_inactive_subtitle_subitem_opens_persistent_picker_without_vlc(
         await pilot.press("shift+f10")
         await pilot.pause()
         assert isinstance(app.screen, SubtitlePicker)
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_visible_subtitle_subitem_resolves_mkv_english_choice_in_background(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "library"
+    video = make_video(root, "episode.mkv")
+    db = Database(tmp_path / "state.sqlite3")
+    app = VLCQApp(root=root, database=db, no_vlc=True)
+
+    async def discover(path: Path, root_path: Path):
+        assert path == video.resolve()
+        assert root_path == root.resolve()
+        return (
+            SubtitleCandidate(
+                "embedded",
+                "en",
+                "English Full Dialogue",
+                full_dialogue=True,
+                source_order=0,
+            ),
+        )
+
+    monkeypatch.setattr(app.subtitle_discovery, "discover", discover)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause(0.1)
+        subtitle = app.query_one("#browser").children[0].query_one(SubtitleSubitem)
+        assert "★ Planned: Embedded · English · English Full Dialogue" in str(subtitle.label)
+        assert subtitle.region.x <= 1
     db.close()
 
 

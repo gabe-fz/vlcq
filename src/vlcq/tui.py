@@ -29,6 +29,8 @@ from .subtitles import (
     SubtitleDiscovery,
     SubtitleSnapshot,
     SubtitleTarget,
+    choose_english_candidate,
+    match_remembered_candidate,
 )
 from .vlc import VLCError
 
@@ -218,7 +220,7 @@ class BrowserListItem(ListItem):
             super().__init__(Label(renderable, classes="row-label", markup=False), classes=classes)
         else:
             marker = "☑" if selected else "☐"
-            subtitle = subtitle_renderable or Text("    ↳ Subtitles: ○ Inspect / select", no_wrap=True)
+            subtitle = subtitle_renderable or Text("  ↳ Subtitles: ○ Inspecting…", no_wrap=True)
             super().__init__(
                 Vertical(
                     Horizontal(
@@ -259,7 +261,7 @@ class QueueListItem(ListItem):
     ) -> None:
         del history_visible
         self.entry_id = entry.id
-        subtitle = subtitle_renderable or Text("    ↳ Subtitles: ○ Inspect / select", no_wrap=True)
+        subtitle = subtitle_renderable or Text("  ↳ Subtitles: ○ Inspecting…", no_wrap=True)
         super().__init__(
             Vertical(
                 Horizontal(
@@ -881,6 +883,8 @@ class VLCQApp(App[None]):
         self._subtitle_loading_task: asyncio.Task[None] | None = None
         self._subtitle_snapshots: dict[Path, SubtitleSnapshot] = {}
         self._subtitle_row_choices: dict[Path, SubtitleChoice] = {}
+        self._subtitle_summary_tasks: dict[Path, asyncio.Task[None]] = {}
+        self._subtitle_summary_failures: set[Path] = set()
 
     def compose(self) -> ComposeResult:
         with Vertical(id="sections"):
@@ -943,12 +947,16 @@ class VLCQApp(App[None]):
                 except (IndexError, OSError, VLCError):
                     self.update_status("Automatic resume failed")
                 self.refresh_queue()
+        self.call_after_refresh(self._schedule_visible_subtitle_inspections)
         self.set_interval(1, self.refresh_playback)
 
     async def on_unmount(self) -> None:
         for task in self._history_tasks.values():
             task.cancel()
         self._history_tasks.clear()
+        for task in self._subtitle_summary_tasks.values():
+            task.cancel()
+        self._subtitle_summary_tasks.clear()
         if self._browser_mount_task is not None:
             self._browser_mount_task.cancel()
         if self._recursive_cancel is not None:
@@ -1414,7 +1422,7 @@ class VLCQApp(App[None]):
 
     def _subtitle_renderable(self, path: Path, *, depth: int = 0) -> Text:
         canonical = path.expanduser().resolve(strict=False)
-        prefix = "  " * max(0, depth) + "    ↳ Subtitles: "
+        prefix = "  " * max(0, depth) + "  ↳ Subtitles: "
         text = Text(prefix, style="bright_black", no_wrap=True, overflow="ellipsis")
         snapshot = self._subtitle_snapshots.get(canonical)
         current = self.controller.status.path is not None and self.controller._same_path(
@@ -1452,10 +1460,17 @@ class VLCQApp(App[None]):
                 text.append("★ Planned: ", style="bold cyan")
                 text.append(self._subtitle_descriptor_label(descriptor), style="cyan")
                 return text
-        if self.database.prefer_english_subtitles():
-            text.append("★ Planned: Prefer English · inspect to resolve", style="cyan")
+        if snapshot is not None:
+            text.append(
+                "○ No planned subtitle" if snapshot.candidates else "○ No subtitles found",
+                style="bright_black",
+            )
+        elif canonical in self._subtitle_summary_failures:
+            text.append("○ Inspection unavailable · activate to retry", style="yellow")
+        elif self.database.prefer_english_subtitles():
+            text.append("○ Inspecting MKV subtitles…", style="cyan")
         else:
-            text.append("○ None selected · inspect / select", style="bright_black")
+            text.append("○ Inspecting subtitles…", style="bright_black")
         return text
 
     def _update_subtitle_row(self, row: BrowserListItem | QueueListItem, path: Path) -> None:
@@ -1486,6 +1501,107 @@ class VLCQApp(App[None]):
                     continue
                 if row_path is not None and (canonical is None or row_path == canonical):
                     self._update_subtitle_row(row, row_path)
+
+    async def _inspect_subtitle_summary(self, path: Path, root_generation: int) -> None:
+        canonical = path.expanduser().resolve(strict=False)
+        before = await asyncio.to_thread(_file_identity, canonical, self.root)
+        if before is None:
+            self._subtitle_summary_failures.add(canonical)
+            self._refresh_subtitle_rows(canonical)
+            return
+        try:
+            candidates = await self.subtitle_discovery.discover(canonical, self.root)
+        except (OSError, RuntimeError, ValueError):
+            if root_generation == self._root_generation:
+                self._subtitle_summary_failures.add(canonical)
+                self._refresh_subtitle_rows(canonical)
+            return
+        after = await asyncio.to_thread(_file_identity, canonical, self.root)
+        if (
+            root_generation != self._root_generation
+            or after is None
+            or after != before
+        ):
+            return
+        planned_choice: SubtitleChoice | None = None
+        planned_candidate = None
+        remembered_applies = False
+        if self.database.remember_subtitles_by_show():
+            remembered = self.database.show_subtitle_preference(canonical, root=self.root)
+            if remembered is not None:
+                remembered_applies = True
+                if remembered.mode == "off":
+                    planned_choice = SubtitleChoice.off()
+                else:
+                    planned_candidate = match_remembered_candidate(remembered, candidates)
+                    if planned_candidate is not None:
+                        planned_choice = SubtitleChoice.candidate_choice(planned_candidate)
+        if (
+            not remembered_applies
+            and planned_choice is None
+            and self.database.prefer_english_subtitles()
+        ):
+            planned_candidate = choose_english_candidate(candidates)
+            if planned_candidate is not None:
+                planned_choice = SubtitleChoice.candidate_choice(planned_candidate)
+        queue_entry_id = next(
+            (entry.id for entry in self.queue.entries() if entry.path == canonical),
+            0,
+        )
+        target = SubtitleTarget(
+            self.controller.playback_generation,
+            queue_entry_id,
+            canonical,
+            None,
+            root_generation,
+            before[1],
+        )
+        self._subtitle_snapshots[canonical] = SubtitleSnapshot(
+            target,
+            (),
+            candidates,
+            planned_candidate,
+            None,
+            planned_choice,
+        )
+        self._subtitle_summary_failures.discard(canonical)
+        self._refresh_subtitle_rows(canonical)
+
+    def _schedule_visible_subtitle_inspections(self) -> None:
+        paths: set[Path] = set()
+        entries_by_id = {entry.id: entry for entry in self.queue.entries()}
+        for selector in ("#browser", "#queue"):
+            try:
+                view = self.query_one(selector, ListView)
+            except NoMatches:
+                continue
+            for row in view.displayed_children:
+                if isinstance(row, BrowserListItem) and not row.is_dir:
+                    paths.add(row.path)
+                elif isinstance(row, QueueListItem):
+                    entry = entries_by_id.get(row.entry_id)
+                    if entry is not None:
+                        paths.add(entry.path)
+        for path in paths:
+            canonical = path.expanduser().resolve(strict=False)
+            if (
+                canonical in self._subtitle_snapshots
+                or canonical in self._subtitle_summary_failures
+                or canonical in self._subtitle_summary_tasks
+            ):
+                continue
+            task = asyncio.create_task(
+                self._inspect_subtitle_summary(canonical, self._root_generation)
+            )
+            self._subtitle_summary_tasks[canonical] = task
+
+            def finished(done: asyncio.Task[None], *, key: Path = canonical) -> None:
+                if self._subtitle_summary_tasks.get(key) is done:
+                    self._subtitle_summary_tasks.pop(key, None)
+                if not done.cancelled():
+                    done.exception()
+
+            task.add_done_callback(finished)
 
     def _apply_browser_history_rows(self) -> None:
         try:
@@ -2057,6 +2173,7 @@ class VLCQApp(App[None]):
         self._render_headers()
 
     def refresh_playback(self) -> None:
+        self._schedule_visible_subtitle_inspections()
         notice = self.controller.last_error or self.controller.subtitle_error
         if notice is not None and self._notice != notice:
             self.update_status(notice)
@@ -2526,6 +2643,10 @@ class VLCQApp(App[None]):
         self.subtitle_discovery.set_root(self.root)
         self._subtitle_snapshots.clear()
         self._subtitle_row_choices.clear()
+        self._subtitle_summary_failures.clear()
+        for task in self._subtitle_summary_tasks.values():
+            task.cancel()
+        self._subtitle_summary_tasks.clear()
         self._tree_generation += 1
         self.expanded_paths.clear()
         self._tree_children.clear()
@@ -3004,6 +3125,9 @@ class VLCQApp(App[None]):
         )
 
     def _open_subtitle_subitem(self, subtitle: SubtitleSubitem) -> None:
+        self._subtitle_summary_failures.discard(
+            subtitle.path.expanduser().resolve(strict=False)
+        )
         if not self._subtitle_action_enabled(subtitle.path):
             self.update_status("Subtitle inspection is unavailable for this video")
             return

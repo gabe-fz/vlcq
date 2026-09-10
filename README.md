@@ -117,8 +117,9 @@ duplicate process/poll loop and never selects, loads, or autoplays media.
 
 ### Subtitle selection and preferences
 
-The always-visible **Subtitles** subitem summarizes the confirmed active choice, a planned
-show/policy choice, or an unresolved/default state. Its picker lists `Off`, embedded streams
+The always-visible **Subtitles** subitem inspects visible videos in the background and
+summarizes the confirmed active choice, resolved show/policy choice, no matching subtitle,
+or an inspection failure. Its picker lists `Off`, embedded streams
 discovered by local `ffprobe`, and immediate same-stem sidecars (`.srt`, `.ass`, `.ssa`,
 `.vtt`, `.sub/.idx`, `.sup`). Sidecars such as
 `Episode.en.whisper.srt` are associated only with the sibling video; hidden, unrelated,
