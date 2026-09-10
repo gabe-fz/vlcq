@@ -125,15 +125,18 @@ def render_filename(name: str, *, folder: bool = False, depth: int = 0, expanded
 class HistoricalCoverage(Static):
     """Compact read-only unique played coverage value."""
 
-    def __init__(self, percentage: int | None) -> None:
+    def __init__(self, percentage: int | None, *, watched: bool = False) -> None:
         super().__init__(classes="history-value")
         self.percentage = percentage
-        self.set_percentage(percentage)
+        self.set_percentage(percentage, watched=watched)
 
-    def set_percentage(self, percentage: int | None) -> None:
+    def set_percentage(self, percentage: int | None, *, watched: bool = False) -> None:
         self.percentage = percentage
         value = "—" if percentage is None else f"{percentage}%"
-        self.update(Text(f"hist {value:>4}", style="cyan", no_wrap=True))
+        style = "bright_black" if percentage is None else ("bold green" if watched else "yellow")
+        text = Text("hist ", style="bright_black", no_wrap=True)
+        text.append(f"{value:>4}", style=style)
+        self.update(text)
 
 
 class ItemProgress(Static):
@@ -152,11 +155,23 @@ class ItemProgress(Static):
         duration = duration_ms if duration_ms is not None and duration_ms > 0 else None
         percent = min(100, max(0, position_ms) * 100 // duration) if duration else None
         filled = round(self.BAR_WIDTH * percent / 100) if percent is not None else 0
-        bar = "█" * filled + "░" * (self.BAR_WIDTH - filled)
         current = VLCQApp._format_time(position_ms)
         total = VLCQApp._format_time(duration) if duration else "--:--"
         value = f"{percent}%" if percent is not None else "--%"
-        self.update(Text(f"[{bar}] {value:>4} {current}/{total}", style="yellow", no_wrap=True))
+        if percent is None:
+            progress_style = "bright_black"
+        elif percent < 34:
+            progress_style = "bold red"
+        elif percent < 67:
+            progress_style = "bold yellow"
+        else:
+            progress_style = "bold green"
+        text = Text("[", style="bright_black", no_wrap=True)
+        text.append("█" * filled, style=progress_style)
+        text.append("░" * (self.BAR_WIDTH - filled) + "] ", style="bright_black")
+        text.append(f"{value:>4} {current}", style=progress_style)
+        text.append(f"/{total}", style="bright_black")
+        self.update(text)
 
 
 class BrowserListItem(ListItem):
@@ -193,7 +208,7 @@ class BrowserListItem(ListItem):
                         tooltip="Deselect video" if selected else "Select video",
                     ),
                     Label(renderable, classes="row-label", markup=False),
-                    HistoricalCoverage(history_percentage),
+                    HistoricalCoverage(history_percentage, watched=history_watched),
                     classes="browser-row",
                 ),
                 classes=classes,
@@ -218,13 +233,13 @@ class QueueListItem(ListItem):
         current_position_ms: int | None = 0,
         current_duration_ms: int | None = None,
     ) -> None:
-        del history_watched, history_visible
+        del history_visible
         self.entry_id = entry.id
         super().__init__(
             Horizontal(
                 Label(renderable, classes="row-label", markup=False),
                 ItemProgress(current_position_ms, current_duration_ms),
-                HistoricalCoverage(history_percentage),
+                HistoricalCoverage(history_percentage, watched=history_watched),
                 classes="queue-row",
             )
         )
@@ -575,9 +590,9 @@ class VLCQApp(App[None]):
     #browser > ListItem, #queue > ListItem { width: auto; min-width: 100%; height: 1; min-height: 1; }
     .browser-row, .queue-row { width: 1fr; height: 1; min-height: 1; }
     .browser-check { width: 3; min-width: 3; height: 1; min-height: 1; margin: 0; padding: 0; border: none; }
-    .row-label { width: 1fr; height: 1; min-height: 1; overflow-x: hidden; }
-    .current-progress { width: 32; min-width: 20; height: 1; min-height: 1; padding: 0; content-align: right middle; overflow-x: hidden; }
-    .history-value { width: 10; min-width: 8; height: 1; min-height: 1; padding: 0; content-align: right middle; }
+    .row-label { width: auto; height: 1; min-height: 1; overflow-x: hidden; }
+    .current-progress { width: auto; min-width: 20; height: 1; min-height: 1; margin-left: 1; padding: 0; content-align: left middle; overflow-x: hidden; }
+    .history-value { width: auto; min-width: 8; height: 1; min-height: 1; margin-left: 1; padding: 0; content-align: left middle; }
     .folder-entry { color: $primary-lighten-2; text-style: bold; }
     .video-entry { color: $text; }
     .selected-video { color: $warning; text-style: bold; }
@@ -1181,7 +1196,8 @@ class VLCQApp(App[None]):
                     self._browser_renderable(entry, entry.path in self.selected_paths, entry.path in queued_paths)
                 )
                 row.query_one(HistoricalCoverage).set_percentage(
-                    self._history_percentage(entry.path)
+                    self._history_percentage(entry.path),
+                    watched=self._history_watched(entry.path),
                 )
             except NoMatches:
                 continue
@@ -1211,7 +1227,8 @@ class VLCQApp(App[None]):
                 position, duration = self._queue_current_position(entry, current_id)
                 row.query_one(ItemProgress).set_position(position, duration)
                 row.query_one(HistoricalCoverage).set_percentage(
-                    self._history_percentage(entry.path)
+                    self._history_percentage(entry.path),
+                    watched=self._history_watched(entry.path),
                 )
             except NoMatches:
                 continue
@@ -1303,7 +1320,8 @@ class VLCQApp(App[None]):
             )
             if not entry.is_dir:
                 row.query_one(HistoricalCoverage).set_percentage(
-                    self._history_percentage(entry.path)
+                    self._history_percentage(entry.path),
+                    watched=self._history_watched(entry.path),
                 )
         except NoMatches:
             pass
@@ -1590,7 +1608,8 @@ class VLCQApp(App[None]):
             position, duration = self._queue_current_position(entry, current_id)
             row.query_one(ItemProgress).set_position(position, duration)
             row.query_one(HistoricalCoverage).set_percentage(
-                self._history_percentage(entry.path)
+                self._history_percentage(entry.path),
+                watched=self._history_watched(entry.path),
             )
         except NoMatches:
             pass

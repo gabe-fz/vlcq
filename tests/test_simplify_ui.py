@@ -28,6 +28,23 @@ def make_files(root: Path, count: int = 8) -> list[Path]:
     return paths
 
 
+def test_progress_and_history_values_have_semantic_color_spans() -> None:
+    low = ItemProgress(20_000, 100_000).renderable
+    middle = ItemProgress(50_000, 100_000).renderable
+    high = ItemProgress(90_000, 100_000).renderable
+    assert any(str(span.style) == "bold red" for span in low.spans)
+    assert any(str(span.style) == "bold yellow" for span in middle.spans)
+    assert any(str(span.style) == "bold green" for span in high.spans)
+    assert any(str(span.style) == "bright_black" for span in high.spans)
+
+    partial_history = HistoricalCoverage(50).renderable
+    watched_history = HistoricalCoverage(90, watched=True).renderable
+    unknown_history = HistoricalCoverage(None).renderable
+    assert any(str(span.style) == "yellow" for span in partial_history.spans)
+    assert any(str(span.style) == "bold green" for span in watched_history.spans)
+    assert any(str(span.style) == "bright_black" for span in unknown_history.spans)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("size", [(80, 24), (120, 40), (80, 50)])
 async def test_stacked_sections_collapse_and_resize_without_rebuilding(
@@ -213,17 +230,26 @@ async def test_one_line_rows_are_literal_compact_and_semantically_independent(tm
         assert "No recorded progress" not in str(absent_label.renderable)
         assert "In progress" not in str(progress_label.renderable)
         assert "Completed" not in str(completed_label.renderable)
-        assert "hist  19%" in str(rows[progress.resolve()].query_one(HistoricalCoverage).renderable)
+        progress_history = rows[progress.resolve()].query_one(HistoricalCoverage)
+        assert "hist  19%" in str(progress_history.renderable)
         assert "hist 100%" in str(rows[completed.resolve()].query_one(HistoricalCoverage).renderable)
+        assert progress_history.region.x - progress_label.region.right <= 1
+        absent_history = rows[absent.resolve()].query_one(HistoricalCoverage)
+        assert absent_history.region.right <= browser.content_region.right
         checkbox = rows[absent.resolve()].query_one(".browser-check", Button)
         assert checkbox.region.width <= 3
         assert checkbox.region.height == 1
         assert all(row.region.height == 1 for row in browser.children)
         queue_row = app.query_one("#queue", ListView).children[0]
         assert "×" in str(queue_row.query_one(Label).renderable)
-        assert "Completed" not in str(queue_row.query_one(Label).renderable)
-        assert "hist 100%" in str(queue_row.query_one(HistoricalCoverage).renderable)
-        assert "100%" in str(queue_row.query_one(ItemProgress).renderable)
+        queue_label = queue_row.query_one(Label)
+        queue_progress = queue_row.query_one(ItemProgress)
+        queue_history = queue_row.query_one(HistoricalCoverage)
+        assert "Completed" not in str(queue_label.renderable)
+        assert "hist 100%" in str(queue_history.renderable)
+        assert "100%" in str(queue_progress.renderable)
+        assert queue_progress.region.x - queue_label.region.right <= 1
+        assert queue_history.region.x - queue_progress.region.right <= 1
     db.close()
 
 
