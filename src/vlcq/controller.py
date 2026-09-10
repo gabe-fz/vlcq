@@ -14,11 +14,18 @@ from .progress import (
 )
 from .queue import QueueService
 from .subtitles import (
+    SubtitleCandidate,
     SubtitleChoice,
+    SubtitleDescriptor,
+    SubtitleDiscovery,
+    SubtitleDiscoveryError,
     SubtitleSnapshot,
     SubtitleTarget,
     SubtitleTrack,
+    associate_sidecars,
+    choose_english_candidate,
     choose_english_track,
+    match_remembered_candidate,
     match_remembered_track,
 )
 from .vlc import VLCClient, VLCError, VLCPlaylistItem, VLCProcess
@@ -73,6 +80,7 @@ class PlaybackController:
         queue: QueueService,
         process: VLCProcess | None = None,
         watched_percent: int | None = None,
+        subtitle_discovery: SubtitleDiscovery | None = None,
     ) -> None:
         self.queue = queue
         self.watched_percent = (
@@ -81,6 +89,9 @@ class PlaybackController:
         if not 1 <= self.watched_percent <= 100:
             raise ValueError("watched threshold must be an integer from 1 through 100")
         self.process = process or VLCProcess()
+        # Keep this injectable so offline probing is testable and so legacy
+        # controller integrations can continue to provide VLC-only behavior.
+        self.subtitle_discovery = subtitle_discovery
         self.client: VLCClient | None = None
         self.status = VLCStatus("unavailable")
         self._poll_task: asyncio.Task[None] | None = None
@@ -105,6 +116,10 @@ class PlaybackController:
         self._subtitle_explicit_done = False
         self._subtitle_explicit_requested = False
         self._subtitle_choice: SubtitleChoice | None = None
+        self._subtitle_attached_paths: set[Path] = set()
+        self._subtitle_sidecar_track_ids: dict[Path, str] = {}
+        self._subtitle_sidecar_baselines: dict[Path, set[str]] = {}
+        self._subtitle_legacy_fallback_paths: set[Path] = set()
         self.subtitle_retry_limit = 3
         self.observation_timeout = 0.75
         self.readiness_timeout = 3.0
@@ -126,6 +141,10 @@ class PlaybackController:
         self._subtitle_explicit_done = False
         self._subtitle_explicit_requested = False
         self._subtitle_choice = None
+        self._subtitle_attached_paths.clear()
+        self._subtitle_sidecar_track_ids.clear()
+        self._subtitle_sidecar_baselines.clear()
+        self._subtitle_legacy_fallback_paths.clear()
         self.subtitle_error = None
 
     def reset_subtitle_policy(self) -> None:
@@ -355,6 +374,14 @@ class PlaybackController:
     sync_playlist_window = synchronize_playlist
     synchronize = synchronize_playlist
 
+    @staticmethod
+    def _subtitle_file_identity(path: Path) -> tuple[int, int, int, int] | None:
+        try:
+            stat = path.resolve(strict=True).stat()
+        except (OSError, RuntimeError):
+            return None
+        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
     def _current_subtitle_target_locked(self) -> SubtitleTarget | None:
         self._ensure_subtitle_generation_state()
         current = self.queue.current()
@@ -371,7 +398,15 @@ class PlaybackController:
         playlist_id = self.active_vlc_id or self.status.playlist_id
         if playlist_id is None and self.status.path is None:
             return None
-        return SubtitleTarget(self._generation, current.id, current.path.resolve(), playlist_id)
+        canonical = current.path.resolve()
+        return SubtitleTarget(
+            self._generation,
+            current.id,
+            canonical,
+            playlist_id,
+            media_identity=self._subtitle_file_identity(canonical),
+            active=True,
+        )
 
     def current_subtitle_target_for_path(self, path: Path) -> SubtitleTarget | None:
         target = self._current_subtitle_target_locked()
@@ -388,6 +423,10 @@ class PlaybackController:
             or target.generation != self._generation
             or target.queue_entry_id != current.id
             or not self._same_path(target.path, current.path)
+            or (
+                target.media_identity is not None
+                and target.media_identity != self._subtitle_file_identity(current.path)
+            )
             or (
                 target.playlist_id is not None
                 and current_target.playlist_id is not None
@@ -432,12 +471,103 @@ class PlaybackController:
         self._validate_subtitle_target_locked(target)
         return SubtitleSnapshot(target, tracks)
 
+    def _planned_offline_choice_locked(
+        self, path: Path, candidates: tuple[SubtitleCandidate, ...]
+    ) -> tuple[SubtitleChoice | None, SubtitleCandidate | None]:
+        database = self.queue.database
+        if database.remember_subtitles_by_show():
+            remembered = database.show_subtitle_preference(path, root=self.queue.root)
+            if remembered is not None:
+                if remembered.mode == "off":
+                    return SubtitleChoice.off(), None
+                match = match_remembered_candidate(remembered, candidates)
+                return (
+                    SubtitleChoice.candidate_choice(match) if match is not None else None,
+                    match,
+                )
+        if not database.prefer_english_subtitles():
+            return None, None
+        english = choose_english_candidate(candidates)
+        return (
+            SubtitleChoice.candidate_choice(english) if english is not None else None,
+            english,
+        )
+
+    def _offline_target_locked(
+        self, path: Path, *, root_generation: int = 0
+    ) -> SubtitleTarget:
+        canonical = path.expanduser().resolve(strict=True)
+        current = self.queue.current()
+        entry_id = 0
+        if current is not None and self._same_path(current.path, canonical):
+            entry_id = current.id
+        else:
+            entry_id = next(
+                (entry.id for entry in self.queue.entries() if self._same_path(entry.path, canonical)),
+                0,
+            )
+        return SubtitleTarget(
+            self._generation,
+            entry_id,
+            canonical,
+            None,
+            root_generation,
+            self._subtitle_file_identity(canonical),
+        )
+
+    async def _offline_candidates_locked(self, target: SubtitleTarget) -> tuple[SubtitleCandidate, ...]:
+        if self.subtitle_discovery is None:
+            return ()
+        root = self.queue.root
+        if root is None:
+            raise VLCError("subtitle discovery requires an active library root")
+        try:
+            candidates = await self.subtitle_discovery.discover(target.path, root)
+        except SubtitleDiscoveryError as exc:
+            raise VLCError(str(exc)) from exc
+        if target.media_identity is not None and target.media_identity != self._subtitle_file_identity(target.path):
+            raise VLCError("subtitle discovery expired because the media file changed")
+        return candidates
+
+    async def discover_subtitles_for_path(
+        self,
+        path: Path,
+        *,
+        root_generation: int = 0,
+        target: SubtitleTarget | None = None,
+    ) -> SubtitleSnapshot:
+        """Inspect an inactive or current row without changing playback."""
+        async with self._transition_lock:
+            actual = target or self._offline_target_locked(path, root_generation=root_generation)
+            current_target = self._current_subtitle_target_locked()
+            tracks: tuple[SubtitleTrack, ...] = ()
+            if current_target is not None and self._same_path(current_target.path, actual.path):
+                actual = SubtitleTarget(
+                    actual.generation,
+                    actual.queue_entry_id,
+                    actual.path,
+                    current_target.playlist_id,
+                    actual.root_generation,
+                    actual.media_identity,
+                    True,
+                )
+                current_snapshot = await self._subtitle_tracks_locked(current_target)
+                tracks = current_snapshot.tracks
+            candidates = await self._offline_candidates_locked(actual)
+            planned_choice, planned = self._planned_offline_choice_locked(actual.path, candidates)
+            return SubtitleSnapshot(actual, tracks, candidates, planned, None, planned_choice)
+
     async def discover_subtitles(self, target: SubtitleTarget | None = None) -> SubtitleSnapshot:
         async with self._transition_lock:
             actual = target or self._current_subtitle_target_locked()
             if actual is None:
                 raise VLCError("subtitle selection requires the validated current media")
-            return await self._subtitle_tracks_locked(actual)
+            current = await self._subtitle_tracks_locked(actual)
+            if self.subtitle_discovery is None:
+                return current
+            candidates = await self._offline_candidates_locked(actual)
+            planned_choice, planned = self._planned_offline_choice_locked(actual.path, candidates)
+            return SubtitleSnapshot(actual, current.tracks, candidates, planned, None, planned_choice)
 
     async def _issue_subtitle_locked(
         self, target: SubtitleTarget, track_id: str | None
@@ -488,6 +618,181 @@ class PlaybackController:
         if active_ids != [track_id]:
             raise VLCError("VLC reported inconsistent active subtitle metadata")
 
+    async def select_inactive_subtitle(
+        self, target: SubtitleTarget, choice: SubtitleChoice
+    ) -> SubtitleChoice:
+        """Remember an offline choice without launching VLC or changing queue state."""
+        async with self._transition_lock:
+            if target.root_generation < 0:
+                raise VLCError("subtitle action expired after the library root changed")
+            if target.media_identity is not None and target.media_identity != self._subtitle_file_identity(target.path):
+                raise VLCError("subtitle action expired because the media file changed")
+            root = self.queue.root
+            if root is None:
+                raise VLCError("subtitle preference requires an active library root")
+            try:
+                media = target.path.expanduser().resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise VLCError("subtitle target is unavailable") from exc
+            if not media.is_file() or not is_beneath(media, root):
+                raise VLCError("subtitle target is outside the active library root")
+            if (
+                target.media_identity is not None
+                and target.media_identity != self._subtitle_file_identity(media)
+            ):
+                raise VLCError("subtitle action expired because the media file changed")
+            if choice.candidate is not None:
+                candidate = choice.candidate
+                if candidate.media_identity is not None and candidate.media_identity != target.media_identity:
+                    raise VLCError("subtitle choice belongs to a different media file")
+                if candidate.source == "sidecar":
+                    if candidate.path is None or candidate.sidecar_identity is None:
+                        raise VLCError("subtitle sidecar identity is unavailable")
+                    sidecar = candidate.path.expanduser().resolve(strict=True)
+                    if (
+                        candidate.sidecar_identity != self._subtitle_file_identity(sidecar)
+                        or sidecar not in associate_sidecars(media, root)
+                    ):
+                        raise VLCError("subtitle sidecar changed or is no longer associated")
+            if not self.queue.database.remember_subtitles_by_show():
+                raise VLCError("enable Remember subtitles by show to save an inactive choice")
+            saved = await self._run_database_operation(
+                lambda: self.queue.database.upsert_subtitle_preference(
+                    target.path, choice.descriptor(), root=root
+                )
+            )
+            if not saved:
+                raise VLCError("show identity is uncertain; inactive choice was not saved")
+            return choice
+
+    async def _attach_sidecar_locked(
+        self,
+        target: SubtitleTarget,
+        candidate: SubtitleCandidate,
+        previous_ids: set[str] | None = None,
+    ) -> None:
+        if candidate.source != "sidecar" or candidate.path is None:
+            raise VLCError("subtitle sidecar identity is unavailable")
+        root = self.queue.root
+        if root is None:
+            raise VLCError("subtitle sidecar requires an active library root")
+        try:
+            sidecar = candidate.path.expanduser().resolve(strict=True)
+            video = target.path.expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise VLCError("subtitle sidecar is no longer available") from exc
+        if not sidecar.is_file() or not is_beneath(sidecar, root):
+            raise VLCError("subtitle sidecar is outside the active library root")
+        if (
+            candidate.sidecar_identity is not None
+            and candidate.sidecar_identity != self._subtitle_file_identity(sidecar)
+        ):
+            raise VLCError("subtitle sidecar changed or is no longer associated")
+        if sidecar.suffix.casefold() not in {".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".sup"}:
+            raise VLCError("subtitle sidecar format is not supported")
+        try:
+            siblings = associate_sidecars(video, root)
+        except (SubtitleDiscoveryError, OSError, RuntimeError) as exc:
+            raise VLCError("subtitle sidecar could not be revalidated") from exc
+        if sidecar not in siblings:
+            raise VLCError("subtitle sidecar changed or is no longer associated")
+        if sidecar in self._subtitle_attached_paths:
+            return
+        client = self.client
+        if client is None:
+            raise VLCError("VLC is not connected")
+        method = getattr(client, "add_subtitle", None)
+        if not callable(method):
+            raise VLCError("VLC sidecar subtitle controls are unavailable")
+        if previous_ids is not None:
+            self._subtitle_sidecar_baselines[sidecar] = set(previous_ids)
+        response = await method(sidecar)
+        if not isinstance(response, VLCStatus) or response.state == "unavailable":
+            raise VLCError("VLC rejected the subtitle sidecar")
+        self._validate_subtitle_target_locked(target)
+        self._subtitle_attached_paths.add(sidecar)
+
+    async def _fallback_sidecar_path_locked(
+        self, target: SubtitleTarget, candidate: SubtitleCandidate
+    ) -> None:
+        if candidate.path is None or candidate.path in self._subtitle_legacy_fallback_paths:
+            return
+        client = self.client
+        method = getattr(client, "add_subtitle_path", None) if client is not None else None
+        if not callable(method):
+            return
+        self._subtitle_legacy_fallback_paths.add(candidate.path)
+        response = await method(candidate.path)
+        if not isinstance(response, VLCStatus) or response.state == "unavailable":
+            raise VLCError("VLC rejected the subtitle sidecar fallback")
+        self._validate_subtitle_target_locked(target)
+
+    @staticmethod
+    def _existing_sidecar_track(
+        candidate: SubtitleCandidate, tracks: tuple[SubtitleTrack, ...]
+    ) -> SubtitleTrack | None:
+        if candidate.source != "sidecar":
+            return None
+        variant = candidate.sidecar_variant.casefold() if candidate.sidecar_variant else None
+        for track in tracks:
+            if track.source == "sidecar":
+                return track
+            if variant is not None and track.title is not None and variant in track.title.casefold():
+                return track
+        return None
+
+    def _match_candidate_to_track(
+        self,
+        candidate: SubtitleCandidate,
+        tracks: tuple[SubtitleTrack, ...],
+        previous_ids: set[str] | None = None,
+    ) -> SubtitleTrack | None:
+        descriptor = candidate.descriptor()
+        if candidate.source == "sidecar":
+            # VLC reports a newly attached sidecar as an ordinary current track;
+            # its source/path is not a portable VLC identifier.
+            descriptor = SubtitleDescriptor(
+                "track",
+                candidate.language,
+                candidate.full_dialogue,
+                candidate.signs_songs,
+                candidate.forced,
+                candidate.sdh,
+                2,
+                None,
+                None,
+            )
+        if candidate.source == "sidecar":
+            known_id = self._subtitle_sidecar_track_ids.get(candidate.path) if candidate.path else None
+            if known_id is not None:
+                known = next((track for track in tracks if track.track_id == known_id), None)
+                if known is not None:
+                    return known
+            baseline = self._subtitle_sidecar_baselines.get(candidate.path) if candidate.path else None
+            if baseline is None:
+                baseline = previous_ids
+            if baseline is not None:
+                added = [track for track in tracks if track.track_id not in baseline]
+                if len(added) == 1:
+                    return added[0]
+                unknown = [
+                    track
+                    for track in tracks
+                    if track.language is None
+                    and track.title is None
+                    and all(value is None for value in (
+                        track.full_dialogue,
+                        track.signs_songs,
+                        track.forced,
+                        track.sdh,
+                    ))
+                ]
+                if len(unknown) == 1:
+                    return unknown[0]
+            if candidate.path in self._subtitle_attached_paths:
+                return None
+        return match_remembered_track(descriptor, tracks)
+
     async def select_subtitle(
         self, target: SubtitleTarget, choice: SubtitleChoice
     ) -> SubtitleChoice:
@@ -501,17 +806,54 @@ class PlaybackController:
             self._ensure_subtitle_generation_state()
             try:
                 snapshot = await self._subtitle_tracks_locked(target)
+                persist_choice = choice
                 selected = choice
                 if choice.mode == "track":
-                    assert choice.track is not None
-                    fresh = next(
-                        (track for track in snapshot.tracks if track.track_id == choice.track.track_id),
-                        None,
-                    )
-                    if fresh is None:
-                        raise VLCError("subtitle choice is no longer available")
-                    selected = SubtitleChoice.track_choice(fresh)
-                    track_id = fresh.track_id
+                    if choice.candidate is not None:
+                        candidate = choice.candidate
+                        previous_ids = {track.track_id for track in snapshot.tracks}
+                        existing_sidecar = self._existing_sidecar_track(candidate, snapshot.tracks)
+                        fresh = existing_sidecar
+                        if candidate.source == "sidecar" and existing_sidecar is None:
+                            await self._attach_sidecar_locked(target, candidate, previous_ids)
+                            for attempt in range(self.subtitle_retry_limit):
+                                snapshot = await self._subtitle_tracks_locked(target)
+                                fresh = self._match_candidate_to_track(
+                                    candidate, snapshot.tracks, previous_ids
+                                )
+                                if (
+                                    fresh is None
+                                    and attempt == 0
+                                    and candidate.source == "sidecar"
+                                ):
+                                    await self._fallback_sidecar_path_locked(target, candidate)
+                                    snapshot = await self._subtitle_tracks_locked(target)
+                                    fresh = self._match_candidate_to_track(
+                                        candidate, snapshot.tracks, previous_ids
+                                    )
+                                if fresh is not None or attempt + 1 >= self.subtitle_retry_limit:
+                                    break
+                                await asyncio.sleep(0.1 * (attempt + 1))
+                        elif fresh is None:
+                            fresh = self._match_candidate_to_track(
+                                candidate, snapshot.tracks, previous_ids
+                            )
+                        if fresh is None:
+                            raise VLCError("subtitle choice is no longer available in VLC")
+                        selected = SubtitleChoice.track_choice(fresh)
+                        if candidate.source == "sidecar" and candidate.path is not None:
+                            self._subtitle_sidecar_track_ids[candidate.path] = fresh.track_id
+                        track_id = fresh.track_id
+                    else:
+                        assert choice.track is not None
+                        fresh = next(
+                            (track for track in snapshot.tracks if track.track_id == choice.track.track_id),
+                            None,
+                        )
+                        if fresh is None:
+                            raise VLCError("subtitle choice is no longer available")
+                        selected = SubtitleChoice.track_choice(fresh)
+                        track_id = fresh.track_id
                 else:
                     track_id = None
                 await self._issue_subtitle_locked(target, track_id)
@@ -524,10 +866,9 @@ class PlaybackController:
             self._subtitle_choice = selected
             self.subtitle_error = None
             if self.queue.database.remember_subtitles_by_show():
-                descriptor = selected.descriptor()
                 await self._run_database_operation(
                     lambda: self.queue.database.upsert_subtitle_preference(
-                        target.path, descriptor, root=self.queue.root
+                        target.path, persist_choice.descriptor(), root=self.queue.root
                     )
                 )
             return selected
@@ -568,15 +909,42 @@ class PlaybackController:
             snapshot = await self._subtitle_tracks_locked(target)
             if self._subtitle_explicit_requested:
                 return None
-            if not snapshot.tracks:
+            if not snapshot.tracks and self.subtitle_discovery is None:
                 if self._subtitle_attempts >= self.subtitle_retry_limit:
                     self._subtitle_automatic_done = True
                 return None
-            choice = self._automatic_choice_locked(target.path, snapshot.tracks)
+            if self.subtitle_discovery is not None:
+                candidates = await self._offline_candidates_locked(target)
+                choice, candidate = self._planned_offline_choice_locked(target.path, candidates)
+            else:
+                choice = self._automatic_choice_locked(target.path, snapshot.tracks)
+                candidate = None
             if choice is None:
                 self._subtitle_automatic_done = True
                 self.subtitle_error = None
                 return None
+            if choice.mode == "track" and candidate is not None:
+                previous_ids = {track.track_id for track in snapshot.tracks}
+                existing_sidecar = self._existing_sidecar_track(candidate, snapshot.tracks)
+                if candidate.source == "sidecar" and existing_sidecar is None:
+                    await self._attach_sidecar_locked(target, candidate, previous_ids)
+                    snapshot = await self._subtitle_tracks_locked(target)
+                matched = existing_sidecar or self._match_candidate_to_track(
+                    candidate, snapshot.tracks, previous_ids
+                )
+                if matched is None and candidate.source == "sidecar":
+                    await self._fallback_sidecar_path_locked(target, candidate)
+                    snapshot = await self._subtitle_tracks_locked(target)
+                    matched = self._match_candidate_to_track(
+                        candidate, snapshot.tracks, previous_ids
+                    )
+                if matched is None:
+                    if self._subtitle_attempts >= self.subtitle_retry_limit:
+                        self._subtitle_automatic_done = True
+                    return None
+                choice = SubtitleChoice.track_choice(matched)
+                if candidate.source == "sidecar" and candidate.path is not None:
+                    self._subtitle_sidecar_track_ids[candidate.path] = matched.track_id
             await self._issue_subtitle_locked(
                 target, None if choice.mode == "off" else choice.track.track_id  # type: ignore[union-attr]
             )

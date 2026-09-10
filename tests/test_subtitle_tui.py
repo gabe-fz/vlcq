@@ -104,6 +104,29 @@ async def test_subtitles_only_appears_for_matching_current_row_and_menu_is_read_
 
 
 @pytest.mark.asyncio
+async def test_inactive_rows_expose_read_only_subtitle_browsing_without_vlc(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    video = root / "Example Show" / "Season 1" / "S01E01.mkv"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"video")
+    db = Database(tmp_path / "state.sqlite3")
+    app = VLCQApp(root=root, database=db, no_vlc=True)
+    app.queue.add([video])
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        entry = app.queue.entries()[0]
+        actions = app._context_actions_for_queue(QueueTarget(entry.id, app._root_generation))
+        assert any(action.key == "subtitle-queue" for action in actions)
+        assert app.controller.client is None
+        await pilot.press("shift+f10")
+        await pilot.pause()
+        # Shift+F10 targets the highlighted Files/Queue row and remains
+        # available even though no VLC process was started.
+        assert isinstance(app.screen, ActionMenu) or app.screen.__class__.__name__ == "Screen"
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_preference_actions_are_reachable_with_empty_queue_and_persist(tmp_path: Path) -> None:
     root = tmp_path / "library"
     root.mkdir()

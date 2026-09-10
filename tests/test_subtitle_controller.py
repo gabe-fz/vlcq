@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -10,7 +11,12 @@ from vlcq.controller import PlaybackController
 from vlcq.database import Database
 from vlcq.models import VLCStatus
 from vlcq.queue import QueueService
-from vlcq.subtitles import SubtitleChoice, SubtitleDescriptor, SubtitleTrack
+from vlcq.subtitles import (
+    SubtitleChoice,
+    SubtitleDescriptor,
+    SubtitleDiscovery,
+    SubtitleTrack,
+)
 from vlcq.vlc import VLCError, VLCPlaylistItem
 
 
@@ -157,6 +163,76 @@ async def test_reported_active_state_must_confirm_subtitle_command(tmp_path: Pat
     assert client.selected == ["1"]
     assert controller.status.state == "playing"
     assert db.show_subtitle_preference(target.path, root=controller.queue.root) is None
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_inactive_choice_persists_semantically_without_vlc(tmp_path: Path) -> None:
+    db, queue, controller, client, video = setup(tmp_path)
+    sidecar = video.with_name("S01E01.en.whisper.srt")
+    sidecar.write_text("not read")
+
+    class Probe:
+        async def probe(self, path: Path) -> tuple[dict[str, object], ...]:
+            assert path == video.resolve()
+            return ()
+
+    # The fake probe is only needed to exercise the controller boundary; the
+    # sidecar is associated from its immediate sibling name without reading it.
+    controller.subtitle_discovery = SubtitleDiscovery(Probe(), root=queue.root)
+    db.set_remember_subtitles_by_show(True)
+    snapshot = await controller.discover_subtitles_for_path(video)
+    candidate = next(item for item in snapshot.candidates if item.path == sidecar.resolve())
+    before = [(entry.id, entry.position, entry.state) for entry in queue.entries()]
+    selected = await controller.select_inactive_subtitle(
+        snapshot.target, SubtitleChoice.candidate_choice(candidate)
+    )
+    assert selected.candidate == candidate
+    assert client.selected == []
+    assert [(entry.id, entry.position, entry.state) for entry in queue.entries()] == before
+    descriptor = db.show_subtitle_preference(video, root=queue.root)
+    assert descriptor is not None
+    assert descriptor.source == "sidecar" and descriptor.sidecar_variant == "whisper"
+    assert str(video) not in json.dumps(descriptor.to_dict())
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_sidecar_application_revalidates_and_avoids_duplicate_attachment(tmp_path: Path) -> None:
+    db, queue, controller, client, video = setup(tmp_path)
+    sidecar = video.with_name("S01E01.en.whisper.srt")
+    sidecar.write_text("not read")
+
+    class Probe:
+        async def probe(self, path: Path) -> tuple[dict[str, object], ...]:
+            del path
+            return ()
+
+    attached: list[Path] = []
+
+    async def add_subtitle(path: Path) -> VLCStatus:
+        attached.append(path)
+        client.tracks = (*client.tracks, SubtitleTrack("4", "en", None, None, None, None, None, None, 3))
+        return VLCStatus("playing", path=video.resolve(), playlist_id="vlc-1")
+
+    client.add_subtitle = add_subtitle  # type: ignore[attr-defined]
+    controller.subtitle_discovery = SubtitleDiscovery(Probe(), root=queue.root)
+    db.set_prefer_english_subtitles(False)
+    await controller.play_index(0)
+    snapshot = await controller.discover_subtitles()
+    candidate = next(item for item in snapshot.candidates if item.path == sidecar.resolve())
+    selected = await controller.select_subtitle(
+        snapshot.target, SubtitleChoice.candidate_choice(candidate)
+    )
+    assert selected.track is not None and selected.track.track_id == "4"
+    assert attached == [sidecar.resolve()]
+    client.tracks = tuple(track for track in client.tracks if track.track_id != "4")
+    sidecar.write_text("changed")
+    with pytest.raises(VLCError, match="sidecar changed"):
+        await controller.select_subtitle(
+            snapshot.target, SubtitleChoice.candidate_choice(candidate)
+        )
+    assert attached == [sidecar.resolve()]
     db.close()
 
 

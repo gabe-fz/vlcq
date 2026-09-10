@@ -268,6 +268,36 @@ async def test_client_subtitle_operations_use_exact_vlc3_parameters() -> None:
 
 
 @pytest.mark.asyncio
+async def test_client_addsubtitle_validates_root_and_uses_canonical_uri(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    sidecar = root / "Episode.en.whisper.srt"
+    sidecar.write_text("not read")
+    outside = tmp_path / "outside.srt"
+    outside.write_text("outside")
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"state": "playing"},
+            headers={"content-type": "application/json"},
+        )
+
+    client = VLCClient(9999, "secret", transport=httpx.MockTransport(handler))
+    await client.add_subtitle(sidecar, root=root)
+    assert requests[-1].url.params["command"] == "addsubtitle"
+    assert requests[-1].url.params["val"] == sidecar.resolve().as_uri()
+    with pytest.raises(VLCError, match="outside"):
+        await client.add_subtitle(outside, root=root)
+    (root / "Episode.txt").write_text("not subtitle")
+    with pytest.raises(VLCError, match="unavailable"):
+        await client.add_subtitle(root / "Episode.txt", root=root)
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_client_auth_commands_and_no_redirects(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 

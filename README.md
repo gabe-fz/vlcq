@@ -7,7 +7,9 @@ successor, and stores private queue and playback state in SQLite.
 
 ## Install and run
 
-Requires Python 3.12+ and VLC 3 at `/Applications/VLC.app` or as `vlc` on `PATH`.
+Requires Python 3.12+, FFmpeg `ffprobe`, and VLC 3 at `/Applications/VLC.app` or as `vlc` on `PATH`.
+Install FFmpeg on macOS with `brew install ffmpeg`; `vlcq doctor` reports whether the
+local inspector is ready.
 
 ```sh
 python3 -m venv .venv
@@ -23,6 +25,8 @@ vlcq play ~/Videos/Show
 vlcq play ~/Videos/Show/e01.mkv ~/Videos/Show/e02.mkv
 vlcq add ~/Videos/Show/e03.mkv
 vlcq resume
+vlcq doctor
+vlcq inspect-subtitles --root ~/Videos ~/Videos/Show/e01.mkv --json
 vlcq progress --root ~/Videos --json
 ```
 
@@ -38,9 +42,9 @@ their one-line headers and Queue application menu remain reachable.
 
 The Files header provides **Open**, **Search/filter**, **Add**, and an overflow menu. The
 Queue header provides removal, reorder, clear actions, and an overflow menu. Right-click
-opens row-specific actions; `Shift+F10` is the keyboard menu fallback. Matching current
-Files and Queue rows also provide **Subtitles…**; inactive or stale rows do not, and
-opening any menu never loads or probes media. Queue overflow always provides **Reconnect**,
+opens row-specific actions; `Shift+F10` is the keyboard menu fallback. Every supported
+Files and Queue video row provides **Subtitles…**, including inactive rows; opening it
+performs bounded local inspection without loading, enqueueing, or playing media. Queue overflow always provides **Reconnect**,
 **Help**, **Quit**, **Remember subtitles by show**, and **Prefer English subtitles**, even
 with an empty queue or no selected row. Queue **Details** is available on demand and is
 not a persistent player panel.
@@ -109,10 +113,15 @@ duplicate process/poll loop and never selects, loads, or autoplays media.
 
 ### Subtitle selection and preferences
 
-**Subtitles…** lists `Off` and only the tracks reported by the current owned VLC
-playback generation. Track IDs are used only for that immediate command; remembered
-choices store language and recognized full-dialogue, signs/songs, forced, and SDH
-characteristics so IDs and per-episode titles can change. The supported VLC 3 macOS
+**Subtitles…** lists `Off`, embedded streams discovered by local `ffprobe`, and immediate
+same-stem sidecars (`.srt`, `.ass`, `.ssa`, `.vtt`, `.sub/.idx`, `.sup`). Sidecars such as
+`Episode.en.whisper.srt` are associated only with the sibling video; hidden, unrelated,
+missing, non-regular, and root-escaping files are ignored. Choices made before playback
+are whole-show preferences when remembering is enabled and planned choices are marked
+separately from VLC-confirmed active choices. Track IDs are used only for that immediate
+command; remembered choices store language, source, sidecar variant, and recognized
+full-dialogue, signs/songs, forced, and SDH characteristics so IDs, paths, and per-episode
+titles can change. The supported VLC 3 macOS
 status response does not identify its initially selected subtitle stream, so the picker
 truthfully marks **VLC current/default · exact track not reported** as active until vlcq
 successfully applies a generation-local track or Off choice. VLC payload variants that
@@ -127,7 +136,8 @@ Show inference is deliberately conservative: season folders or explicit `S01E02`
 `1x02`, and `Episode 02` filename evidence are accepted, while generic names, unsafe
 paths, and ambiguous root-level files are not. Preferences are scoped by a hash of the
 canonical library root and show identity; absolute media paths are not stored in the
-subtitle preference table. Discovery and selection use only the authenticated
+subtitle preference table. Offline inspection uses only the canonical media URI, a shell-free bounded `ffprobe`
+subprocess, and no subtitle-content reads. Discovery and selection use only the authenticated
 127.0.0.1 VLC HTTP endpoint. Delayed tracks, stale menus, rejected commands, and
 reconnects fail with bounded notices while playback continues.
 
@@ -234,10 +244,11 @@ requests and never deletes, moves, copies, or edits media.
 .venv/bin/pytest
 .venv/bin/ruff check .
 .venv/bin/mypy src
-openspec validate subtitle-selection-preferences --strict
+openspec validate browse-subtitles-before-playback --strict
 VLCQ_REAL_VLC=1 .venv/bin/pytest tests/test_integration_real_vlc.py
 ```
 
 The normal suite uses mock VLC and Textual's headless Pilot. Real-VLC tests generate only
-temporary media and state, verify VLC 3 timing/rate assumptions and native transitions,
+temporary media and state, verify VLC 3 timing/rate assumptions, subtitle discovery/attachment,
+and native transitions,
 and cleanly stop the owned process. An environment-dependent skip is not release evidence.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import struct
 import subprocess
 import wave
@@ -12,7 +13,7 @@ import pytest
 from vlcq.controller import PlaybackController
 from vlcq.database import Database
 from vlcq.queue import QueueService
-from vlcq.subtitles import SubtitleChoice
+from vlcq.subtitles import FFProbeAdapter, SubtitleChoice, SubtitleDiscovery
 from vlcq.vlc import VLCError, VLCProcess
 
 
@@ -304,6 +305,103 @@ async def test_real_vlc_temporary_media_play_seek_pause_stop_and_reconnect(
         assert queue.current() is not None
         assert queue.current().id == saved_current.id
         assert queue.current().state == "stopped"
+    finally:
+        await controller.stop()
+        database.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    os.environ.get("VLCQ_REAL_VLC") != "1",
+    reason="set VLCQ_REAL_VLC=1 for installed VLC 3 subtitle smoke test",
+)
+async def test_real_vlc_generated_embedded_sidecar_discovery_selection_off(
+    tmp_path: Path,
+) -> None:
+    """Exercise offline discovery and VLC 3 sidecar attachment on disposable media."""
+    executable = Path("/Applications/VLC.app/Contents/MacOS/VLC")
+    if not executable.is_file():
+        pytest.fail("VLCQ_REAL_VLC=1 requires an installed VLC 3 application")
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if ffmpeg is None or ffprobe is None:
+        pytest.fail("VLCQ_REAL_VLC=1 requires ffmpeg and ffprobe")
+    media = tmp_path / "GeneratedShow" / "Episode01.mkv"
+    media.parent.mkdir(parents=True)
+    embedded = media.with_name("embedded.srt")
+    embedded.write_text("1\n00:00:00,000 --> 00:00:02,000\nembedded dialogue\n")
+    sidecar = media.with_name("Episode01.en.whisper.srt")
+    sidecar.write_text("1\n00:00:00,000 --> 00:00:02,000\nsidecar dialogue\n")
+    result = await asyncio.to_thread(
+        subprocess.run,
+        [
+            ffmpeg,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=320x240:r=10",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=8000:cl=mono",
+            "-i",
+            str(embedded),
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-map",
+            "2:0",
+            "-t",
+            "8",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            "-c:s",
+            "subrip",
+            "-metadata:s:s:0",
+            "language=eng",
+            "-metadata:s:s:0",
+            "title=Embedded Full Dialogue",
+            str(media),
+        ],
+        check=False,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    database = Database(tmp_path / "subtitle-integration.sqlite3")
+    queue = QueueService(database)
+    queue.open(tmp_path)
+    queue.add([media])
+    database.set_prefer_english_subtitles(False)
+    discovery = SubtitleDiscovery(FFProbeAdapter(ffprobe), root=tmp_path)
+    controller = PlaybackController(
+        queue,
+        process=VLCProcess(executable),
+        subtitle_discovery=discovery,
+    )
+    try:
+        offline = await controller.discover_subtitles_for_path(media)
+        assert any(candidate.source == "embedded" for candidate in offline.candidates)
+        assert any(candidate.path == sidecar for candidate in offline.candidates)
+        await controller.start()
+        await controller.play_index(0)
+        snapshot = await controller.discover_subtitles()
+        sidecar_candidate = next(
+            candidate for candidate in snapshot.candidates if candidate.path == sidecar
+        )
+        selected = await controller.select_subtitle(
+            snapshot.target, SubtitleChoice.candidate_choice(sidecar_candidate)
+        )
+        assert selected.mode == "track"
+        assert controller.client is not None
+        assert (await controller.client.status()).path == media.resolve()
+        await controller.select_subtitle(snapshot.target, SubtitleChoice.off())
+        assert controller.current_subtitle_choice == SubtitleChoice.off()
+        assert (await controller.client.status()).path == media.resolve()
+        assert media.is_file() and sidecar.is_file()
     finally:
         await controller.stop()
         database.close()

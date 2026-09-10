@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import inspect
 import json
 import sqlite3
@@ -9,12 +10,13 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from .config import database_path, resolve_watched_percent
+from .config import database_path, ffprobe_diagnostic, resolve_watched_percent
 from .database import Database, DatabaseMigrationError
 from .finder import resolve_handoff
 from .ipc import ControllerBusy, ControllerLock
 from .paths import PathError, canonical_root, common_root, validate_video
 from .queue import QueueService
+from .subtitles import SubtitleDiscovery
 from .tui import VLCQApp
 
 
@@ -38,6 +40,14 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("resume", help="resume the most recent queue").add_argument(
         "--no-vlc", action="store_true"
     )
+    doctor = sub.add_parser("doctor", help="diagnose local vlcq dependencies")
+    doctor.add_argument("--json", action="store_true", help="print a machine-readable diagnostic")
+    inspect_subtitles = sub.add_parser(
+        "inspect-subtitles", aliases=["inspect"], help="inspect local subtitles without starting VLC"
+    )
+    inspect_subtitles.add_argument("path", type=Path)
+    inspect_subtitles.add_argument("--root", required=True, type=Path)
+    inspect_subtitles.add_argument("--json", action="store_true", help="print a machine-readable document")
     progress = sub.add_parser("progress", help="export playback progress")
     progress.add_argument("--root", required=True, type=Path)
     progress.add_argument("--json", action="store_true", required=True)
@@ -92,6 +102,45 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Resolve policy before opening the database so a bad environment
         # setting cannot mutate queue, history, or media state.
         watched_percent = resolve_watched_percent()
+        if args.command == "doctor":
+            ready, message = ffprobe_diagnostic()
+            if args.json:
+                print(json.dumps({"ffprobe": ready, "message": message}, sort_keys=True))
+            else:
+                print(message)
+            return 0 if ready else 2
+        if args.command in {"inspect-subtitles", "inspect"}:
+            inspect_root = canonical_root(args.root)
+            path = validate_video(args.path, inspect_root)
+            candidates = asyncio.run(SubtitleDiscovery(root=inspect_root).discover(path))
+            inspect_document: list[dict[str, object]] = [
+                {
+                    "source": candidate.source,
+                    "language": candidate.language,
+                    "title": candidate.title,
+                    "variant": candidate.sidecar_variant,
+                    "characteristics": list(candidate.characteristics),
+                }
+                for candidate in candidates
+            ]
+            if args.json:
+                print(json.dumps(inspect_document, sort_keys=True))
+            else:
+                for item in inspect_document:
+                    raw_traits = item["characteristics"]
+                    traits = raw_traits if isinstance(raw_traits, list) else []
+                    label = " · ".join(
+                        str(value)
+                        for value in (
+                            item["source"],
+                            item["language"] or "unknown language",
+                            item["variant"] or item["title"] or "unnamed",
+                            ", ".join(value for value in traits if isinstance(value, str)),
+                        )
+                        if value
+                    )
+                    print(label)
+            return 0
         if args.command == "progress":
             progress_root = canonical_root(args.root)
             database = Database(db_path)

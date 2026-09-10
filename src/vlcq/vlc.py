@@ -15,8 +15,8 @@ from typing import cast
 import httpx
 
 from .models import VLCStatus
-from .paths import PathError, file_uri_to_path
-from .subtitles import SubtitleError, SubtitleTrack
+from .paths import PathError, canonical_root, file_uri_to_path, is_beneath
+from .subtitles import SIDECAR_EXTENSIONS, SubtitleError, SubtitleTrack
 from .subtitles import parse_subtitle_tracks as _parse_subtitle_tracks
 
 
@@ -307,6 +307,7 @@ class VLCClient:
             "seek",
             "rate",
             "subtitle_track",
+            "addsubtitle",
         }
         if command not in allowed:
             raise VLCError("unsupported VLC command")
@@ -352,6 +353,36 @@ class VLCClient:
 
     async def disable_subtitles(self) -> VLCStatus:
         return await self.select_subtitle(None)
+
+    @staticmethod
+    def _validated_sidecar_path(path: Path, root: Path | None = None) -> Path:
+        try:
+            canonical = path.expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise VLCError("subtitle sidecar is unavailable") from exc
+        if not canonical.is_file() or canonical.suffix.casefold() not in SIDECAR_EXTENSIONS:
+            raise VLCError("subtitle sidecar is unavailable")
+        if root is not None:
+            try:
+                base = canonical_root(root)
+            except PathError as exc:
+                raise VLCError("subtitle sidecar root is unavailable") from exc
+            if not is_beneath(canonical, base):
+                raise VLCError("subtitle sidecar is outside the active library root")
+        return canonical
+
+    async def add_subtitle(self, path: Path, root: Path | None = None) -> VLCStatus:
+        """Attach one freshly validated root-confined sidecar to VLC 3."""
+        canonical = self._validated_sidecar_path(path, root)
+        return await self.command("addsubtitle", val=canonical.as_uri())
+
+    async def add_subtitle_path(self, path: Path, root: Path | None = None) -> VLCStatus:
+        """Compatibility fallback for VLC 3 builds that reject file: MRLs."""
+        canonical = self._validated_sidecar_path(path, root)
+        return await self.command("addsubtitle", val=str(canonical))
+
+    addsubtitle = add_subtitle
+    attach_subtitle = add_subtitle
 
     async def play(self, path: Path) -> VLCStatus:
         canonical = self._validated_media_path(path)

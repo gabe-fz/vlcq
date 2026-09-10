@@ -9,7 +9,10 @@ from pathlib import Path
 
 COVERAGE_QUALIFICATION_SECONDS = 5.0
 COVERAGE_MAX_GAP_SECONDS = 5.0
-COVERAGE_POSITION_TOLERANCE_MS = 1_000
+# VLC 3 reports integer-second positions; allow one media second plus a
+# bounded request/poll scheduling margin so a 1.0s sample interval does not
+# reset on a 20-50ms HTTP timing slip.
+COVERAGE_POSITION_TOLERANCE_MS = 1_250
 COVERAGE_MAX_REQUEST_SECONDS = 2.0
 
 

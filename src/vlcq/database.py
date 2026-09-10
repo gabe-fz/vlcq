@@ -175,13 +175,40 @@ class Database:
                     "CREATE TABLE subtitle_preferences("
                     "show_key_hash TEXT PRIMARY KEY, descriptor_version INTEGER NOT NULL, "
                     "descriptor_json TEXT NOT NULL, updated_at TEXT NOT NULL, "
-                    "CHECK(descriptor_version=1), CHECK(length(descriptor_json)<=4096))"
+                    "CHECK(descriptor_version IN (1,2)), CHECK(length(descriptor_json)<=4096))"
                 ),
                 "INSERT INTO settings(key,value) VALUES('remember_subtitles_by_show','0')",
                 "INSERT INTO settings(key,value) VALUES('prefer_english_subtitles','1')",
             ),
             SCHEMA_VERSION,
         )
+
+    def _upgrade_subtitle_descriptor_constraint(self) -> None:
+        row = self.connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='subtitle_preferences'"
+        ).fetchone()
+        definition = str(row[0]) if row and row[0] is not None else ""
+        if "descriptor_version=1" not in definition.replace(" ", "").lower():
+            return
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            self.connection.execute("ALTER TABLE subtitle_preferences RENAME TO subtitle_preferences_old")
+            self.connection.execute(
+                "CREATE TABLE subtitle_preferences("
+                "show_key_hash TEXT PRIMARY KEY, descriptor_version INTEGER NOT NULL, "
+                "descriptor_json TEXT NOT NULL, updated_at TEXT NOT NULL, "
+                "CHECK(descriptor_version IN (1,2)), CHECK(length(descriptor_json)<=4096))"
+            )
+            self.connection.execute(
+                "INSERT INTO subtitle_preferences "
+                "SELECT show_key_hash,descriptor_version,descriptor_json,updated_at "
+                "FROM subtitle_preferences_old"
+            )
+            self.connection.execute("DROP TABLE subtitle_preferences_old")
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
 
     def _migrate(self) -> None:
         version = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
@@ -207,7 +234,7 @@ class Database:
                             "CREATE TABLE subtitle_preferences("
                             "show_key_hash TEXT PRIMARY KEY, descriptor_version INTEGER NOT NULL, "
                             "descriptor_json TEXT NOT NULL, updated_at TEXT NOT NULL, "
-                            "CHECK(descriptor_version=1), CHECK(length(descriptor_json)<=4096))"
+                            "CHECK(descriptor_version IN (1,2)), CHECK(length(descriptor_json)<=4096))"
                         ),
                         "INSERT INTO settings(key,value) VALUES('remember_subtitles_by_show','0')",
                         "INSERT INTO settings(key,value) VALUES('prefer_english_subtitles','1')",
@@ -229,7 +256,7 @@ class Database:
                             "CREATE TABLE subtitle_preferences("
                             "show_key_hash TEXT PRIMARY KEY, descriptor_version INTEGER NOT NULL, "
                             "descriptor_json TEXT NOT NULL, updated_at TEXT NOT NULL, "
-                            "CHECK(descriptor_version=1), CHECK(length(descriptor_json)<=4096))"
+                            "CHECK(descriptor_version IN (1,2)), CHECK(length(descriptor_json)<=4096))"
                         ),
                         "INSERT INTO settings(key,value) VALUES('remember_subtitles_by_show','0')",
                         "INSERT INTO settings(key,value) VALUES('prefer_english_subtitles','1')",
@@ -243,13 +270,15 @@ class Database:
                             "CREATE TABLE subtitle_preferences("
                             "show_key_hash TEXT PRIMARY KEY, descriptor_version INTEGER NOT NULL, "
                             "descriptor_json TEXT NOT NULL, updated_at TEXT NOT NULL, "
-                            "CHECK(descriptor_version=1), CHECK(length(descriptor_json)<=4096))"
+                            "CHECK(descriptor_version IN (1,2)), CHECK(length(descriptor_json)<=4096))"
                         ),
                         "INSERT INTO settings(key,value) VALUES('remember_subtitles_by_show','0')",
                         "INSERT INTO settings(key,value) VALUES('prefer_english_subtitles','1')",
                     ),
                     SCHEMA_VERSION,
                 )
+            elif version == SCHEMA_VERSION:
+                self._upgrade_subtitle_descriptor_constraint()
         except Exception as exc:
             raise DatabaseMigrationError(self.path, exc) from exc
 
@@ -356,7 +385,7 @@ class Database:
         if row is None:
             return None
         try:
-            if int(row[0]) != 1 or len(str(row[1])) > 4096:
+            if int(row[0]) not in {1, 2} or len(str(row[1])) > 4096:
                 raise SubtitleError("invalid subtitle preference row")
             return SubtitleDescriptor.from_dict(json.loads(str(row[1])))
         except (ValueError, TypeError, json.JSONDecodeError, SubtitleError):
@@ -387,7 +416,7 @@ class Database:
             "VALUES(?,?,?,?) ON CONFLICT(show_key_hash) DO UPDATE SET "
             "descriptor_version=excluded.descriptor_version,descriptor_json=excluded.descriptor_json,"
             "updated_at=excluded.updated_at",
-            (key, 1, encoded, datetime.now(UTC).isoformat()),
+            (key, descriptor.version, encoded, datetime.now(UTC).isoformat()),
         )
         return True
 

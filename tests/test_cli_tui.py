@@ -18,6 +18,19 @@ from vlcq.tui import VLCQApp
 from vlcq.vlc import VLCError
 
 
+def test_cli_doctor_reports_actionable_missing_ffprobe(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        vlcq.cli,
+        "ffprobe_diagnostic",
+        lambda: (False, "ffprobe is unavailable; install FFmpeg with: brew install ffmpeg"),
+    )
+    result = main(["--database", str(tmp_path / "db.sqlite3"), "doctor"])
+    assert result == 2
+    assert "brew install ffmpeg" in capsys.readouterr().out
+
+
 def test_explicit_file_cli_establishes_root_and_seeds_queue(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

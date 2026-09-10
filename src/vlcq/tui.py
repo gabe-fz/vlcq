@@ -23,7 +23,12 @@ from .database import Database
 from .models import BrowserEntry, HistoryProjection, QueueEntry
 from .paths import VIDEO_EXTENSIONS, PathError, is_beneath, list_folder, natural_key
 from .queue import QueueService
-from .subtitles import SubtitleChoice, SubtitleSnapshot, SubtitleTarget
+from .subtitles import (
+    SubtitleChoice,
+    SubtitleDiscovery,
+    SubtitleSnapshot,
+    SubtitleTarget,
+)
 from .vlc import VLCError
 
 
@@ -381,8 +386,25 @@ class DetailsPrompt(ModalScreen[str | None]):
             self.dismiss(None)
 
 
+class SubtitleLoading(ModalScreen[None]):
+    """Cancelable placeholder shown while ffprobe runs off the UI path."""
+
+    BINDINGS: ClassVar = [Binding("escape", "cancel", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        yield Static("Inspecting subtitles…", classes="dialog-title")
+        yield Button("Cancel", id="subtitle-loading-cancel")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "subtitle-loading-cancel":
+            self.dismiss(None)
+
+
 class SubtitlePicker(ModalScreen[SubtitleChoice | None]):
-    """A bounded, keyboard and mouse friendly picker for current VLC tracks."""
+    """A bounded picker for offline candidates and generation-local VLC tracks."""
 
     BINDINGS: ClassVar = [Binding("escape", "cancel", "Cancel")]
 
@@ -390,39 +412,70 @@ class SubtitlePicker(ModalScreen[SubtitleChoice | None]):
         super().__init__()
         self.snapshot = snapshot
         self.active = active
-        self.choices = [SubtitleChoice.off(), *(SubtitleChoice.track_choice(track) for track in snapshot.tracks)]
+        self.choices = [
+            SubtitleChoice.off(),
+            *(
+                SubtitleChoice.candidate_choice(candidate)
+                for candidate in snapshot.candidates
+            ),
+            *(SubtitleChoice.track_choice(track) for track in snapshot.tracks),
+        ]
 
     def compose(self) -> ComposeResult:
         yield Static("Subtitles", classes="dialog-title")
         with VerticalScroll(id="subtitle-picker-list"):
-            if not self._active_choice_is_identifiable():
+            if self.snapshot.planned_choice is not None:
+                planned_label = self._choice_label(self.snapshot.planned_choice)
+                yield Static(
+                    f"★ Planned: {planned_label} (not active in VLC)",
+                    id="subtitle-planned",
+                    classes="subtitle-choice",
+                )
+            if not self._active_choice_is_identifiable() and not self.snapshot.candidates:
                 yield Static(
                     "● VLC current/default · exact track not reported",
                     id="subtitle-active-unknown",
                     classes="subtitle-choice",
                 )
             for index, choice in enumerate(self.choices):
-                if choice.mode == "off":
-                    label = "Off"
-                else:
-                    assert choice.track is not None
-                    label = choice.track.label
+                label = self._choice_label(choice)
                 is_active = self._is_active(choice)
+                planned = self._is_planned(choice)
                 yield Button(
-                    ("● " if is_active else "○ ") + label,
+                    ("★ " if planned else "● " if is_active else "○ ") + label,
                     id=f"subtitle-choice-{index}",
                     classes="subtitle-choice",
                 )
         yield Button("Cancel", id="subtitle-cancel")
 
+    @staticmethod
+    def _choice_label(choice: SubtitleChoice) -> str:
+        if choice.mode == "off":
+            return "Off"
+        if choice.candidate is not None:
+            return choice.candidate.label
+        assert choice.track is not None
+        return choice.track.label
+
+    def _is_planned(self, choice: SubtitleChoice) -> bool:
+        planned = self.snapshot.planned_choice
+        if planned is None or planned.mode != choice.mode:
+            return False
+        if planned.mode == "off":
+            return True
+        if planned.candidate is not None and choice.candidate is not None:
+            return planned.candidate.identity == choice.candidate.identity
+        return False
+
     def _active_choice_is_identifiable(self) -> bool:
         if self.active is not None:
             if self.active.mode == "off":
                 return True
-            assert self.active.track is not None
-            return any(
-                track.track_id == self.active.track.track_id for track in self.snapshot.tracks
-            )
+            if self.active.track is not None:
+                return any(
+                    track.track_id == self.active.track.track_id for track in self.snapshot.tracks
+                )
+            return False
         return not self.snapshot.tracks or any(
             track.active is not None for track in self.snapshot.tracks
         )
@@ -433,7 +486,11 @@ class SubtitlePicker(ModalScreen[SubtitleChoice | None]):
                 return False
             if choice.mode == "off":
                 return True
-            return self.active.track is not None and choice.track is not None and self.active.track.track_id == choice.track.track_id
+            if self.active.track is not None and choice.track is not None:
+                return self.active.track.track_id == choice.track.track_id
+            return False
+        if choice.candidate is not None:
+            return False
         if choice.mode == "track" and choice.track is not None:
             return choice.track.active is True
         if choice.mode == "off":
@@ -636,7 +693,8 @@ class HelpPrompt(ModalScreen[None]):
             "d remove · J/K reorder · r retry · c clear watched · ? help · q quit · Shift+F10 menu. "
             "Use VLC's visible controls for ordinary transport, or vlcq keyboard shortcuts. "
             "Native Next is supported; native Previous and arbitrary VLC playlist navigation are not. "
-            "Subtitles… is available only on the validated current row; Queue … contains the "
+            "Subtitles… is available on supported Files and Queue rows; inactive rows use bounded "
+            "offline ffprobe inspection, while current rows reconcile with VLC. Queue … contains the "
             "Remember subtitles by show and Prefer English subtitles toggles. "
             "Files and Queue headers expose frequent mouse actions; use Queue … for Help, reconnect, and Quit.",
             classes="help-content",
@@ -698,7 +756,7 @@ class VLCQApp(App[None]):
     .details-content, .help-content { height: auto; overflow-y: auto; }
     #subtitle-picker-list { width: 80%; max-height: 12; padding: 0; background: $surface; border: solid $accent; overflow-y: auto; }
     .subtitle-choice { width: 1fr; min-width: 20; height: 1; min-height: 1; margin: 0; padding: 0 1; border: none; content-align: left middle; }
-    SubtitlePicker { align: center middle; }
+    SubtitlePicker, SubtitleLoading { align: center middle; }
     RootPrompt, SearchFilterPrompt, ResumePrompt, DetailsPrompt, ConfirmClear, ConfirmClearAll, QuitPrompt, HelpPrompt, NoticeDetailsPrompt { align: center middle; }
     RootPrompt > Input, SearchFilterPrompt > Input { width: 80%; background: $surface; }
     """
@@ -776,7 +834,12 @@ class VLCQApp(App[None]):
         self.search_query = ""
         self.history_filter = "all"
         self.browser_reverse = False
-        self.controller = PlaybackController(self.queue, watched_percent=self.watched_percent)
+        self.subtitle_discovery = SubtitleDiscovery(root=self.root)
+        self.controller = PlaybackController(
+            self.queue,
+            watched_percent=self.watched_percent,
+            subtitle_discovery=self.subtitle_discovery,
+        )
         self.no_vlc = no_vlc
         self.autoplay = autoplay
         self.autoplay_target_paths: list[Path] = []
@@ -786,6 +849,8 @@ class VLCQApp(App[None]):
         self._notice_timer: Any | None = None
         self._source_focus: Widget | None = None
         self._restoring_queue_selection = False
+        self._subtitle_menu_targets: dict[Path, SubtitleTarget | None] = {}
+        self._subtitle_loading_task: asyncio.Task[None] | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="sections"):
@@ -2289,8 +2354,10 @@ class VLCQApp(App[None]):
             self.update_status(str(exc))
             return
         await self._notify_queue_mutation()
+        self._cancel_subtitle_loading()
         self.browser_path = self.root
         self._root_generation += 1
+        self.subtitle_discovery.set_root(self.root)
         self._tree_generation += 1
         self.expanded_paths.clear()
         self._tree_children.clear()
@@ -2619,7 +2686,41 @@ class VLCQApp(App[None]):
         return FileTarget(highlighted.path, self._root_generation, selected)
 
     def _subtitle_action_enabled(self, path: Path) -> bool:
-        return not self.no_vlc and self.controller.current_subtitle_target_for_path(path) is not None
+        # Older integrations sometimes replace the current-target predicate
+        # with a row validator. Honor that injected contract while the normal
+        # app path exposes offline inspection for every supported row.
+        target_predicate = self.controller.current_subtitle_target_for_path
+        if (
+            not hasattr(target_predicate, "__self__")
+            or target_predicate.__self__ is not self.controller
+        ):
+            target = target_predicate(path)
+            try:
+                key = path.resolve(strict=False)
+            except (OSError, RuntimeError):
+                key = path
+            self._subtitle_menu_targets[key] = target
+            return target is not None
+        try:
+            canonical = path.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError):
+            return False
+        return (
+            canonical.is_file()
+            and is_beneath(canonical, self.root)
+            and canonical.suffix.casefold() in VIDEO_EXTENSIONS
+        )
+
+    def _subtitle_playback_generation(self, path: Path) -> int | None:
+        try:
+            key = path.resolve(strict=False)
+        except (OSError, RuntimeError):
+            key = path
+        if key in self._subtitle_menu_targets:
+            target = self._subtitle_menu_targets.pop(key)
+        else:
+            target = self.controller.current_subtitle_target_for_path(path)
+        return target.generation if target is not None else None
 
     def _target_batch_label(self, target: FileTarget, verb: str) -> str:
         paths = target.selected_paths or (target.path,)
@@ -2658,7 +2759,7 @@ class VLCQApp(App[None]):
                                     target.path,
                                     target.root_generation,
                                     target.selected_paths,
-                                    self.controller.playback_generation,
+                                    self._subtitle_playback_generation(target.path),
                                 ),
                             )
                         ]
@@ -2769,7 +2870,7 @@ class VLCQApp(App[None]):
                         QueueTarget(
                             target.entry_id,
                             target.root_generation,
-                            self.controller.playback_generation,
+                            self._subtitle_playback_generation(entry.path),
                         ),
                     )
                 ]
@@ -2866,29 +2967,70 @@ class VLCQApp(App[None]):
         self, target: SubtitleTarget, choice: SubtitleChoice
     ) -> None:
         try:
-            selected = await self.controller.select_subtitle(target, choice)
+            if not target.active:
+                selected = await self.controller.select_inactive_subtitle(target, choice)
+            else:
+                selected = await self.controller.select_subtitle(target, choice)
         except (VLCError, OSError, RuntimeError) as exc:
             self.update_status(f"Subtitle selection failed; playback continues: {exc}")
             return
-        label = "Off" if selected.mode == "off" else selected.track.label  # type: ignore[union-attr]
+        if selected.mode == "off":
+            label = "Off"
+        elif selected.candidate is not None:
+            label = selected.candidate.label
+        else:
+            assert selected.track is not None
+            label = selected.track.label
         self.update_status(f"Subtitles selected: {label}")
+
+    def _cancel_subtitle_loading(self) -> None:
+        task = self._subtitle_loading_task
+        if task is not None and not task.done():
+            task.cancel()
 
     async def _open_subtitles_for_path(self, path: Path) -> None:
         target = self.controller.current_subtitle_target_for_path(path)
-        if target is None:
-            self.update_status("Subtitles are available only for the validated current media")
-            return
+        self._subtitle_loading_task = asyncio.current_task()
+        self.push_screen(SubtitleLoading(), lambda _result: self._cancel_subtitle_loading())
         try:
-            snapshot = await self.controller.discover_subtitles(target)
+            if target is None:
+                snapshot = await self.controller.discover_subtitles_for_path(
+                    path, root_generation=self._root_generation
+                )
+            else:
+                target = SubtitleTarget(
+                    target.generation,
+                    target.queue_entry_id,
+                    target.path,
+                    target.playlist_id,
+                    self._root_generation,
+                    target.media_identity,
+                    True,
+                )
+                snapshot = await self.controller.discover_subtitles(target)
+        except asyncio.CancelledError:
+            return
         except (VLCError, OSError, RuntimeError) as exc:
             self.update_status(f"Subtitle discovery failed; playback continues: {exc}")
             return
+        finally:
+            self._subtitle_loading_task = None
+            if isinstance(self.screen, SubtitleLoading):
+                self.pop_screen()
+        if snapshot.target.root_generation != self._root_generation:
+            self.update_status("Subtitle discovery expired after the library root changed")
+            return
+        try:
+            current = self.controller.current_subtitle_target_for_path(path)
+            active = self.controller.current_subtitle_choice if current is not None else None
+        except (VLCError, OSError, RuntimeError):
+            active = None
 
         def chosen(choice: SubtitleChoice | None) -> None:
             if choice is not None:
-                self.run_worker(self._finish_subtitle_choice(target, choice), exclusive=True)
+                self.run_worker(self._finish_subtitle_choice(snapshot.target, choice), exclusive=True)
 
-        self.push_screen(SubtitlePicker(snapshot, self.controller.current_subtitle_choice), chosen)
+        self.push_screen(SubtitlePicker(snapshot, active), chosen)
 
     async def _dispatch_context_action(self, action: ContextAction) -> None:
         target = action.target

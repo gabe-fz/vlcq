@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 
@@ -18,6 +19,22 @@ def app_dir() -> Path:
 
 def database_path() -> Path:
     return app_dir() / "vlcq.sqlite3"
+
+
+def ffprobe_path() -> Path | None:
+    """Resolve the local FFmpeg inspector once from trusted configuration."""
+    override = os.environ.get("VLCQ_FFPROBE")
+    value = override if override else shutil.which("ffprobe")
+    return Path(value).expanduser() if value else None
+
+
+def ffprobe_diagnostic() -> tuple[bool, str]:
+    executable = ffprobe_path()
+    if executable is None:
+        return False, "ffprobe is unavailable; install FFmpeg with: brew install ffmpeg"
+    if not executable.is_file():
+        return False, "configured ffprobe is not a regular executable; set VLCQ_FFPROBE or install FFmpeg"
+    return True, f"ffprobe ready: {executable.name}"
 
 
 def resolve_watched_percent(value: str | int | None = None) -> int:
