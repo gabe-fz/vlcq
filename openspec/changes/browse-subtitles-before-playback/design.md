@@ -1,6 +1,6 @@
 ## Context
 
-See `proposal.md` for motivation and `specs/subtitle-selection/spec.md` for behavior. The existing subtitle model is built around ephemeral VLC stream IDs, while its persisted descriptor intentionally retains only cross-episode semantics. Row menus omit subtitle actions unless the controller can produce a validated current-generation target. The browser already restricts visible videos to canonical supported files beneath one root, and controller transitions serialize all VLC commands.
+See `proposal.md` for motivation and `specs/subtitle-selection/spec.md` for behavior. The existing subtitle model is built around ephemeral VLC stream IDs, while its persisted descriptor intentionally retains only cross-episode semantics. Each supported video now has an indented subtitle subitem that owns subtitle interaction and status, instead of hiding that interaction in the video's general context menu. The browser already restricts visible videos to canonical supported files beneath one root, and controller transitions serialize all VLC commands.
 
 Offline discovery crosses three trust boundaries: parsing untrusted media metadata in a subprocess, associating neighboring files without escaping the library, and later translating an offline choice into a VLC-generation-local action. ffprobe and VLC do not share stream IDs, and a sidecar selected for one episode has a different path for the next episode.
 
@@ -56,7 +56,7 @@ Alternatives: launch VLC with a precomputed `--sub-file`, which complicates succ
 
 Run probes outside Textual's event loop through cancellable workers. Cache successful discovery by canonical path plus file stat identity and sibling-directory stat identity for the application session only; invalidate on mismatch, root change, explicit refresh, or before playback application. Do not persist track inventories or sidecar paths. Coalesce concurrent requests for the same identity and cap probe concurrency so opening menus cannot spawn an unbounded process set.
 
-The menu action appears for supported file rows regardless of VLC state. Opening it presents a loading state, then the picker or one notice. Root-generation and media-identity checks discard stale completions and restore focus. A currently playing row still uses controller generation validation for any immediate selection command.
+Every supported file row reserves a second, indented subtitle line. Without eagerly probing media, that line can show a confirmed current-generation choice, a persisted semantic show preference, the enabled English policy pending resolution, or an explicit unresolved/default state. Activating or right-clicking that line presents a loading state, then a persistent picker or one bounded notice; the video's general context menu has no duplicate subtitle action. Successful discovery and selection update both Files and Queue instances of the same path. Root-generation and media-identity checks discard stale completions and restore focus. A currently playing row still uses controller generation validation for any immediate selection command.
 
 Alternatives: probe every row during tree discovery, which makes browsing expensive and exposes many malformed files unnecessarily; persist inventories, which quickly become stale and stores more path-derived data than needed.
 
@@ -72,7 +72,7 @@ Alternatives: probe every row during tree discovery, which makes browsing expens
 
 ## Migration Plan
 
-1. Add the offline model/prober and sidecar association behind focused tests, then expose it in row menus.
+1. Add the offline model/prober and sidecar association behind focused tests, then expose it through always-visible subtitle subitems beneath video rows.
 2. Extend descriptors to version 2 while retaining version-1 reads; no SQLite schema version change is required because descriptors are already bounded JSON.
 3. Add source-aware policy resolution and the typed VLC sidecar operation, guarded by existing generation validation.
 4. Update install guidance to require FFmpeg and reinstall the CLI globally; verify the globally resolved command reports actionable diagnostics when ffprobe is absent.

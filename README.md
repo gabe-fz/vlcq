@@ -43,8 +43,10 @@ their one-line headers and Queue application menu remain reachable.
 The Files header provides **Open**, **Search/filter**, **Add**, and an overflow menu. The
 Queue header provides removal, reorder, clear actions, and an overflow menu. Right-click
 opens row-specific actions; `Shift+F10` is the keyboard menu fallback. Every supported
-Files and Queue video row provides **Subtitles…**, including inactive rows; opening it
-performs bounded local inspection without loading, enqueueing, or playing media. Queue overflow always provides **Reconnect**,
+Files and Queue video has an always-visible indented **Subtitles** subitem. Left-click,
+right-click, or focus it and press `Shift+F10` to inspect/select subtitles; the video's
+general menu does not duplicate that action. Inactive inspection is bounded and does not
+load, enqueue, or play media. Queue overflow always provides **Reconnect**,
 **Help**, **Quit**, **Remember subtitles by show**, and **Prefer English subtitles**, even
 with an empty queue or no selected row. Queue **Details** is available on demand and is
 not a persistent player panel.
@@ -55,9 +57,11 @@ and **Not watched** use historical coverage. Explicit selections survive filteri
 collapsing; the Files header reports selected and hidden-selected counts. Enter/Play
 always targets the highlighted item rather than an unrelated selected batch.
 
-Rows remain one line and filenames remain literal while folders, stem text, bracketed
-spans, numbers, punctuation, and extensions use semantic colors. Compact markers convey
-selection, queued membership, and the current item without relying on color. Missing and
+Folder rows remain one line; video rows reserve a second indented subtitle line. Filenames
+remain literal while folders, stem text, bracketed spans, numbers, punctuation, and
+extensions use semantic colors. Compact markers convey selection, queued membership, and
+the current item without relying on color. Subtitle markers distinguish `● Active`,
+`★ Planned`, and `○` unresolved/default state. Missing and
 failed queue entries retain `!`/`×` indicators. Ordinary queued, playing, paused,
 stopped, skipped, completed, and watched labels are intentionally not repeated in rows;
 queue outcomes remain available in Details.
@@ -113,8 +117,10 @@ duplicate process/poll loop and never selects, loads, or autoplays media.
 
 ### Subtitle selection and preferences
 
-**Subtitles…** lists `Off`, embedded streams discovered by local `ffprobe`, and immediate
-same-stem sidecars (`.srt`, `.ass`, `.ssa`, `.vtt`, `.sub/.idx`, `.sup`). Sidecars such as
+The always-visible **Subtitles** subitem summarizes the confirmed active choice, a planned
+show/policy choice, or an unresolved/default state. Its picker lists `Off`, embedded streams
+discovered by local `ffprobe`, and immediate same-stem sidecars (`.srt`, `.ass`, `.ssa`,
+`.vtt`, `.sub/.idx`, `.sup`). Sidecars such as
 `Episode.en.whisper.srt` are associated only with the sibling video; hidden, unrelated,
 missing, non-regular, and root-escaping files are ignored. Choices made before playback
 are whole-show preferences when remembering is enabled and planned choices are marked

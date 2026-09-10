@@ -17,6 +17,7 @@
 - [x] 3.2 Add a cancellable loading flow and adapt the picker to distinguish embedded/sidecar candidates and planned remembered/English choices from VLC-confirmed active choices; verify compact-terminal keyboard/mouse, focus restoration, cancellation, empty discovery, and error-notice tests pass.
 - [x] 3.3 Persist an inactive choice or Off only as a whole-show preference when remembering is enabled and show identity is confident, without launching VLC or mutating the queue; verify TUI/controller tests cover success, disabled remembering, uncertain show identity, preference replacement, and unchanged playback/queue state.
 - [x] 3.4 Resolve and display the stored whole-show preference on another episode, including generated sidecars, and display English fallback only as planned; verify cross-episode and restart tests pass without persisting absolute paths or probe/VLC identifiers.
+- [x] 3.5 Render an always-visible indented subtitle subitem beneath every Files and Queue video row, show distinct active/planned/unresolved summaries, remove the duplicate action from general video menus, and open a persistent picker from left-click, right-click, or focused keyboard activation; verify row layout, duplicate-menu removal, and right-click regression tests pass.
 
 ## 4. VLC reconciliation and sidecar application
 

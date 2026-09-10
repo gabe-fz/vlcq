@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from textual import events
 from textual.widgets import Button, Static
 
 from vlcq.database import Database
@@ -12,6 +13,7 @@ from vlcq.tui import (
     ActionMenu,
     QueueTarget,
     SubtitlePicker,
+    SubtitleSubitem,
     VLCQApp,
 )
 
@@ -70,8 +72,8 @@ async def test_subtitle_picker_selects_and_dismisses_at_compact_terminal_size(tm
 
 
 @pytest.mark.asyncio
-async def test_subtitles_only_appears_for_matching_current_row_and_menu_is_read_only(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_subtitle_subitem_is_visible_and_video_menu_no_longer_owns_subtitles(
+    tmp_path: Path,
 ) -> None:
     root = tmp_path / "library"
     current = make_video(root, "current.mkv")
@@ -82,29 +84,29 @@ async def test_subtitles_only_appears_for_matching_current_row_and_menu_is_read_
     entry = app.queue.play_now(0)
     app.controller.status = VLCStatus("playing", path=current.resolve(), playlist_id="vlc-1")
     app.controller.client = object()  # type: ignore[assignment]
-    target = SubtitleTarget(app.controller.playback_generation, entry.id, current.resolve(), "vlc-1")
-    calls: list[str] = []
-
-    def target_for_path(path: Path) -> SubtitleTarget | None:
-        calls.append(str(path))
-        return target if path.resolve() == current.resolve() else None
-
-    monkeypatch.setattr(app.controller, "current_subtitle_target_for_path", target_for_path)
+    app.controller._subtitle_choice = SubtitleChoice.off()
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause()
+        rows = list(app.query_one("#queue").children)
+        assert len(rows) == 2
+        current_subtitle = rows[0].query_one(SubtitleSubitem)
+        inactive_subtitle = rows[1].query_one(SubtitleSubitem)
+        assert "● Active: Off" in str(current_subtitle.label)
+        assert "★ Planned: Prefer English" in str(inactive_subtitle.label)
         current_actions = app._context_actions_for_queue(QueueTarget(entry.id, app._root_generation))
         inactive_entry = app.queue.entries()[1]
         inactive_actions = app._context_actions_for_queue(
             QueueTarget(inactive_entry.id, app._root_generation)
         )
-        assert any(action.key == "subtitle-queue" for action in current_actions)
+        assert not any(action.key == "subtitle-queue" for action in current_actions)
         assert not any(action.key == "subtitle-queue" for action in inactive_actions)
-        assert calls == [str(current.resolve()), str(inactive.resolve())]
     db.close()
 
 
 @pytest.mark.asyncio
-async def test_inactive_rows_expose_read_only_subtitle_browsing_without_vlc(tmp_path: Path) -> None:
+async def test_inactive_subtitle_subitem_opens_persistent_picker_without_vlc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     root = tmp_path / "library"
     video = root / "Example Show" / "Season 1" / "S01E01.mkv"
     video.parent.mkdir(parents=True)
@@ -112,17 +114,45 @@ async def test_inactive_rows_expose_read_only_subtitle_browsing_without_vlc(tmp_
     db = Database(tmp_path / "state.sqlite3")
     app = VLCQApp(root=root, database=db, no_vlc=True)
     app.queue.add([video])
+
+    async def discover(path: Path, *, root_generation: int = 0, target=None) -> SubtitleSnapshot:
+        del target
+        subtitle_target = SubtitleTarget(0, 1, path.resolve(), None, root_generation)
+        return SubtitleSnapshot(
+            subtitle_target,
+            (),
+            planned_choice=SubtitleChoice.off(),
+        )
+
+    monkeypatch.setattr(app.controller, "discover_subtitles_for_path", discover)
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause()
-        entry = app.queue.entries()[0]
-        actions = app._context_actions_for_queue(QueueTarget(entry.id, app._root_generation))
-        assert any(action.key == "subtitle-queue" for action in actions)
+        subtitle = app.query_one("#queue").children[0].query_one(SubtitleSubitem)
+        assert "Subtitles:" in str(subtitle.label)
         assert app.controller.client is None
+        app.on_click(
+            events.Click(
+                subtitle,
+                1,
+                0,
+                0,
+                0,
+                3,
+                False,
+                False,
+                False,
+                subtitle.region.x + 1,
+                subtitle.region.y,
+            )
+        )
+        await pilot.pause()
+        assert isinstance(app.screen, SubtitlePicker)
+        assert "★ Planned: Off" in str(subtitle.label)
+        await pilot.press("escape")
+        subtitle.focus()
         await pilot.press("shift+f10")
         await pilot.pause()
-        # Shift+F10 targets the highlighted Files/Queue row and remains
-        # available even though no VLC process was started.
-        assert isinstance(app.screen, ActionMenu) or app.screen.__class__.__name__ == "Screen"
+        assert isinstance(app.screen, SubtitlePicker)
     db.close()
 
 

@@ -25,6 +25,7 @@ from .paths import VIDEO_EXTENSIONS, PathError, is_beneath, list_folder, natural
 from .queue import QueueService
 from .subtitles import (
     SubtitleChoice,
+    SubtitleDescriptor,
     SubtitleDiscovery,
     SubtitleSnapshot,
     SubtitleTarget,
@@ -182,6 +183,14 @@ class ItemProgress(Static):
         self.update(text)
 
 
+class SubtitleSubitem(CompactButton):
+    """An always-visible subtitle child row that owns subtitle interaction."""
+
+    def __init__(self, path: Path, renderable: Text) -> None:
+        self.path = path
+        super().__init__(renderable, classes="subtitle-subitem")
+
+
 class BrowserListItem(ListItem):
     path: Path
     is_dir: bool
@@ -197,6 +206,7 @@ class BrowserListItem(ListItem):
         history_percentage: int | None = None,
         history_watched: bool = False,
         history_visible: bool = False,
+        subtitle_renderable: Text | None = None,
     ) -> None:
         self.path = entry.path
         self.is_dir = entry.is_dir
@@ -208,16 +218,21 @@ class BrowserListItem(ListItem):
             super().__init__(Label(renderable, classes="row-label", markup=False), classes=classes)
         else:
             marker = "☑" if selected else "☐"
+            subtitle = subtitle_renderable or Text("    ↳ Subtitles: ○ Inspect / select", no_wrap=True)
             super().__init__(
-                Horizontal(
-                    CompactButton(
-                        marker,
-                        classes="browser-check",
-                        tooltip="Deselect video" if selected else "Select video",
+                Vertical(
+                    Horizontal(
+                        CompactButton(
+                            marker,
+                            classes="browser-check",
+                            tooltip="Deselect video" if selected else "Select video",
+                        ),
+                        Label(renderable, classes="row-label", markup=False),
+                        HistoricalCoverage(history_percentage, watched=history_watched),
+                        classes="browser-row",
                     ),
-                    Label(renderable, classes="row-label", markup=False),
-                    HistoricalCoverage(history_percentage, watched=history_watched),
-                    classes="browser-row",
+                    SubtitleSubitem(entry.path, subtitle),
+                    classes="video-with-subtitle",
                 ),
                 classes=classes,
             )
@@ -240,15 +255,21 @@ class QueueListItem(ListItem):
         history_visible: bool = False,
         current_position_ms: int | None = 0,
         current_duration_ms: int | None = None,
+        subtitle_renderable: Text | None = None,
     ) -> None:
         del history_visible
         self.entry_id = entry.id
+        subtitle = subtitle_renderable or Text("    ↳ Subtitles: ○ Inspect / select", no_wrap=True)
         super().__init__(
-            Horizontal(
-                Label(renderable, classes="row-label", markup=False),
-                ItemProgress(current_position_ms, current_duration_ms),
-                HistoricalCoverage(history_percentage, watched=history_watched),
-                classes="queue-row",
+            Vertical(
+                Horizontal(
+                    Label(renderable, classes="row-label", markup=False),
+                    ItemProgress(current_position_ms, current_duration_ms),
+                    HistoricalCoverage(history_percentage, watched=history_watched),
+                    classes="queue-row",
+                ),
+                SubtitleSubitem(entry.path, subtitle),
+                classes="video-with-subtitle",
             )
         )
         del current_id
@@ -734,9 +755,17 @@ class VLCQApp(App[None]):
     .section-body { height: 1fr; min-height: 1; }
     .section.collapsed .section-body { display: none; }
     #browser, #queue { height: 1fr; min-height: 1; overflow-x: auto; overflow-y: auto; }
-    #browser > ListItem, #queue > ListItem { width: auto; min-width: 100%; height: 1; min-height: 1; }
+    #browser > ListItem, #queue > ListItem { width: auto; min-width: 100%; }
+    #browser > ListItem.folder-entry { height: 1; min-height: 1; }
+    #browser > ListItem.video-entry, #queue > ListItem { height: 2; min-height: 2; }
+    .video-with-subtitle { width: 1fr; height: 2; min-height: 2; }
     .browser-row, .queue-row { width: 1fr; height: 1; min-height: 1; }
     .browser-check { width: 3; min-width: 3; height: 1; min-height: 1; margin: 0; padding: 0; border: none; }
+    .subtitle-subitem {
+        width: 1fr; height: 1; min-height: 1; margin: 0; padding: 0;
+        border: none; content-align: left middle; color: $text-muted;
+    }
+    .subtitle-subitem:hover, .subtitle-subitem:focus { color: $text; background: $boost; }
     .row-label { width: auto; height: 1; min-height: 1; overflow-x: hidden; }
     .current-progress { width: auto; min-width: 20; height: 1; min-height: 1; margin-left: 1; padding: 0; content-align: left middle; overflow-x: hidden; }
     .history-value { width: auto; min-width: 8; height: 1; min-height: 1; margin-left: 1; padding: 0; content-align: left middle; }
@@ -849,8 +878,9 @@ class VLCQApp(App[None]):
         self._notice_timer: Any | None = None
         self._source_focus: Widget | None = None
         self._restoring_queue_selection = False
-        self._subtitle_menu_targets: dict[Path, SubtitleTarget | None] = {}
         self._subtitle_loading_task: asyncio.Task[None] | None = None
+        self._subtitle_snapshots: dict[Path, SubtitleSnapshot] = {}
+        self._subtitle_row_choices: dict[Path, SubtitleChoice] = {}
 
     def compose(self) -> ComposeResult:
         with Vertical(id="sections"):
@@ -953,6 +983,19 @@ class VLCQApp(App[None]):
         except NoMatches:
             pass
 
+    @staticmethod
+    def _subtitle_ancestor(widget: Widget | None) -> SubtitleSubitem | None:
+        if widget is None:
+            return None
+        return next(
+            (
+                item
+                for item in widget.ancestors_with_self
+                if isinstance(item, SubtitleSubitem)
+            ),
+            None,
+        )
+
     def _row_ancestor(self, widget: Widget | None) -> BrowserListItem | QueueListItem | None:
         if widget is None:
             return None
@@ -968,6 +1011,12 @@ class VLCQApp(App[None]):
     def on_click(self, event: events.Click) -> None:
         widget = event.widget
         if widget is None:
+            return
+        subtitle = self._subtitle_ancestor(widget)
+        if subtitle is not None:
+            if event.button == 3:
+                event.stop()
+                self._open_subtitle_subitem(subtitle)
             return
         row = self._row_ancestor(widget)
         if row is not None:
@@ -1333,6 +1382,111 @@ class VLCQApp(App[None]):
             text.append("  ×", style="bold red")
         return text
 
+    @staticmethod
+    def _subtitle_choice_label(choice: SubtitleChoice) -> str:
+        if choice.mode == "off":
+            return "Off"
+        if choice.candidate is not None:
+            return choice.candidate.label
+        assert choice.track is not None
+        return choice.track.label
+
+    @staticmethod
+    def _subtitle_descriptor_label(descriptor: SubtitleDescriptor) -> str:
+        if descriptor.mode == "off":
+            return "Off"
+        parts: list[str] = []
+        if descriptor.source is not None:
+            parts.append(descriptor.source.title())
+        if descriptor.language is not None:
+            parts.append("English" if descriptor.language == "en" else descriptor.language)
+        if descriptor.sidecar_variant is not None:
+            parts.append(descriptor.sidecar_variant)
+        if descriptor.full_dialogue is True:
+            parts.append("full dialogue")
+        if descriptor.signs_songs is True:
+            parts.append("signs/songs")
+        if descriptor.forced is True:
+            parts.append("forced")
+        if descriptor.sdh is True:
+            parts.append("SDH")
+        return " · ".join(parts) if parts else "Remembered track"
+
+    def _subtitle_renderable(self, path: Path, *, depth: int = 0) -> Text:
+        canonical = path.expanduser().resolve(strict=False)
+        prefix = "  " * max(0, depth) + "    ↳ Subtitles: "
+        text = Text(prefix, style="bright_black", no_wrap=True, overflow="ellipsis")
+        snapshot = self._subtitle_snapshots.get(canonical)
+        current = self.controller.status.path is not None and self.controller._same_path(
+            self.controller.status.path, canonical
+        )
+        choice = self.controller.current_subtitle_choice if current else None
+        if choice is None and current:
+            choice = self._subtitle_row_choices.get(canonical)
+        if choice is not None and current:
+            text.append("● Active: ", style="bold green")
+            text.append(self._subtitle_choice_label(choice), style="green")
+            return text
+        if current and snapshot is not None:
+            active_track = next((track for track in snapshot.tracks if track.active is True), None)
+            if active_track is not None:
+                text.append("● Active: ", style="bold green")
+                text.append(active_track.label, style="green")
+                return text
+            if snapshot.tracks and any(track.active is not None for track in snapshot.tracks):
+                text.append("● Active: Off", style="bold green")
+                return text
+        if current:
+            text.append("○ VLC current/default · exact track unreported", style="yellow")
+            return text
+        planned = self._subtitle_row_choices.get(canonical)
+        if planned is None and snapshot is not None:
+            planned = snapshot.planned_choice
+        if planned is not None:
+            text.append("★ Planned: ", style="bold cyan")
+            text.append(self._subtitle_choice_label(planned), style="cyan")
+            return text
+        if self.database.remember_subtitles_by_show():
+            descriptor = self.database.show_subtitle_preference(canonical, root=self.root)
+            if descriptor is not None:
+                text.append("★ Planned: ", style="bold cyan")
+                text.append(self._subtitle_descriptor_label(descriptor), style="cyan")
+                return text
+        if self.database.prefer_english_subtitles():
+            text.append("★ Planned: Prefer English · inspect to resolve", style="cyan")
+        else:
+            text.append("○ None selected · inspect / select", style="bright_black")
+        return text
+
+    def _update_subtitle_row(self, row: BrowserListItem | QueueListItem, path: Path) -> None:
+        try:
+            depth = row.depth if isinstance(row, BrowserListItem) else 0
+            row.query_one(SubtitleSubitem).label = self._subtitle_renderable(path, depth=depth)
+        except NoMatches:
+            pass
+
+    def _refresh_subtitle_rows(self, path: Path | None = None) -> None:
+        canonical = path.expanduser().resolve(strict=False) if path is not None else None
+        entries_by_id = {entry.id: entry for entry in self.queue.entries()}
+        for selector in ("#browser", "#queue"):
+            try:
+                view = self.query_one(selector, ListView)
+            except NoMatches:
+                continue
+            for row in view.children:
+                row_path: Path | None
+                if isinstance(row, BrowserListItem):
+                    if row.is_dir:
+                        continue
+                    row_path = row.path
+                elif isinstance(row, QueueListItem):
+                    entry = entries_by_id.get(row.entry_id)
+                    row_path = entry.path if entry is not None else None
+                else:
+                    continue
+                if row_path is not None and (canonical is None or row_path == canonical):
+                    self._update_subtitle_row(row, row_path)
+
     def _apply_browser_history_rows(self) -> None:
         try:
             view = self.query_one("#browser", ListView)
@@ -1356,6 +1510,7 @@ class VLCQApp(App[None]):
                     self._history_percentage(entry.path),
                     watched=self._history_watched(entry.path),
                 )
+                self._update_subtitle_row(row, entry.path)
             except NoMatches:
                 continue
         self._render_headers()
@@ -1387,6 +1542,7 @@ class VLCQApp(App[None]):
                     self._history_percentage(entry.path),
                     watched=self._history_watched(entry.path),
                 )
+                self._update_subtitle_row(row, entry.path)
             except NoMatches:
                 continue
         self._render_headers()
@@ -1480,6 +1636,7 @@ class VLCQApp(App[None]):
                     self._history_percentage(entry.path),
                     watched=self._history_watched(entry.path),
                 )
+                self._update_subtitle_row(row, entry.path)
         except NoMatches:
             pass
 
@@ -1601,6 +1758,13 @@ class VLCQApp(App[None]):
                             history_percentage=self._history_percentage(entry.path),
                             history_watched=self._history_watched(entry.path),
                             history_visible=self._history_visible(entry.path),
+                            subtitle_renderable=(
+                                self._subtitle_renderable(
+                                    entry.path, depth=self._entry_depth(entry.path)
+                                )
+                                if not entry.is_dir
+                                else None
+                            ),
                         )
                     )
                     self._browser_rows_by_path[entry.path] = new_rows[-1]
@@ -1768,6 +1932,7 @@ class VLCQApp(App[None]):
                 self._history_percentage(entry.path),
                 watched=self._history_watched(entry.path),
             )
+            self._update_subtitle_row(row, entry.path)
         except NoMatches:
             pass
 
@@ -1868,6 +2033,7 @@ class VLCQApp(App[None]):
                             history_visible=self._history_visible(entry.path),
                             current_position_ms=self._queue_current_position(entry, current_id)[0],
                             current_duration_ms=self._queue_current_position(entry, current_id)[1],
+                            subtitle_renderable=self._subtitle_renderable(entry.path),
                         )
                     )
             if target_present:
@@ -2358,6 +2524,8 @@ class VLCQApp(App[None]):
         self.browser_path = self.root
         self._root_generation += 1
         self.subtitle_discovery.set_root(self.root)
+        self._subtitle_snapshots.clear()
+        self._subtitle_row_choices.clear()
         self._tree_generation += 1
         self.expanded_paths.clear()
         self._tree_children.clear()
@@ -2686,21 +2854,6 @@ class VLCQApp(App[None]):
         return FileTarget(highlighted.path, self._root_generation, selected)
 
     def _subtitle_action_enabled(self, path: Path) -> bool:
-        # Older integrations sometimes replace the current-target predicate
-        # with a row validator. Honor that injected contract while the normal
-        # app path exposes offline inspection for every supported row.
-        target_predicate = self.controller.current_subtitle_target_for_path
-        if (
-            not hasattr(target_predicate, "__self__")
-            or target_predicate.__self__ is not self.controller
-        ):
-            target = target_predicate(path)
-            try:
-                key = path.resolve(strict=False)
-            except (OSError, RuntimeError):
-                key = path
-            self._subtitle_menu_targets[key] = target
-            return target is not None
         try:
             canonical = path.expanduser().resolve(strict=False)
         except (OSError, RuntimeError):
@@ -2710,17 +2863,6 @@ class VLCQApp(App[None]):
             and is_beneath(canonical, self.root)
             and canonical.suffix.casefold() in VIDEO_EXTENSIONS
         )
-
-    def _subtitle_playback_generation(self, path: Path) -> int | None:
-        try:
-            key = path.resolve(strict=False)
-        except (OSError, RuntimeError):
-            key = path
-        if key in self._subtitle_menu_targets:
-            target = self._subtitle_menu_targets.pop(key)
-        else:
-            target = self.controller.current_subtitle_target_for_path(path)
-        return target.generation if target is not None else None
 
     def _target_batch_label(self, target: FileTarget, verb: str) -> str:
         paths = target.selected_paths or (target.path,)
@@ -2750,22 +2892,6 @@ class VLCQApp(App[None]):
                     ContextAction("add-end-file", self._target_batch_label(target, "Add to end"), target),
                     ContextAction("play-next-file", self._target_batch_label(target, "Play next"), target),
                     ContextAction("add-play-file", self._target_batch_label(target, "Add & play"), target),
-                    *(
-                        [
-                            ContextAction(
-                                "subtitle-file",
-                                "Subtitles…",
-                                FileTarget(
-                                    target.path,
-                                    target.root_generation,
-                                    target.selected_paths,
-                                    self._subtitle_playback_generation(target.path),
-                                ),
-                            )
-                        ]
-                        if self._subtitle_action_enabled(entry.path)
-                        else []
-                    ),
                     ContextAction("details-file", "Details", target),
                 ]
             )
@@ -2862,21 +2988,6 @@ class VLCQApp(App[None]):
             ContextAction("move-up", "Move up", target),
             ContextAction("move-down", "Move down", target),
             ContextAction("remove-queue", "Remove from queue", target),
-            *(
-                [
-                    ContextAction(
-                        "subtitle-queue",
-                        "Subtitles…",
-                        QueueTarget(
-                            target.entry_id,
-                            target.root_generation,
-                            self._subtitle_playback_generation(entry.path),
-                        ),
-                    )
-                ]
-                if self._subtitle_action_enabled(entry.path)
-                else []
-            ),
             ContextAction("details-queue", "Details", target),
         ]
 
@@ -2891,6 +3002,27 @@ class VLCQApp(App[None]):
             ActionMenu(actions, source, x or 1, y or 1),
             self._context_menu_result,
         )
+
+    def _open_subtitle_subitem(self, subtitle: SubtitleSubitem) -> None:
+        if not self._subtitle_action_enabled(subtitle.path):
+            self.update_status("Subtitle inspection is unavailable for this video")
+            return
+        row = self._row_ancestor(subtitle)
+        if isinstance(row, BrowserListItem):
+            try:
+                browser = self.query_one("#browser", ListView)
+                browser.index = list(browser.children).index(row)
+            except (NoMatches, ValueError):
+                return
+        elif isinstance(row, QueueListItem):
+            try:
+                queue = self.query_one("#queue", ListView)
+                queue.index = list(queue.children).index(row)
+                self.database.set_selected(row.entry_id)
+                self._apply_queue_selection(row.entry_id)
+            except (NoMatches, ValueError):
+                return
+        self.run_worker(self._open_subtitles_for_path(subtitle.path), exclusive=True)
 
     def _open_row_menu(self, row: BrowserListItem | QueueListItem, x: int | None, y: int | None) -> None:
         if isinstance(row, BrowserListItem):
@@ -2981,6 +3113,9 @@ class VLCQApp(App[None]):
         else:
             assert selected.track is not None
             label = selected.track.label
+        canonical = target.path.expanduser().resolve(strict=False)
+        self._subtitle_row_choices[canonical] = selected
+        self._refresh_subtitle_rows(canonical)
         self.update_status(f"Subtitles selected: {label}")
 
     def _cancel_subtitle_loading(self) -> None:
@@ -3020,6 +3155,9 @@ class VLCQApp(App[None]):
         if snapshot.target.root_generation != self._root_generation:
             self.update_status("Subtitle discovery expired after the library root changed")
             return
+        canonical = path.expanduser().resolve(strict=False)
+        self._subtitle_snapshots[canonical] = snapshot
+        self._refresh_subtitle_rows(canonical)
         try:
             current = self.controller.current_subtitle_target_for_path(path)
             active = self.controller.current_subtitle_choice if current is not None else None
@@ -3151,6 +3289,7 @@ class VLCQApp(App[None]):
             self.update_status(
                 "Remember subtitles by show " + ("enabled" if enabled else "disabled; saved choices retained")
             )
+            self._refresh_subtitle_rows()
             if enabled and not self.no_vlc:
                 await self.controller.apply_automatic_subtitles()
         elif key == "toggle-prefer-english" and isinstance(target, SectionTarget):
@@ -3160,6 +3299,7 @@ class VLCQApp(App[None]):
             )
             self.controller.reset_subtitle_policy()
             self.update_status("Prefer English subtitles " + ("enabled" if enabled else "disabled"))
+            self._refresh_subtitle_rows()
             if enabled and not self.no_vlc:
                 await self.controller.apply_automatic_subtitles()
         elif key == "reconnect":
@@ -3250,6 +3390,10 @@ class VLCQApp(App[None]):
             self.update_status("VLC reconnected; playback was not restarted")
 
     def action_context_menu(self) -> None:
+        subtitle = self._subtitle_ancestor(self.focused)
+        if subtitle is not None:
+            self._open_subtitle_subitem(subtitle)
+            return
         if self._browser_has_focus():
             source = self.focused
             entry = self._browser_entry()
@@ -3345,6 +3489,9 @@ class VLCQApp(App[None]):
         event.stop()
         button = event.button
         button_id = button.id
+        if isinstance(button, SubtitleSubitem):
+            self._open_subtitle_subitem(button)
+            return
         if button.has_class("browser-check"):
             row = self._row_ancestor(button)
             if isinstance(row, BrowserListItem):

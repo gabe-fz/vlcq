@@ -1,7 +1,11 @@
 ## MODIFIED Requirements
 
 ### Requirement: Current-media subtitle menu
-vlcq SHALL expose a Subtitles action from Files and Queue row context menus, including the keyboard context-menu path, for each supported, canonical video file beneath the active library root. For inactive media, the action SHALL asynchronously inspect the file without loading, enqueueing, or playing it and SHALL list Off, every embedded subtitle stream reported by the local media inspector, and every safely associated sidecar subtitle. For current media, vlcq SHALL reconcile offline candidates with tracks reported by the same owned VLC playback generation before issuing a playback command. The picker SHALL distinguish embedded and sidecar candidates, present available language, title or sidecar variant, and recognized characteristics without inventing missing metadata, and indicate a resolved remembered show preference or English fallback separately from a choice confirmed active in VLC. When VLC cannot identify its exact active stream, vlcq SHALL continue to identify VLC's preserved current/default state rather than guessing. Discovery and picker opening SHALL NOT change queue order, playback position, or media files.
+vlcq SHALL render an always-visible, indented Subtitles subitem beneath each supported, canonical Files and Queue video row beneath the active library root. The subtitle subitem, rather than the video's general context menu, SHALL own mouse and keyboard subtitle interaction. Its persistent summary SHALL clearly distinguish a VLC-confirmed active choice (`● Active`), a remembered or policy-planned choice (`★ Planned`), and an unresolved/default state (`○`), without claiming that an inactive planned choice is active. Activating or right-clicking the subitem SHALL asynchronously open subtitle inspection without loading, enqueueing, or playing inactive media and SHALL list Off, every embedded subtitle stream reported by the local media inspector, and every safely associated sidecar subtitle. For current media, vlcq SHALL reconcile offline candidates with tracks reported by the same owned VLC playback generation before issuing a playback command. The picker SHALL distinguish embedded and sidecar candidates, present available language, title or sidecar variant, and recognized characteristics without inventing missing metadata. When VLC cannot identify its exact active stream, vlcq SHALL continue to identify VLC's preserved current/default state rather than guessing. Discovery and picker opening SHALL NOT change queue order, playback position, or media files.
+
+#### Scenario: Subtitle status is always visible
+- **WHEN** vlcq renders a supported Files or Queue video row
+- **THEN** it renders one indented subtitle subitem immediately beneath that video and shows its active, planned, or unresolved state with distinct markers
 
 #### Scenario: Browse subtitles before playback
 - **WHEN** the user opens Subtitles on an inactive supported video beneath the active root
@@ -32,8 +36,8 @@ vlcq SHALL expose a Subtitles action from Files and Queue row context menus, inc
 - **THEN** vlcq disables subtitles for that playback generation, identifies Off as active, and records the show preference only when remembering is enabled
 
 #### Scenario: Open an inactive row menu
-- **WHEN** the user opens a context menu for supported media that is not the validated current item
-- **THEN** Subtitles is available for offline inspection without playing, loading, or enqueueing that media
+- **WHEN** the user activates or right-clicks the subtitle subitem for supported media that is not the validated current item
+- **THEN** the subtitle picker remains open for offline inspection without playing, loading, or enqueueing that media, and the video's general context menu contains no duplicate Subtitles action
 
 #### Scenario: Current item changes before selection
 - **WHEN** playback changes after a current-media subtitle list opens but before a choice is applied

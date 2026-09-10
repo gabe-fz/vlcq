@@ -375,7 +375,11 @@ async def test_tui_lists_scroll_to_show_long_names_and_all_rows(tmp_path: Path) 
             assert view.show_vertical_scrollbar
             assert view.max_scroll_y > 0
             assert len(view.displayed_children) >= 5
-            assert all(row.region.height == 1 for row in view.displayed_children[:5])
+            assert all(row.region.height == 2 for row in view.displayed_children[:5])
+            assert all(
+                "↳ Subtitles:" in str(row.query_one(".subtitle-subitem", Button).label)
+                for row in view.displayed_children[:5]
+            )
 
         browser = app.query_one("#browser", ListView)
         rendered_names = [str(row.query_one(Label).renderable) for row in browser.children]

@@ -201,7 +201,7 @@ async def test_headers_lead_with_color_coded_pane_specific_controls(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_one_line_rows_are_literal_compact_and_semantically_independent(tmp_path: Path) -> None:
+async def test_video_rows_add_compact_subtitle_subitems_without_changing_metadata(tmp_path: Path) -> None:
     root = tmp_path / "library"
     root.mkdir()
     absent = root / "[WEB-DL][1080p] Episode [01] - A filename with literal brackets.mkv"
@@ -241,8 +241,10 @@ async def test_one_line_rows_are_literal_compact_and_semantically_independent(tm
         checkbox = rows[absent.resolve()].query_one(".browser-check", Button)
         assert checkbox.region.width <= 3
         assert checkbox.region.height == 1
-        assert all(row.region.height == 1 for row in browser.children)
+        assert all(row.region.height == 2 for row in browser.children)
+        assert all("↳ Subtitles:" in str(row.query_one(".subtitle-subitem", Button).label) for row in browser.children)
         queue_row = app.query_one("#queue", ListView).children[0]
+        assert queue_row.region.height == 2
         assert "×" in str(queue_row.query_one(Label).renderable)
         queue_label = queue_row.query_one(Label)
         queue_progress = queue_row.query_one(ItemProgress)
