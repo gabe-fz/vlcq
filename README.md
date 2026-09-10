@@ -112,9 +112,13 @@ duplicate process/poll loop and never selects, loads, or autoplays media.
 **Subtitles…** lists `Off` and only the tracks reported by the current owned VLC
 playback generation. Track IDs are used only for that immediate command; remembered
 choices store language and recognized full-dialogue, signs/songs, forced, and SDH
-characteristics so IDs and per-episode titles can change. If **Remember subtitles by
-show** is enabled, a successful vlcq choice (including **Off**) for a confidently
-inferred show wins over all automation. Otherwise, enabled **Prefer English subtitles**
+characteristics so IDs and per-episode titles can change. The supported VLC 3 macOS
+status response does not identify its initially selected subtitle stream, so the picker
+truthfully marks **VLC current/default · exact track not reported** as active until vlcq
+successfully applies a generation-local track or Off choice. VLC payload variants that
+do report active flags are validated after selection. If **Remember subtitles by show**
+is enabled, a successful vlcq choice (including **Off**) for a confidently inferred
+show wins over all automation. Otherwise, enabled **Prefer English subtitles**
 tries confidently identified English full-dialogue first, then other English tracks;
 within a class it prefers non-forced and non-SDH tracks. If metadata is missing or no
 English track is identifiable, VLC's existing/default choice is preserved.

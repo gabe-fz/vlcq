@@ -395,6 +395,12 @@ class SubtitlePicker(ModalScreen[SubtitleChoice | None]):
     def compose(self) -> ComposeResult:
         yield Static("Subtitles", classes="dialog-title")
         with VerticalScroll(id="subtitle-picker-list"):
+            if not self._active_choice_is_identifiable():
+                yield Static(
+                    "● VLC current/default · exact track not reported",
+                    id="subtitle-active-unknown",
+                    classes="subtitle-choice",
+                )
             for index, choice in enumerate(self.choices):
                 if choice.mode == "off":
                     label = "Off"
@@ -409,6 +415,18 @@ class SubtitlePicker(ModalScreen[SubtitleChoice | None]):
                 )
         yield Button("Cancel", id="subtitle-cancel")
 
+    def _active_choice_is_identifiable(self) -> bool:
+        if self.active is not None:
+            if self.active.mode == "off":
+                return True
+            assert self.active.track is not None
+            return any(
+                track.track_id == self.active.track.track_id for track in self.snapshot.tracks
+            )
+        return not self.snapshot.tracks or any(
+            track.active is not None for track in self.snapshot.tracks
+        )
+
     def _is_active(self, choice: SubtitleChoice) -> bool:
         if self.active is not None:
             if self.active.mode != choice.mode:
@@ -418,6 +436,11 @@ class SubtitlePicker(ModalScreen[SubtitleChoice | None]):
             return self.active.track is not None and choice.track is not None and self.active.track.track_id == choice.track.track_id
         if choice.mode == "track" and choice.track is not None:
             return choice.track.active is True
+        if choice.mode == "off":
+            return not self.snapshot.tracks or (
+                any(track.active is not None for track in self.snapshot.tracks)
+                and not any(track.active is True for track in self.snapshot.tracks)
+            )
         return False
 
     def on_mount(self) -> None:

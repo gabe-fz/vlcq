@@ -344,9 +344,11 @@ async def test_real_vlc_subtitle_enumeration_selection_and_off(tmp_path: Path) -
             snapshot.target, SubtitleChoice.track_choice(snapshot.tracks[0])
         )
         assert selected.track is not None
+        assert controller.current_subtitle_choice == selected
         after_track = await client.status()
         assert after_track.path == before.path == media.resolve()
         await controller.select_subtitle(snapshot.target, SubtitleChoice.off())
+        assert controller.current_subtitle_choice == SubtitleChoice.off()
         after_off = await client.status()
         assert after_off.path == media.resolve()
         assert queue.current() is not None and queue.current().path == media.resolve()

@@ -119,6 +119,12 @@ def test_parse_subtitle_fixture_and_fail_closed_variants() -> None:
     assert tracks[0].full_dialogue is True
     assert tracks[1].signs_songs is True
     assert tracks[1].full_dialogue is False
+    assert all(track.active is None for track in tracks)
+    active_fixture = json.loads(json.dumps(fixture))
+    active_fixture["information"]["category"]["Stream 1"]["Active"] = True
+    active_fixture["information"]["category"]["Stream 2"]["Active"] = False
+    active_tracks = parse_subtitle_tracks(active_fixture)
+    assert [track.active for track in active_tracks] == [True, False]
     assert parse_subtitle_tracks({"state": "stopped"}) == ()
     with pytest.raises(VLCError, match="malformed"):
         parse_subtitle_tracks({"information": {"category": []}})

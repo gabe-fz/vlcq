@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from textual.widgets import Button
+from textual.widgets import Button, Static
 
 from vlcq.database import Database
 from vlcq.models import VLCStatus
@@ -44,15 +44,28 @@ async def test_subtitle_picker_selects_and_dismisses_at_compact_terminal_size(tm
         assert isinstance(app.screen, SubtitlePicker)
         assert app.query_one("#subtitle-picker-list").region.height <= 12
         assert any("Off" in str(button.label) for button in app.screen.query(Button))
+        assert "VLC current/default" in str(
+            app.screen.query_one("#subtitle-active-unknown", Static).render()
+        )
+        assert not any(str(button.label).startswith("●") for button in app.screen.query(Button))
         await pilot.click("#subtitle-choice-1")
         await pilot.pause()
         assert result and isinstance(result[0], SubtitleChoice)
         assert result[0].track is not None and result[0].track.track_id == "1"
         assert app.screen.__class__.__name__ == "Screen"
-        app.push_screen(SubtitlePicker(snapshot), result.append)
+
+        app.push_screen(SubtitlePicker(snapshot, result[0]), result.append)
         await pilot.pause()
+        assert not app.screen.query("#subtitle-active-unknown")
+        assert str(app.screen.query_one("#subtitle-choice-1", Button).label).startswith("●")
         await pilot.press("escape")
-        assert result[-1] is None
+
+        app.push_screen(SubtitlePicker(snapshot, SubtitleChoice.off()), result.append)
+        await pilot.pause()
+        assert not app.screen.query("#subtitle-active-unknown")
+        assert str(app.screen.query_one("#subtitle-choice-0", Button).label).startswith("● Off")
+        await pilot.press("escape")
+        assert result[-2:] == [None, None]
     db.close()
 
 

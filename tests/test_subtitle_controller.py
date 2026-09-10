@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,7 @@ from vlcq.database import Database
 from vlcq.models import VLCStatus
 from vlcq.queue import QueueService
 from vlcq.subtitles import SubtitleChoice, SubtitleDescriptor, SubtitleTrack
-from vlcq.vlc import VLCPlaylistItem
+from vlcq.vlc import VLCError, VLCPlaylistItem
 
 
 class SubtitleClient:
@@ -120,6 +121,42 @@ async def test_automatic_precedence_remembered_off_and_english_fallback(tmp_path
     choice = await controller.apply_automatic_subtitles()
     assert choice is not None and choice.mode == "off"
     assert client.selected[-1] is None
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_subtitle_target_is_rejected_without_a_command(tmp_path: Path) -> None:
+    db, _queue, controller, client, _video = setup(tmp_path)
+    db.set_prefer_english_subtitles(False)
+    await controller.play_index(0)
+    target = (await controller.discover_subtitles()).target
+    controller._generation += 1
+
+    with pytest.raises(VLCError, match="expired because playback changed"):
+        await controller.select_subtitle(target, SubtitleChoice.off())
+
+    assert client.selected == []
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_reported_active_state_must_confirm_subtitle_command(tmp_path: Path) -> None:
+    db, _queue, controller, client, _video = setup(tmp_path)
+    db.set_prefer_english_subtitles(False)
+    await controller.play_index(0)
+    target = (await controller.discover_subtitles()).target
+    client.tracks = tuple(
+        replace(track, active=track.track_id == "2") for track in client.tracks
+    )
+
+    with pytest.raises(VLCError, match="inconsistent active subtitle metadata"):
+        await controller.select_subtitle(
+            target, SubtitleChoice.track_choice(client.tracks[0])
+        )
+
+    assert client.selected == ["1"]
+    assert controller.status.state == "playing"
+    assert db.show_subtitle_preference(target.path, root=controller.queue.root) is None
     db.close()
 
 

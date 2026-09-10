@@ -463,7 +463,30 @@ class PlaybackController:
             and response.playlist_id != target.playlist_id
         ):
             raise VLCError("VLC changed playlist identity while selecting subtitles")
+        await self._confirm_subtitle_choice_locked(target, track_id)
         return response
+
+    async def _confirm_subtitle_choice_locked(
+        self, target: SubtitleTarget, track_id: str | None
+    ) -> None:
+        """Validate selection when this VLC payload variant reports active flags.
+
+        The supported VLC 3 macOS status payload does not report the selected
+        subtitle stream. Its authenticated successful command response remains
+        the confirmation boundary there. Variants that do expose active flags
+        must agree with the requested track or Off rather than being trusted
+        inconsistently.
+        """
+        snapshot = await self._subtitle_tracks_locked(target)
+        if not any(track.active is not None for track in snapshot.tracks):
+            return
+        active_ids = [track.track_id for track in snapshot.tracks if track.active is True]
+        if track_id is None:
+            if active_ids:
+                raise VLCError("VLC reported inconsistent active subtitle metadata")
+            return
+        if active_ids != [track_id]:
+            raise VLCError("VLC reported inconsistent active subtitle metadata")
 
     async def select_subtitle(
         self, target: SubtitleTarget, choice: SubtitleChoice
