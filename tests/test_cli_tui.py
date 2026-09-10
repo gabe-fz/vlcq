@@ -579,7 +579,9 @@ async def test_periodic_queue_refresh_reuses_and_updates_existing_rows(tmp_path:
         app.refresh_queue()
         await pilot.pause()
         assert view.children[0] is original_row
-        assert "PLAYING" in str(original_row.query_one(Label).renderable)
+        label = str(original_row.query_one(Label).renderable)
+        assert "◆" in label
+        assert "PLAYING" not in label
     db.close()
 
 
@@ -641,7 +643,9 @@ async def test_tui_search_filters_without_queueing_or_shortcut_leakage(tmp_path:
     (root / "completed.mkv").write_bytes(b"done")
     db = Database(tmp_path / "db.sqlite3")
     db.merge_progress(root / "alpha1.mkv", 1_000, 10_000)
+    db.merge_coverage(root / "alpha1.mkv", [(0, 1_000)], 10_000)
     db.merge_progress(root / "completed.mkv", 10_000, 10_000, completed=True)
+    db.merge_coverage(root / "completed.mkv", [(0, 10_000)], 10_000)
     app = VLCQApp(root=root, database=db, no_vlc=True)
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
@@ -861,6 +865,7 @@ async def test_tui_direct_resume_and_start_over_target_highlighted_item(tmp_path
     video.write_bytes(b"video")
     db = Database(tmp_path / "db.sqlite3")
     db.merge_progress(video, 2_000, 10_000)
+    db.merge_coverage(video, [(0, 1_000)], 10_000)
     app = VLCQApp(root=root, database=db, no_vlc=True)
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
@@ -878,6 +883,9 @@ async def test_tui_direct_resume_and_start_over_target_highlighted_item(tmp_path
         await pilot.pause()
         assert app.queue.current() is not None
         assert app.queue.current().state == "playing"
+        progress = db.progress_for(video)
+        assert progress["resume_position_ms"] == 0
+        assert progress["coverage_ms"] == 1_000
     db.close()
 
 
@@ -920,11 +928,12 @@ async def test_tui_empty_feedback_and_queue_state_indicators(tmp_path: Path) -> 
             for item in app.query_one("#queue", ListView).children
         ]
         rendered = "\n".join(labels)
-        assert "QUEUED" not in rendered
-        assert "PLAYING" in rendered
-        assert "PAUSED" not in rendered
-        assert "STOPPED" not in rendered
-        for state in ("SKIPPED", "COMPLETED", "MISSING", "FAILED"):
-            assert state in rendered
+        for repeated_state in (
+            "QUEUED", "PLAYING", "PAUSED", "STOPPED", "SKIPPED", "COMPLETED"
+        ):
+            assert repeated_state not in rendered
+        assert rendered.count("◆") == 1
+        assert "!" in rendered
+        assert "×" in rendered
         assert not app.query_one("#queue-empty", Static).display
     db.close()

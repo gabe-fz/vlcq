@@ -1,218 +1,216 @@
 # vlcq
 
-`vlcq` is a folder-first Textual interface for a deterministic, persistent VLC 3
-video queue on macOS. It browses a lazily expandable library tree without automatically
-enqueueing its contents, and keeps VLC's ephemeral playlist bounded to the active item
-plus at most one `vlcq`-authorized successor. `vlcq` remains authoritative for queue
-order and records monotonic playback history plus a separate trustworthy resume position
-in SQLite.
+`vlcq` is a macOS Textual wrapper around a deterministic, persistent queue for a
+dedicated VLC 3 process. It browses a root-confined library without modifying media,
+keeps VLC's ephemeral playlist to the current item plus at most one authorized
+successor, and stores private queue and playback state in SQLite.
 
-## Install
+## Install and run
 
-Requires Python 3.12+ and VLC 3 installed at `/Applications/VLC.app` or available
-as `vlc` on `PATH`.
+Requires Python 3.12+ and VLC 3 at `/Applications/VLC.app` or as `vlc` on `PATH`.
 
 ```sh
 python3 -m venv .venv
-.venv/bin/pip install -e .
+.venv/bin/pip install -e '.[dev]'
 .venv/bin/vlcq
 ```
 
-Running `vlcq` reopens the last library, or displays the native macOS folder
-chooser on first use. You can also open a specific root directly. The Files pane keeps
-that root visible while folders expand/collapse in place; normal discovery is lazy and
-search/filter discovery is recursive and asynchronous:
+A commandless run reopens the last library (or presents the macOS folder chooser on
+first use). Other entry points are:
 
 ```sh
 vlcq play ~/Videos/Show
-```
-
-Opening a folder only establishes the library root. Browse into subfolders,
-select videos, then add them. Explicit file arguments establish their nearest
-common parent as the root:
-
-```sh
 vlcq play ~/Videos/Show/e01.mkv ~/Videos/Show/e02.mkv
+vlcq add ~/Videos/Show/e03.mkv
 vlcq resume
 vlcq progress --root ~/Videos --json
 ```
 
-## TUI controls and playback choices
+Opening a folder establishes the library root but does not enqueue its contents.
+Explicit files must remain under the active canonical root.
 
-The main screen is a stacked **Files** section above a **Queue** section. Both start
-expanded and share the available list space; click `▾`/`▸` to collapse or restore either
-section. Each section’s compact root/count metadata appears immediately after its name,
-followed by color-coded controls. Metadata is width-limited so it cannot push controls to
-the right edge. Wider terminals progressively expose additional
-pane-specific actions (file navigation/sort/selection, queue management, and VLC/system
-controls) instead of leaving useful space empty. Unavailable contextual actions such as
-**Undo**, **Clear selection**, or **Clear watched** stay out of the bar. The `…` control appears
-only while useful actions remain hidden and never duplicates buttons already on screen.
-Right-clicking a row
-opens actions for that specific item,
-and `Shift+F10` is the keyboard fallback. Menus remain inside the terminal and scroll when
-needed.
+## Two-pane workflow
 
-Rows are one line: filenames remain literal, including bracketed release tags, while
-folders, stems, bracketed spans, numeric runs, punctuation, and extensions use distinct
-syntax colors. Checkbox targets select library videos. Files and Queue items with positive
-history show a thick read-only bar and whole percentage; unknown durations show `?%`.
-A queue-row highlight is a durable, identity-based Details selection and never starts
-playback; the diamond marks the independent current playback item. Pending queue position
-is implicit rather than a `QUEUED` badge. Only the current row may show **Playing**,
-**Paused**, or **Stopped**; **Skipped**, **Completed**, **Missing**, and **Failed** remain
-visible as outcomes. Unplayed rows omit a history badge. Click a folder to expand it.
-Full paths, resume/furthest positions, durations, watched threshold, fingerprints, and
-missing history are available through **Details**.
+The main screen contains only full-width **Files** above **Queue**. Both start expanded
+and split available list space equally. Each can be collapsed independently without
+losing tree expansion, selection, highlight, or scroll position; if both are collapsed,
+their one-line headers and Queue application menu remain reachable.
 
-The Files header exposes **Open**, **Search/filter**, **Add**, and file actions; Queue exposes
-**Remove**, **Move up/down**, **Clear**, and queue actions; the status pane exclusively owns
-**Previous**, **Play/pause**, **Next**, and VLC/application actions. File item context menus
-retain history **Details** where the player status cannot represent them; Queue omits Details
-because active metadata is already in the status pane. Item resume/start-over actions remain
-contextual, while section menus stay pane-specific. Search and
-**All / In progress / Not watched** filters discover
-the whole root without enqueueing results. The Files header keeps active search/filter and
-selected/hidden counts visible. Selections remain explicit across filtering, collapsing,
-and resizing. **Play now** always targets the highlighted item, while **Add to end**,
-**Play next**, and **Add & play** use the selected batch when one exists.
+The Files header provides **Open**, **Search/filter**, **Add**, and an overflow menu. The
+Queue header provides removal, reorder, clear actions, and an overflow menu. Right-click
+opens row-specific actions; `Shift+F10` is the keyboard menu fallback. Queue overflow
+always provides **Reconnect**, **Help**, and **Quit**, even with an empty queue or no
+selected row. Queue **Details** is available on demand and is not a persistent player
+panel.
 
-Selecting an incomplete item with a trustworthy resume point opens **Resume**, **Start
-over**, or **Cancel**. Legacy rows use **Resume from furthest recorded progress**; their
-last-played time remains unknown. Start over preserves maximum history and completion.
-An item is **Watched** when explicit completion exists or furthest progress reaches the
-configured threshold (90% by default). Threshold classification never advances playback
-or changes queue outcome state. Set `VLCQ_WATCHED_PERCENT` to a whole number from 1 through
-100; invalid values fail startup before database mutation. Automatic advancement uses a
-trustworthy resume without opening a modal.
+Files are shown in one lazy inline tree. Multiple branches can remain expanded. Search
+is case-insensitive, recursive, asynchronous, and root-confined. **All**, **In progress**,
+and **Not watched** use historical coverage. Explicit selections survive filtering and
+collapsing; the Files header reports selected and hidden-selected counts. Enter/Play
+always targets the highlighted item rather than an unrelated selected batch.
 
-The bottom status pane is a color-coded metadata surface: it shows the active filename and
-source folder, player/VLC state, elapsed, remaining, and total time, a thick live progress
-track/percentage, transport controls, and the complete wrapping last notice. These are
-always visible metadata rather than overflow buttons. The player overflow is reserved for
-relative seek, reconnect, Help, and Quit. Reconnect never selects or autoplays a queue item.
-Absolute seek is available only for connected matching media with a known positive duration;
-item history bars are inert.
+Rows remain one line and filenames remain literal while folders, stem text, bracketed
+spans, numbers, punctuation, and extensions use semantic colors. Compact markers convey
+selection, queued membership, and the current item without relying on color. Missing and
+failed queue entries retain `!`/`×` indicators. Ordinary queued, playing, paused,
+stopped, skipped, completed, and watched labels are intentionally not repeated in rows;
+queue outcomes remain available in Details.
 
-When `vlcq` owns VLC 3, VLC's native **Next** button is supported: the controller
-reconciles the observed staged successor into the authoritative queue without replaying
-it. The VLC process starts with repeat-current, repeat-all, and random playback explicitly
-disabled, regardless of saved VLC preferences. The window is never a full queue mirror;
-there is no native Previous support in this change, and media opened directly or through
-untracked VLC playlist navigation is rejected rather than adopted. Use `vlcq`'s **Previous**
-and **Next** controls (or `p` and `n`) for authoritative queue navigation.
+### Current view versus historical coverage
 
-## TUI keys
+Files rows show the filename and `hist N%` only—never a progress bar. Queue rows show:
+
+```text
+◆ episode.mkv  [████░░░░] 40% 12:00/30:00  hist 85%
+```
+
+The Queue bar, percentage, and time are the current/latest viewing position. For the
+active item they use matching live VLC state; inactive rows use the last trustworthy
+resume position. New entries begin at zero. Legacy-only rows with no trustworthy resume
+position show unknown rather than substituting their old maximum. **Start over** writes a
+zero resume position immediately but never clears coverage or legacy history.
+
+`hist` is the union of unique confirmed played ranges across all viewings, not the
+furthest reached position and not elapsed wall time. Replaying an overlap adds no credit,
+and disjoint playback never fills the gap. Percentages use floor rounding, so incomplete
+99.x% evidence never displays as 100%. `—` means coverage is absent/uninitialized;
+initialized tracking with known duration but no qualified ranges displays 0%. Unknown or
+nonpositive duration produces an unknown percentage.
+
+Coverage requires at least five seconds of coherent, advancing `playing` observations
+for the same validated media/generation/playlist identity at a finite positive VLC rate.
+Request timing, a five-second maximum observation gap, and one media-second of VLC 3
+integer-timestamp tolerance bound accepted intervals. Seeks, rate changes, stalls,
+pauses, previews shorter than five seconds, stale or slow polls, reconnects, failures,
+scrubbing, and item transitions reset pending evidence. Ambiguous evidence is
+intentionally undercounted. End inference and Next never fill an unseen tail or force
+100%; only actually qualified ranges are stored. This measures conservative observed
+playback, not human attention and not every tiny native seek.
+
+The watched threshold defaults to 90% unique coverage and can be changed with a whole
+`VLCQ_WATCHED_PERCENT=1..100`. Invalid values fail before queue/history mutation. The
+same raw threshold drives replay choices and Files filters. Reaching it does not stop,
+advance, or rewrite queue outcome state. Explicit completed queue outcomes remain
+eligible for finished-entry navigation and Clear completed independently.
+
+## Playback controls
+
+Visible pause, seek, Previous, and Next controls belong to the owned VLC window. `vlcq`
+keeps its keyboard transport shortcuts and contextual **Play**, **Resume**, and **Start
+over** actions, but has no toolbar, persistent status/player pane, transport menu entries,
+or clickable seek track. Queue progress is read-only.
+
+VLC's native **Next** is supported because vlcq stages and validates one authorized
+successor. Native Previous and arbitrary VLC playlist navigation are not supported;
+unexpected media fails closed instead of inheriting history. Reconnect creates no
+duplicate process/poll loop and never selects, loads, or autoplays media.
+
+Relevant connection transitions, errors, and action feedback use a dismissible one-line
+notice that reserves no space while hidden. Its complete last text is available from
+Queue overflow. Healthy/idle state and duplicate active-file metadata are not displayed
+below the lists.
+
+## Keys
 
 | Key | Action |
 | --- | --- |
 | `o` | Open/change library root |
-| Up/Down | Browse |
-| Right | Enter highlighted folder; seek forward when the queue has focus |
-| `Enter` | Enter folder or play video now |
-| Left / `Backspace` | Parent folder; Left seeks backward outside the browser |
-| `v` | Toggle video selection |
-| `a` / `A` | Add / add and play the highlighted video, or use the explicit `v` selection |
-| `Space` | Pause/resume |
+| Up/Down | Move highlight |
+| Right / Enter | Expand folder or play highlighted video |
+| Left / Backspace | Collapse/go to parent; Left seeks backward outside Files |
+| `v` | Toggle explicit video selection |
+| `a` / `A` | Add / add and play highlighted or explicitly selected videos |
+| `Space` | Play/pause |
 | `n` / `p` | Next/previous |
-| Left / `[` / `]` | Seek backward / forward 10 seconds |
-| `d` | Remove queue entry (never the media file) |
+| `[` / `]` | Seek backward/forward 10 seconds |
+| `d` / Delete | Remove queue entry only |
 | `J` / `K` | Move queue entry down/up |
-| `r` | Retry selected queue entry |
-| `c` | Clear watched/completed entries |
-| `Shift+F10` | Open contextual actions for the focused section |
+| `r` | Retry/reconnect as applicable |
+| `c` | Confirm and clear watched/completed entries |
+| `Shift+F10` | Open contextual actions |
 | `?` | Help |
-| `q` | Quit after choosing whether to stop or keep the owned VLC process |
+| `q` | Quit after choosing whether to stop or keep owned VLC |
 
-Add-to-end is idempotent; Play next moves existing entries without duplication and never
-restarts the active entry. Add-and-play commits a batch only after its resume choice, so
-Cancel cannot insert or reorder media. Clear confirms before removing queue entries and
-never deletes media. Removing active playback first requires a confirmed stop and never
-starts a successor. Successful removal or clear offers one in-memory undo; another queue
-mutation, automatic advancement, root change, or shutdown expires it. Missing media can
-be restored as visibly missing, while unsafe or replaced paths are rejected.
+Text inputs own ordinary typing, so shortcut letters do not trigger application actions.
+Clear operations require confirmation and never delete media. One in-memory undo follows
+a successful removal/clear until another queue mutation, advancement, root change, or
+shutdown.
 
-Empty sections show one short next-action hint, focused sections receive a distinct
-highlight, and the Files header reports the root without repeating the currently expanded
-folder. Queue rows display current-state or outcome indicators (`▶ PLAYING`,
-`Ⅱ PAUSED`, `■ STOPPED`, `→ SKIPPED`, `✓ COMPLETED`, `! MISSING`, and `× FAILED`). Hidden
-dotfiles and unsupported file types are not shown.
+## Progress export compatibility
 
-## Watched threshold
+`vlcq progress --root PATH --json` remains a version-1, canonical root-relative document.
+Existing fields retain their historical meanings:
 
-Watched status is derived from explicit completion or furthest recorded progress. The
-threshold defaults to 90 percent and can be set before startup with
-`VLCQ_WATCHED_PERCENT=1..100`. Only decimal whole percentages are accepted; an invalid
-value exits clearly without opening or changing the database. The setting changes display,
-filters, replay choices, Clear watched/completed, and `progress --json` classification, but
-never rewrites stored completion evidence or queue outcomes.
+- `positionMs`: legacy furthest position
+- `durationMs`: stored known duration
+- `watchedPercent`: legacy furthest-position percentage
+- `completionObserved`: legacy completion/threshold classification
+- `observedAt`: legacy observation timestamp
 
-## Finder / right-click handoff
+The command adds separately named `coverageMs`, `coveragePercent`, and
+`coverageWatched`. Uninitialized coverage is `null`; initialized coverage without a
+qualified range is zero milliseconds. Unknown duration makes coverage percentage and
+classification `null`. Legacy classification can therefore differ from the coverage-based
+UI and policy. Consumers should use this command rather than SQLite internals.
+Replaced, missing, symlink-escaped, and out-of-root identities are not exported.
 
-The portable integration boundary is:
+## Finder handoff
+
+The Finder/Automator boundary is:
 
 ```sh
 vlcq finder-handoff "$@"
 ```
 
-Create a Finder Quick Action in Automator that receives files or folders, add a
-**Run Shell Script** action with input passed *as arguments*, and invoke the
-command above using its absolute installed path. A folder opens as the root;
-selected files use their canonical nearest common parent. Mixed folder/file
-arguments and unsafe/out-of-root selections are rejected.
+A folder intentionally changes root. Explicit files stay under an existing active root;
+mixed folder/file and unsafe selections are rejected.
 
-## Storage, locking, and privacy
+## Storage, privacy, migration, and rollback
 
-State defaults to `~/Library/Application Support/vlcq/vlcq.sqlite3`. Its
-directory and files are private to the user; SQLite uses WAL and a busy timeout.
-An advisory lock prevents a second controller from independently mutating the
-queue. A second process exits clearly rather than risking corruption.
+State defaults to `~/Library/Application Support/vlcq/vlcq.sqlite3`; its directory is
+mode 0700 and database/WAL files are mode 0600. Coverage ranges are compact merged
+half-open millisecond intervals tied to the existing canonical file fingerprint. No raw
+poll event log, attention tracking, telemetry, remote request, VLC credential, raw status
+payload, or unrelated media path is recorded.
 
-VLC is launched as a dedicated process with its normal macOS video interface
-visible and an authenticated HTTP interface bound to `127.0.0.1`. Its launch command
-explicitly passes `--no-repeat`, `--no-loop`, and `--no-random`; users can still change
-VLC controls while it runs, but `vlcq` fails closed if VLC does not remain within the
-bounded window. The generated password, Authorization header, raw VLC responses, and media
-history are not logged. `vlcq` performs no non-loopback
-network requests and never deletes, moves, copies, or modifies media files.
+Schema version 3 adds nullable coverage initialization and range storage transactionally.
+Version 1/2 queue order, current/selected identities, resume position, legacy maximum,
+completion, fingerprints, and timestamps are retained. Migration deliberately infers no
+coverage from old maximum/completion evidence. A migration failure rolls back and reports
+recovery guidance without replacing the database.
 
-## Private backup and rollback
-
-Before testing a new binary against an important queue, make a private SQLite backup with
-the SQLite backup API (including WAL state), for example:
+Before upgrading an important database, close vlcq and take a private SQLite backup that
+includes WAL state:
 
 ```sh
 .venv/bin/python - <<'PY'
 import sqlite3
 from pathlib import Path
 source = Path.home() / "Library/Application Support/vlcq/vlcq.sqlite3"
-backup = source.with_name("vlcq.sqlite3.before-change")
+backup = source.with_name("vlcq.sqlite3.before-v3")
 with sqlite3.connect(source) as src, sqlite3.connect(backup) as dst:
     src.backup(dst)
 PY
 ```
 
-Schema v2 is preservation-first. Do not decrement `PRAGMA user_version`, delete the new
-resume columns, or downgrade in place. To roll back to a version-1 binary, close vlcq and
-restore the private backup; observations recorded after that backup are intentionally lost.
+Older binaries reject schema 3. Rollback means closing vlcq and restoring the backup—not
+decrementing `PRAGMA user_version` or deleting tables. Progress after the backup will be
+lost.
 
-## Development and tests
+VLC is launched with its visible macOS interface plus an authenticated loopback-only HTTP
+interface and with repeat/loop/random disabled. `vlcq` performs no non-loopback network
+requests and never deletes, moves, copies, or edits media.
 
-```sh
-.venv/bin/pip install -e '.[dev]'
-.venv/bin/python -m pytest
-.venv/bin/python -m ruff check .
-.venv/bin/python -m mypy src
-```
-
-The normal suite uses fake/mock VLC interfaces and Textual's headless Pilot.
-A real installed VLC 3 startup/authentication/shutdown smoke test is opt-in:
+## Development and verification
 
 ```sh
-VLCQ_REAL_VLC=1 .venv/bin/python -m pytest tests/test_integration_real_vlc.py
+.venv/bin/pytest
+.venv/bin/ruff check .
+.venv/bin/mypy src
+openspec validate simplify-progress-with-watched-coverage --strict
+VLCQ_REAL_VLC=1 .venv/bin/pytest tests/test_integration_real_vlc.py
 ```
 
-It is skipped when not explicitly enabled or when the macOS VLC application is
-unavailable. The opt-in test uses generated temporary media and exercises native Next,
-natural transitions, bounded playlist contents, queue outcomes, and clean shutdown; it
-never uses user media or credentials.
+The normal suite uses mock VLC and Textual's headless Pilot. Real-VLC tests generate only
+temporary media and state, verify VLC 3 timing/rate assumptions and native transitions,
+and cleanly stop the owned process. An environment-dependent skip is not release evidence.

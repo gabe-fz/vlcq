@@ -3,7 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .progress import clamped_percentage, is_watched
+from .progress import (
+    MillisecondRange,
+    clamped_percentage,
+    coverage_category,
+    coverage_is_watched,
+    coverage_percentage,
+    is_watched,
+)
 
 
 @dataclass(frozen=True)
@@ -64,10 +71,17 @@ class HistoryProjection:
     first_observed: str | None
     last_observed: str | None
     last_played_at: str | None
+    coverage_initialized_at: str | None = None
+    coverage_ranges: tuple[MillisecondRange, ...] = ()
+    coverage_ms: int | None = None
 
     @property
     def fallback_resume_position_ms(self) -> int | None:
-        if self.resume_position_ms is None and not self.completion_observed and self.position_ms > 0:
+        if (
+            self.resume_position_ms is None
+            and not self.completion_observed
+            and self.position_ms > 0
+        ):
             return self.position_ms
         return None
 
@@ -95,6 +109,19 @@ class HistoryProjection:
     def percentage(self) -> int | None:
         return clamped_percentage(self.position_ms, self.duration_ms)
 
+    def coverage_percentage(self) -> int | None:
+        if self.coverage_ms is None:
+            return None
+        return coverage_percentage(self.coverage_ms, self.duration_ms)
+
+    def coverage_watched(self, threshold: int = 90) -> bool:
+        return self.coverage_ms is not None and coverage_is_watched(
+            self.coverage_ms, self.duration_ms, threshold=threshold
+        )
+
+    def coverage_category(self, threshold: int = 90) -> str:
+        return coverage_category(self.coverage_ms, self.duration_ms, threshold=threshold)
+
 
 @dataclass(frozen=True)
 class VLCStatus:
@@ -103,6 +130,9 @@ class VLCStatus:
     duration_ms: int = 0
     path: Path | None = None
     playlist_id: str | None = None
+    rate: float | None = None
+    request_started: float | None = None
+    response_received: float | None = None
 
     @property
     def vlc_id(self) -> str | None:

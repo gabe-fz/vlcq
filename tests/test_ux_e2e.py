@@ -72,8 +72,9 @@ async def test_mouse_workflow_at_compact_and_wide_sizes(tmp_path: Path, size: tu
         await pilot.pause()
         assert app.queue.current() is not None
 
-        # Promoted mouse transport stays direct rather than being duplicated in overflow.
-        await pilot.click("#player-pause")
+        # Ordinary transport remains keyboard-driven in vlcq; VLC owns visible controls.
+        assert not app.query("#player-pause")
+        await pilot.press("space")
         await pilot.pause()
         browser.index = 1
         await pilot.click(".browser-check")
@@ -97,12 +98,9 @@ async def test_mouse_workflow_at_compact_and_wide_sizes(tmp_path: Path, size: tu
         await undo_queue(pilot)
         assert len(app.queue.entries()) == before_undo
 
-        await choose_menu_action(pilot, "#player-menu", "Help")
+        await choose_menu_action(pilot, "#queue-actions", "Help")
         await pilot.click("#help-close")
-        assert any(
-            state in str(app.query_one("#player-meta").renderable).lower()
-            for state in ("offline", "disconnected")
-        )
-        await choose_menu_action(pilot, "#player-menu", "Quit")
+        assert not app.query("#player-meta")
+        await choose_menu_action(pilot, "#queue-actions", "Quit")
 
     db.close()

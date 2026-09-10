@@ -7,7 +7,6 @@ from pathlib import Path
 from .database import Database
 from .models import QueueEntry
 from .paths import VIDEO_EXTENSIONS, deduplicate_natural, is_beneath, natural_key, validate_video
-from .progress import is_watched
 
 
 class ActivePlaybackError(RuntimeError):
@@ -115,26 +114,15 @@ class QueueService:
         """
         entries = self.entries()
         current_id = self.database.get_current_id()
-        ordered = [
-            index
-            for index, entry in enumerate(entries)
-            if entry.id == current_id
-        ] + [
-            index
-            for index, entry in enumerate(entries)
-            if entry.id != current_id
+        ordered = [index for index, entry in enumerate(entries) if entry.id == current_id] + [
+            index for index, entry in enumerate(entries) if entry.id != current_id
         ]
         for index in ordered:
             entry = entries[index]
             if entry.state == "completed":
                 continue
             history = self.database.history_for(entry.path, root=self.root)
-            if history is not None and is_watched(
-                history.position_ms,
-                history.duration_ms,
-                completion_observed=history.completion_observed,
-                threshold=self.watched_percent,
-            ):
+            if history is not None and history.coverage_watched(self.watched_percent):
                 continue
             return index
         return None
@@ -284,12 +272,7 @@ class QueueService:
                 selected.append(entry)
                 continue
             history = self.database.history_for(entry.path, root=self.root)
-            if history is not None and is_watched(
-                history.position_ms,
-                history.duration_ms,
-                completion_observed=history.completion_observed,
-                threshold=self.watched_percent,
-            ):
+            if history is not None and history.coverage_watched(self.watched_percent):
                 selected.append(entry)
         if not selected:
             return
@@ -311,11 +294,7 @@ class QueueService:
         if not selected:
             return
         current = self.current()
-        if (
-            current is not None
-            and current.state in {"playing", "paused"}
-            and not stop_confirmed
-        ):
+        if current is not None and current.state in {"playing", "paused"} and not stop_confirmed:
             raise ActivePlaybackError("stop VLC playback before clearing the active entry")
         if current is not None and current.state in {"playing", "paused"} and stop_confirmed:
             self.set_current_state(current.id, "stopped")
@@ -381,6 +360,14 @@ class QueueService:
             self.database.set_state(entry.id, "missing")
             raise FileNotFoundError("video is missing")
         return self.play_now(index)
+
+    def update_coverage(
+        self,
+        path: Path,
+        ranges: Sequence[tuple[int, int]],
+        duration_ms: int = 0,
+    ) -> None:
+        self.database.merge_coverage(path.resolve(), ranges, duration_ms)
 
     def update_progress(
         self,

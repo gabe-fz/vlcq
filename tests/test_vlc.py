@@ -107,6 +107,7 @@ def test_parse_status_is_tolerant_and_rejects_remote_media(tmp_path: Path) -> No
             "state": "playing",
             "time": 12,
             "length": 30,
+            "rate": 1.5,
             "information": {"category": {"meta": {"uri": video.as_uri()}}},
         }
     )
@@ -114,8 +115,11 @@ def test_parse_status_is_tolerant_and_rejects_remote_media(tmp_path: Path) -> No
         status.state == "playing"
         and status.position_ms == 12_000
         and status.path == video.resolve()
+        and status.rate == 1.5
     )
     assert status.playlist_id is None
+    for invalid_rate in (None, 0, -1, "nan", "inf", {}, True):
+        assert parse_status({"state": "playing", "rate": invalid_rate}).rate is None
     with pytest.raises(VLCError):
         parse_status(
             {"state": "playing", "information": {"category": {"meta": {"uri": "https://x/a"}}}}
@@ -225,6 +229,11 @@ async def test_client_auth_commands_and_no_redirects(tmp_path: Path) -> None:
     assert status.state == "paused"
     await client.command("pl_pause")
     assert requests[-1].url.params["command"] == "pl_pause"
+    await client.set_rate(1.5)
+    assert requests[-1].url.params["command"] == "rate"
+    assert requests[-1].url.params["val"] == "1.5"
+    with pytest.raises(VLCError, match="finite and positive"):
+        await client.set_rate(float("nan"))
     assert requests[-1].headers["authorization"].startswith("Basic ")
     await client.close()
 

@@ -13,6 +13,8 @@ from vlcq.tui import (
     ActionMenu,
     ContextAction,
     FileTarget,
+    HistoricalCoverage,
+    ItemProgress,
     QueueTarget,
     VLCQApp,
 )
@@ -87,12 +89,13 @@ async def test_stacked_sections_collapse_and_resize_without_rebuilding(
         await pilot.pause()
         assert browser.children[2] is original_browser_row
         assert browser.index == 2
-        assert app.query_one("#player").display
+        assert not app.query("#status-pane")
+        assert not app.query("#player")
         app._toggle_section("files")
         app._toggle_section("queue")
         assert app.query_one("#files-header").display
         assert app.query_one("#queue-header").display
-        assert app.query_one("#player-line").display
+        assert app.query_one("#queue-actions").display
     db.close()
 
 
@@ -119,24 +122,25 @@ async def test_headers_lead_with_color_coded_pane_specific_controls(tmp_path: Pa
         assert app.query_one("#queue-remove", Button).variant == "error"
         assert app.query_one("#files-sort", Button).display
         assert not app.query_one("#queue-undo", Button).display
-        assert app.query_one("#player-seek-back", Button).display
+        assert not app.query("#player-seek-back")
         assert not app.query_one("#files-clear-selection", Button).display
         assert not app.query_one("#files-actions", Button).display
-        assert not app.query_one("#player-help", Button).display
-        assert app.query_one("#player-menu", Button).display
-        await pilot.click("#player-menu")
-        assert {str(button.label) for button in app.screen.query(Button)} == {"Help", "Quit"}
+        assert app.query_one("#queue-actions", Button).display
+        await pilot.click("#queue-actions")
+        assert {str(button.label) for button in app.screen.query(Button)} == {
+            "Reconnect", "Help", "Quit", "Last notice details"
+        }
         await pilot.press("escape")
 
         await pilot.resize_terminal(160, 30)
         await pilot.pause()
         assert not app.query_one("#files-clear-selection", Button).display
         assert not app.query_one("#queue-clear-all", Button).display
-        assert app.query_one("#player-help", Button).display
-        assert app.query_one("#player-quit", Button).display
+        assert not app.query("#player-help")
+        assert not app.query("#player-quit")
         assert not app.query_one("#files-actions", Button).display
-        assert not app.query_one("#queue-actions", Button).display
-        assert not app.query_one("#player-menu", Button).display
+        assert app.query_one("#queue-actions", Button).display
+        assert not app.query("#player-menu")
 
         selected_path = (nested / "episode-00.mkv").resolve()
         app.selected_paths.add(selected_path)
@@ -150,10 +154,10 @@ async def test_headers_lead_with_color_coded_pane_specific_controls(tmp_path: Pa
         await pilot.pause()
         assert not app.query_one("#files-sort", Button).display
         assert not app.query_one("#queue-undo", Button).display
-        assert not app.query_one("#player-seek-back", Button).display
+        assert not app.query("#player-seek-back")
         assert app.query_one("#files-actions", Button).display
         assert app.query_one("#queue-actions", Button).display
-        assert app.query_one("#player-menu", Button).display
+        assert not app.query("#player-menu")
 
         await pilot.click("#files-actions")
         files_actions = {str(button.label) for button in app.screen.query(Button)}
@@ -161,23 +165,18 @@ async def test_headers_lead_with_color_coded_pane_specific_controls(tmp_path: Pa
         await pilot.press("escape")
         await pilot.click("#queue-actions")
         queue_actions = {str(button.label) for button in app.screen.query(Button)}
-        assert queue_actions == {"Clear queue"}
+        assert queue_actions == {
+            "Details", "Clear queue", "Reconnect", "Help", "Quit", "Last notice details"
+        }
         await pilot.press("escape")
         queue_entry = app.queue.entries()[0]
         row_actions = app._context_actions_for_queue(
             QueueTarget(queue_entry.id, app._root_generation)
         )
-        assert "Details" not in {action.label for action in row_actions}
-
-        await pilot.click("#player-menu")
-        player_actions = {str(button.label) for button in app.screen.query(Button)}
-        assert player_actions == {
-            "Seek back 10s",
-            "Seek forward 10s",
-            "Reconnect",
-            "Help",
-            "Quit",
-        }
+        assert "Details" in {action.label for action in row_actions}
+        assert {"Previous", "Next", "Seek back 10s"}.isdisjoint(
+            {action.label for action in row_actions}
+        )
 
     db.close()
 
@@ -193,7 +192,9 @@ async def test_one_line_rows_are_literal_compact_and_semantically_independent(tm
         path.write_bytes(b"video")
     db = Database(tmp_path / "state.sqlite3")
     db.merge_progress(progress, 8_000, 42_000)
+    db.merge_coverage(progress, [(0, 8_000)], 42_000)
     db.merge_progress(completed, 42_000, 42_000, completed=True)
+    db.merge_coverage(completed, [(0, 42_000)], 42_000)
     queue = QueueService(db)
     queue.open(root)
     queue.add([completed])
@@ -210,16 +211,19 @@ async def test_one_line_rows_are_literal_compact_and_semantically_independent(tm
         completed_label = rows[completed.resolve()].query_one(Label)
         assert absent.name in str(absent_label.renderable)
         assert "No recorded progress" not in str(absent_label.renderable)
-        assert "In progress" in str(progress_label.renderable)
-        assert "Completed" in str(completed_label.renderable)
+        assert "In progress" not in str(progress_label.renderable)
+        assert "Completed" not in str(completed_label.renderable)
+        assert "hist  19%" in str(rows[progress.resolve()].query_one(HistoricalCoverage).renderable)
+        assert "hist 100%" in str(rows[completed.resolve()].query_one(HistoricalCoverage).renderable)
         checkbox = rows[absent.resolve()].query_one(".browser-check", Button)
         assert checkbox.region.width <= 3
         assert checkbox.region.height == 1
         assert all(row.region.height == 1 for row in browser.children)
         queue_row = app.query_one("#queue", ListView).children[0]
-        assert "FAILED" in str(queue_row.query_one(Label).renderable)
-        assert "Completed" in str(queue_row.query_one(Label).renderable)
-        assert "No recorded progress" not in str(queue_row.query_one(Label).renderable)
+        assert "×" in str(queue_row.query_one(Label).renderable)
+        assert "Completed" not in str(queue_row.query_one(Label).renderable)
+        assert "hist 100%" in str(queue_row.query_one(HistoricalCoverage).renderable)
+        assert "100%" in str(queue_row.query_one(ItemProgress).renderable)
     db.close()
 
 
@@ -246,24 +250,25 @@ async def test_details_is_read_only_complete_and_fingerprint_matched(tmp_path: P
         await pilot.pause()
         content = str(app.query_one("#details-content", Static).renderable)
         assert f"Full path: {absent.resolve()}" in content
-        assert "No recorded progress" in content
-        assert "Resume position: unknown" in content
+        assert "History: absent" in content
+        assert "Current/resume position: unknown" in content
         await pilot.click("#details-close")
         browser.index = next(i for i, entry in enumerate(app.browser_entries) if entry.path == known.resolve())
         await app._open_details()
         await pilot.pause()
         content = str(app.query_one("#details-content", Static).renderable)
-        assert "Resume position: 0:04" in content
-        assert "Furthest progress: 0:08" in content
+        assert "Current/resume position: 0:04" in content
+        assert "Historical coverage: —" in content
+        assert "Legacy maximum: 0:08" in content
         assert "Duration: 0:42" in content
-        assert "Last played: 2026-01-02T03:04:05+00:00" in content
+        assert "Last trustworthy playback: 2026-01-02T03:04:05+00:00" in content
         await pilot.click("#details-close")
         known.write_bytes(b"replacement-with-a-new-fingerprint")
         await app._open_details()
         await pilot.pause()
         content = str(app.query_one("#details-content", Static).renderable)
-        assert "No recorded progress" in content
-        assert "Resume position: unknown" in content
+        assert "History: absent" in content
+        assert "Current/resume position: unknown" in content
         assert db.connection.execute("SELECT COUNT(*) FROM media").fetchone()[0] == media_before
         assert db.connection.execute("SELECT last_observed FROM media").fetchone()[0] == observed_before
     db.close()
@@ -375,7 +380,7 @@ async def test_on_demand_search_and_hidden_selection_summary(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_status_pane_integrates_player_metadata_notice_and_system_menu(tmp_path: Path) -> None:
+async def test_two_pane_live_row_transient_notice_and_queue_application_menu(tmp_path: Path) -> None:
     root = tmp_path / "library"
     video = make_files(root, 1)[0]
     db = Database(tmp_path / "state.sqlite3")
@@ -387,62 +392,50 @@ async def test_status_pane_integrates_player_metadata_notice_and_system_menu(tmp
 
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause(0.1)
-        app.no_vlc = False
-        app.controller.client = object()  # type: ignore[assignment]
         app.controller.status = VLCStatus("playing", 5_000, 20_000, video.resolve())
         app.refresh_playback()
-        player = str(app.query_one("#player", Static).renderable)
-        metadata = str(app.query_one("#player-meta", Static).renderable)
-        assert player.count(video.name) == 1
-        assert str(video.parent.resolve()) in player
-        assert "PLAYING" in metadata
-        assert "REMAINING  0:15" in metadata
-        assert "DURATION  0:20" in metadata
-        assert "25%" in str(app.query_one("#progress-percent", Static).renderable)
+        queue_row = app.query_one("#queue", ListView).children[0]
+        assert "25%" in str(queue_row.query_one(ItemProgress).renderable)
+        assert video.name in str(queue_row.query_one(Label).renderable)
+        assert not app.query("#status-pane")
+        assert not app.query("#player")
+        assert not app.query_one("#notice").display
+
         app.update_status("A very long playback failure notice with complete details")
-        assert "complete details" in str(app.query_one("#notice", Static).renderable)
+        await pilot.pause()
+        notice = app.query_one("#notice", Static)
+        assert notice.display and notice.region.height == 1
+        assert "complete details" in str(notice.renderable)
+        await pilot.click("#notice")
+        assert not notice.display
+
         await pilot.click("#files-toggle")
         await pilot.click("#queue-toggle")
         await pilot.pause()
-        assert app.query_one("#player-line").display
-        assert app.query_one("#progress-line").display
-        assert app.query_one("#notice").display
-        async def overflow_action(label: str) -> Button:
-            await pilot.click("#player-menu")
-            await pilot.pause()
-            button = next(button for button in app.screen.query(Button) if str(button.label) == label)
-            await pilot.click(button)
-            await pilot.pause()
-            return button
-
-        await pilot.click("#player-menu")
+        assert app.query_one("#files-header").display
+        assert app.query_one("#queue-header").display
+        await pilot.click("#queue-actions")
         await pilot.pause()
         overflow_labels = {str(button.label) for button in app.screen.query(Button)}
-        assert {
-            "Pause / resume",
-            "Previous",
-            "Next",
-            "Active player details",
-            "Show remaining time",
-            "Show full last notice",
-        }.isdisjoint(overflow_labels)
-        reconnect = next(button for button in app.screen.query(Button) if str(button.label) == "Reconnect")
-        assert not reconnect.disabled
+        assert {"Details", "Reconnect", "Help", "Quit", "Last notice details"}.issubset(
+            overflow_labels
+        )
+        assert {"Pause / resume", "Previous", "Next", "Seek back 10s"}.isdisjoint(
+            overflow_labels
+        )
         await pilot.press("escape")
-        app.no_vlc = True
-        app.controller.client = None
-        await pilot.click("#player-pause")
-        assert app.queue.current() is not None
-        await overflow_action("Seek back 10s")
-        assert "offline" in app._notice.lower()
-        await pilot.click("#player-next")
+
+        await pilot.press("space")
+        assert app.queue.current() is not None and app.queue.current().state == "paused"
+        await pilot.press("n")
         assert app.queue.current() is None
-        await pilot.click("#player-previous")
+        await pilot.press("p")
         assert app.queue.current() is not None
-        await overflow_action("Help")
+
+        await pilot.click("#queue-actions")
+        await pilot.click(next(button for button in app.screen.query(Button) if str(button.label) == "Help"))
         await pilot.click("#help-close")
-        await pilot.click("#player-menu")
-        await pilot.pause()
+        await pilot.click("#queue-actions")
         await pilot.click(next(button for button in app.screen.query(Button) if str(button.label) == "Quit"))
         await pilot.pause()
         assert app.screen.__class__.__name__ == "QuitPrompt"

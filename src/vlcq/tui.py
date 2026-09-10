@@ -15,27 +15,15 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widget import Widget
-from textual.widgets import Button, Input, Label, ListItem, ListView, ProgressBar, Static
+from textual.widgets import Button, Input, Label, ListItem, ListView, Static
 
 from .config import resolve_watched_percent
 from .controller import PlaybackController, ResumeChoiceRequired, ResumeOffer
 from .database import Database
 from .models import BrowserEntry, HistoryProjection, QueueEntry
 from .paths import VIDEO_EXTENSIONS, PathError, is_beneath, list_folder, natural_key
-from .progress import clamped_percentage
 from .queue import QueueService
 from .vlc import VLCError
-
-_QUEUE_STATE_LABELS: dict[str, str] = {
-    "playing": "▶ PLAYING",
-    "paused": "Ⅱ PAUSED",
-    "stopped": "■ STOPPED",
-    "skipped": "→ SKIPPED",
-    "completed": "✓ COMPLETED",
-    "missing": "! MISSING",
-    "failed": "× FAILED",
-}
-_TRANSIENT_QUEUE_STATES = frozenset({"playing", "paused", "stopped"})
 
 
 def _file_identity(
@@ -71,13 +59,7 @@ class SectionTarget:
     root_generation: int
 
 
-@dataclass(frozen=True)
-class PlayerTarget:
-    path: Path | None
-    root_generation: int
-
-
-type ContextTarget = FileTarget | QueueTarget | SectionTarget | PlayerTarget
+type ContextTarget = FileTarget | QueueTarget | SectionTarget
 
 
 @dataclass(frozen=True)
@@ -140,47 +122,41 @@ def render_filename(name: str, *, folder: bool = False, depth: int = 0, expanded
     return text
 
 
+class HistoricalCoverage(Static):
+    """Compact read-only unique played coverage value."""
+
+    def __init__(self, percentage: int | None) -> None:
+        super().__init__(classes="history-value")
+        self.percentage = percentage
+        self.set_percentage(percentage)
+
+    def set_percentage(self, percentage: int | None) -> None:
+        self.percentage = percentage
+        value = "—" if percentage is None else f"{percentage}%"
+        self.update(Text(f"hist {value:>4}", style="cyan", no_wrap=True))
+
+
 class ItemProgress(Static):
-    """Fixed-width, read-only history progress attached to one item row."""
+    """Read-only current/latest-view position for a Queue row."""
 
     BAR_WIDTH = 8
 
-    def __init__(
-        self,
-        percentage: int | None,
-        watched: bool,
-        *,
-        visible: bool = False,
-        id: str | None = None,
-    ) -> None:
-        super().__init__(id=id, classes="history-bar")
-        self.percentage = percentage
-        self.watched = watched
-        self.display = visible or percentage is not None or watched
-        self._render_progress()
+    def __init__(self, position_ms: int | None, duration_ms: int | None) -> None:
+        super().__init__(classes="current-progress")
+        self.set_position(position_ms, duration_ms)
 
-    def set_progress(
-        self, percentage: int | None, watched: bool, *, visible: bool = False
-    ) -> None:
-        self.percentage = percentage
-        self.watched = watched
-        self.display = visible or percentage is not None or watched
-        self._render_progress()
-
-    def _render_progress(self) -> None:
-        if not self.display:
-            self.update("")
+    def set_position(self, position_ms: int | None, duration_ms: int | None) -> None:
+        if position_ms is None:
+            self.update(Text("[????????] --% --:--/--:--", style="bright_black", no_wrap=True))
             return
-        if self.percentage is None:
-            bar = "?" * self.BAR_WIDTH
-            value = "?%"
-            style = "green" if self.watched else "yellow"
-        else:
-            filled = round(self.BAR_WIDTH * self.percentage / 100)
-            bar = "█" * filled + "░" * (self.BAR_WIDTH - filled)
-            value = f"{self.percentage}%"
-            style = "green" if self.watched else "yellow"
-        self.update(Text(f" {bar} {value:>4}", style=style, no_wrap=True))
+        duration = duration_ms if duration_ms is not None and duration_ms > 0 else None
+        percent = min(100, max(0, position_ms) * 100 // duration) if duration else None
+        filled = round(self.BAR_WIDTH * percent / 100) if percent is not None else 0
+        bar = "█" * filled + "░" * (self.BAR_WIDTH - filled)
+        current = VLCQApp._format_time(position_ms)
+        total = VLCQApp._format_time(duration) if duration else "--:--"
+        value = f"{percent}%" if percent is not None else "--%"
+        self.update(Text(f"[{bar}] {value:>4} {current}/{total}", style="yellow", no_wrap=True))
 
 
 class BrowserListItem(ListItem):
@@ -217,9 +193,7 @@ class BrowserListItem(ListItem):
                         tooltip="Deselect video" if selected else "Select video",
                     ),
                     Label(renderable, classes="row-label", markup=False),
-                    ItemProgress(
-                        history_percentage, history_watched, visible=history_visible
-                    ),
+                    HistoricalCoverage(history_percentage),
                     classes="browser-row",
                 ),
                 classes=classes,
@@ -241,26 +215,21 @@ class QueueListItem(ListItem):
         history_percentage: int | None = None,
         history_watched: bool = False,
         history_visible: bool = False,
+        current_position_ms: int | None = 0,
+        current_duration_ms: int | None = None,
     ) -> None:
+        del history_watched, history_visible
         self.entry_id = entry.id
         super().__init__(
             Horizontal(
                 Label(renderable, classes="row-label", markup=False),
-                ItemProgress(
-                    history_percentage, history_watched, visible=history_visible
-                ),
+                ItemProgress(current_position_ms, current_duration_ms),
+                HistoricalCoverage(history_percentage),
                 classes="queue-row",
             )
         )
-        display_state = (
-            entry.state
-            if current_id == entry.id or entry.state not in _TRANSIENT_QUEUE_STATES
-            else "queued"
-        )
-        classes = VLCQApp._queue_state_class(display_state)
-        if selected_id == entry.id:
-            classes += " queue-selected"
-        self.set_classes(classes)
+        del current_id
+        self.set_classes("queue-selected" if selected_id == entry.id else "")
 
 
 class RootPrompt(ModalScreen[str | None]):
@@ -536,6 +505,25 @@ class QuitPrompt(ModalScreen[str | None]):
             self.dismiss(choices[event.button.id])
 
 
+class NoticeDetailsPrompt(ModalScreen[None]):
+    BINDINGS: ClassVar = [Binding("escape", "cancel", "Close")]
+
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self.message = message
+
+    def compose(self) -> ComposeResult:
+        yield Static(self.message, classes="details-content", markup=False)
+        yield Button("Close", id="notice-details-close")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "notice-details-close":
+            self.dismiss(None)
+
+
 class HelpPrompt(ModalScreen[None]):
     BINDINGS: ClassVar = [Binding("escape", "cancel", "Close")]
 
@@ -544,7 +532,9 @@ class HelpPrompt(ModalScreen[None]):
             "Keys: o open · arrows/backspace browse · Enter play/open · v select · "
             "a add · A add & play · Space pause · n/p next/previous · [ ] seek · "
             "d remove · J/K reorder · r retry · c clear watched · ? help · q quit · Shift+F10 menu. "
-            "Files and Queue headers and the player bar also expose frequent mouse actions; use … for more.",
+            "Use VLC's visible controls for ordinary transport, or vlcq keyboard shortcuts. "
+            "Native Next is supported; native Previous and arbitrary VLC playlist navigation are not. "
+            "Files and Queue headers expose frequent mouse actions; use Queue … for Help, reconnect, and Quit.",
             classes="help-content",
             markup=False,
         )
@@ -568,16 +558,14 @@ class VLCQApp(App[None]):
     .section.focused { background: $primary-background; }
     #queue-section.focused { background: $secondary-background; }
     .section-header { height: 1; min-height: 1; width: 1fr; }
-    .section-header Button, #player-actions Button {
+    .section-header Button {
         width: auto; min-width: 3; height: 1; min-height: 1; margin: 0; padding: 0 1;
         border: none; content-align: center middle;
     }
-    #files-toggle, #queue-toggle, #files-actions, #queue-actions, #player-menu { width: 3; min-width: 3; padding: 0; }
+    #files-toggle, #queue-toggle, #files-actions, #queue-actions { width: 3; min-width: 3; padding: 0; }
     #files-open, #files-search, #files-add, #files-up, #files-sort,
     #files-clear-selection, #queue-remove, #queue-up, #queue-down,
-    #queue-clear, #queue-sort, #queue-undo, #queue-clear-all,
-    #player-previous, #player-pause, #player-next, #player-seek-back,
-    #player-seek-forward, #player-reconnect, #player-help, #player-quit { min-width: 5; }
+    #queue-clear, #queue-sort, #queue-undo, #queue-clear-all { min-width: 5; }
     .responsive-action { display: none; }
     .section-name { width: auto; min-width: 7; height: 1; text-style: bold; }
     .section-title { width: auto; max-width: 30%; height: 1; padding: 0 1; color: $text-muted; overflow-x: hidden; }
@@ -588,28 +576,13 @@ class VLCQApp(App[None]):
     .browser-row, .queue-row { width: 1fr; height: 1; min-height: 1; }
     .browser-check { width: 3; min-width: 3; height: 1; min-height: 1; margin: 0; padding: 0; border: none; }
     .row-label { width: 1fr; height: 1; min-height: 1; overflow-x: hidden; }
-    .history-bar { width: 14; min-width: 14; height: 1; min-height: 1; padding: 0; content-align: right middle; }
+    .current-progress { width: 32; min-width: 20; height: 1; min-height: 1; padding: 0; content-align: right middle; overflow-x: hidden; }
+    .history-value { width: 10; min-width: 8; height: 1; min-height: 1; padding: 0; content-align: right middle; }
     .folder-entry { color: $primary-lighten-2; text-style: bold; }
     .video-entry { color: $text; }
     .selected-video { color: $warning; text-style: bold; }
-    .queue-playing, .queue-paused { color: $warning; text-style: bold; }
-    .queue-completed { color: $success; }
-    .queue-missing, .queue-failed { color: $error; text-style: bold; }
-    .queue-stopped, .queue-skipped { color: $text-muted; }
-    .queue-queued { color: $text; }
     .queue-selected { background: $boost; text-style: bold; }
-    .history-progress { color: $warning; }
-    .history-completed { color: $success; }
-    .queued-badge { color: $accent; }
-    #status-pane { height: auto; min-height: 7; background: $surface-darken-1; border-top: solid $accent; }
-    #player-line { height: 1; min-height: 1; background: $boost; }
-    #player { width: 1fr; height: 1; min-height: 1; padding: 0 1; overflow-x: hidden; }
-    #player-meta { height: 1; min-height: 1; padding: 0 1; overflow-x: hidden; }
-    #progress-line { height: 2; min-height: 2; }
-    #progress { width: 1fr; height: 2; min-height: 2; }
-    #progress-percent { width: 7; height: 2; min-height: 2; content-align: right middle; padding: 0 1; color: $accent-lighten-2; text-style: bold; }
-    #player-actions { height: 1; min-height: 1; background: $boost; }
-    #notice { height: auto; min-height: 1; padding: 0 1; color: $text; overflow-x: hidden; }
+    #notice { display: none; height: 1; min-height: 1; padding: 0 1; color: $text; background: $boost; overflow-x: hidden; }
     #context-menu { position: absolute; background: $surface; border: round $accent; padding: 0; overflow-y: auto; }
     .context-action { width: 1fr; min-width: 20; height: 1; min-height: 1; margin: 0; padding: 0 1; border: none; content-align: left middle; }
     .dialog-actions { height: 1; min-height: 1; align-horizontal: center; }
@@ -619,7 +592,7 @@ class VLCQApp(App[None]):
     }
     .dialog-title, .details-content, .help-content { width: 80%; max-height: 12; padding: 1; background: $surface; border: solid $accent; }
     .details-content, .help-content { height: auto; overflow-y: auto; }
-    RootPrompt, SearchFilterPrompt, ResumePrompt, DetailsPrompt, ConfirmClear, ConfirmClearAll, QuitPrompt, HelpPrompt { align: center middle; }
+    RootPrompt, SearchFilterPrompt, ResumePrompt, DetailsPrompt, ConfirmClear, ConfirmClearAll, QuitPrompt, HelpPrompt, NoticeDetailsPrompt { align: center middle; }
     RootPrompt > Input, SearchFilterPrompt > Input { width: 80%; background: $surface; }
     """
     BINDINGS: ClassVar = [
@@ -702,7 +675,8 @@ class VLCQApp(App[None]):
         self.autoplay_target_paths: list[Path] = []
         self.resume_command = False
         self._last_pane = "browser"
-        self._notice = "Ready"
+        self._notice = ""
+        self._notice_timer: Any | None = None
         self._source_focus: Widget | None = None
         self._restoring_queue_selection = False
 
@@ -739,24 +713,7 @@ class VLCQApp(App[None]):
                 with Vertical(id="queue-body", classes="section-body"):
                     yield Static("Queue is empty — use Files actions to add a video.", id="queue-empty")
                     yield ListView(id="queue")
-        with Vertical(id="status-pane"):
-            with Horizontal(id="player-line"):
-                yield Static("No active media", id="player")
-            yield Static("PLAYER  IDLE  ·  VLC  DISCONNECTED  ·  TIME  --:--", id="player-meta")
-            with Horizontal(id="progress-line"):
-                yield ProgressBar(total=100, id="progress", show_eta=False)
-                yield Static("?%", id="progress-percent")
-            with Horizontal(id="player-actions"):
-                yield CompactButton("Previous", id="player-previous", variant="primary", tooltip="Previous queue item")
-                yield CompactButton("−10s", id="player-seek-back", classes="responsive-action responsive-medium", tooltip="Seek back 10 seconds")
-                yield CompactButton("Play", id="player-pause", variant="success", tooltip="Play or pause current item")
-                yield CompactButton("+10s", id="player-seek-forward", classes="responsive-action responsive-medium", tooltip="Seek forward 10 seconds")
-                yield CompactButton("Next", id="player-next", variant="primary", tooltip="Next queue item")
-                yield CompactButton("Reconnect", id="player-reconnect", classes="responsive-action responsive-medium", tooltip="Reconnect to VLC")
-                yield CompactButton("Help", id="player-help", classes="responsive-action responsive-wide", tooltip="Show help")
-                yield CompactButton("Quit", id="player-quit", classes="responsive-action responsive-wide", variant="error", tooltip="Quit vlcq")
-                yield CompactButton("…", id="player-menu", variant="warning", tooltip="VLC and application actions")
-            yield Static("NOTICE  Ready", id="notice", markup=False)
+        yield Static("", id="notice", markup=False)
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         del action, parameters
@@ -769,11 +726,10 @@ class VLCQApp(App[None]):
         await self.refresh_browser()
         self.query_one("#browser", ListView).focus()
         self.refresh_queue()
-        self.update_status("Ready")
+        self.dismiss_notice()
         if not self.no_vlc:
             try:
                 await self.controller.start()
-                self.update_status("VLC connected")
             except (VLCError, OSError):
                 self.update_status("VLC unavailable — press r to retry")
         if self.autoplay or self.resume_command:
@@ -821,10 +777,7 @@ class VLCQApp(App[None]):
             self.query_one("#files-actions", Button).display = (
                 not medium or (not wide and bool(self.selected_paths))
             )
-            self.query_one("#queue-actions", Button).display = not wide and (
-                bool(self.queue.entries()) or self.queue.undo_available
-            )
-            self.query_one("#player-menu", Button).display = not wide
+            self.query_one("#queue-actions", Button).display = True
         except NoMatches:
             pass
 
@@ -878,36 +831,8 @@ class VLCQApp(App[None]):
         if event.button == 3:
             event.stop()
             return
-        progress = next((item for item in widget.ancestors_with_self if isinstance(item, ProgressBar)), None)
-        if progress is None:
-            return
-        if self.no_vlc or self.controller.client is None:
-            self.update_status("Seek unavailable while VLC is disconnected")
-            return
-        current = self.queue.current()
-        status = self.controller.status
-        duration = status.duration_ms
-        if (
-            current is None
-            or status.path is None
-            or not self.controller._same_path(status.path, current.path)
-            or duration <= 0
-        ):
-            self.update_status("Seek unavailable because duration is unknown or media is not ready")
-            return
-        region = progress.region
-        screen_x = event.screen_x if event.screen_x is not None else region.x
-        ratio = max(0.0, min(1.0, (screen_x - region.x) / max(1, region.width - 1)))
-        target = int(duration * ratio)
-        self.run_worker(self._seek_track(target, duration), exclusive=True)
-
-    async def _seek_track(self, target_ms: int, duration_ms: int) -> None:
-        try:
-            await self.controller.seek_absolute(target_ms, duration_ms)
-        except (OSError, VLCError) as exc:
-            self.update_status(f"Seek failed: {exc}")
-        else:
-            self.update_status(f"Seeked to {self._format_time(target_ms)}")
+        if widget.id == "notice" or any(item.id == "notice" for item in widget.ancestors):
+            self.dismiss_notice()
 
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
         try:
@@ -996,21 +921,13 @@ class VLCQApp(App[None]):
             queue_sort = self.query_one("#queue-sort", Button)
             queue_undo = self.query_one("#queue-undo", Button)
             queue_clear_all = self.query_one("#queue-clear-all", Button)
-            player_pause = self.query_one("#player-pause", Button)
-            player_previous = self.query_one("#player-previous", Button)
-            player_next = self.query_one("#player-next", Button)
-            player_seek_back = self.query_one("#player-seek-back", Button)
-            player_seek_forward = self.query_one("#player-seek-forward", Button)
-            player_reconnect = self.query_one("#player-reconnect", Button)
         except NoMatches:
             return
-        current = self.queue.current()
-        connected = self.no_vlc or self.controller.client is not None
         clearable = any(
             entry.state == "completed"
             or (
                 (history := self.history.get(entry.path)) is not None
-                and history.watched(self.watched_percent)
+                and history.coverage_watched(self.watched_percent)
             )
             for entry in self.queue.entries()
         )
@@ -1033,15 +950,17 @@ class VLCQApp(App[None]):
         queue_undo.disabled = not self.queue.undo_available
         queue_clear_all.display = wide and bool(self.queue.entries())
         queue_clear_all.disabled = not self.queue.entries()
-        player_pause.disabled = current is None or not connected
-        player_next.disabled = not self.queue.entries() or not connected
-        player_previous.disabled = not self.queue.entries() or not connected
-        player_seek_back.disabled = current is None or not connected
-        player_seek_forward.disabled = current is None or not connected
-        player_reconnect.disabled = self.no_vlc
 
     def _refresh_headers(self) -> None:
         self._render_headers()
+
+    def dismiss_notice(self) -> None:
+        try:
+            notice = self.query_one("#notice", Static)
+            notice.display = False
+            notice.update("")
+        except NoMatches:
+            pass
 
     def update_status(self, message: str) -> None:
         if self.queue.undo_expired:
@@ -1049,10 +968,16 @@ class VLCQApp(App[None]):
             message = f"Undo expired after queue mutation · {message}"
         self._notice = message
         try:
-            notice = Text()
-            notice.append("NOTICE  ", style="bold magenta")
-            notice.append(message, style="white")
-            self.query_one("#notice", Static).update(notice)
+            notice = self.query_one("#notice", Static)
+            text = Text(no_wrap=True, overflow="ellipsis")
+            text.append("NOTICE  ", style="bold magenta")
+            text.append(message, style="white")
+            text.append("  ×", style="bold cyan")
+            notice.update(text)
+            notice.display = True
+            if self._notice_timer is not None:
+                self._notice_timer.stop()
+            self._notice_timer = self.set_timer(5, self.dismiss_notice)
         except NoMatches:
             pass
 
@@ -1178,39 +1103,34 @@ class VLCQApp(App[None]):
 
     def _history_watched(self, path: Path) -> bool:
         history = self.history.get(path.expanduser().resolve(strict=False))
-        return history is not None and history.watched(self.watched_percent)
+        return history is not None and history.coverage_watched(self.watched_percent)
 
     def _history_percentage(self, path: Path) -> int | None:
         history = self.history.get(path.expanduser().resolve(strict=False))
-        if history is None:
-            return None
-        if history.completion_observed and history.duration_ms > 0:
-            return 100
-        return clamped_percentage(history.position_ms, history.duration_ms)
+        return history.coverage_percentage() if history is not None else None
 
     def _history_visible(self, path: Path) -> bool:
-        history = self.history.get(path.expanduser().resolve(strict=False))
-        return history is not None and history.has_recorded_progress
+        return True
 
-    def _history_label(self, path: Path) -> str:
-        history = self.history.get(path.expanduser().resolve(strict=False))
-        if history is None or not history.has_recorded_progress:
-            return ""
-        if self._history_watched(path):
-            category = "✓ Watched (Completed)"
-        else:
-            category = "~ In progress"
-        progress = self._format_time(history.position_ms)
-        duration = self._format_time(history.duration_ms) if history.duration_ms > 0 else "?"
-        return f"{category} {progress}/{duration}"
-
-    def _history_class(self, path: Path) -> str:
-        history = self.history.get(path.expanduser().resolve(strict=False))
-        if history is not None and self._history_watched(path):
-            return "history-completed"
-        if history is not None and history.position_ms > 0:
-            return "history-progress"
-        return ""
+    def _queue_current_position(
+        self, entry: QueueEntry, current_id: int | None
+    ) -> tuple[int | None, int | None]:
+        status = self.controller.status
+        if (
+            current_id == entry.id
+            and status.state != "unavailable"
+            and status.path is not None
+            and self.controller._same_path(status.path, entry.path)
+        ):
+            return status.position_ms, status.duration_ms if status.duration_ms > 0 else None
+        history = self.history.get(entry.path)
+        if history is None:
+            return 0, None
+        if history.resume_position_ms is not None:
+            return history.resume_position_ms, history.duration_ms if history.duration_ms > 0 else None
+        if history.position_ms > 0 or history.completion_observed:
+            return None, history.duration_ms if history.duration_ms > 0 else None
+        return 0, history.duration_ms if history.duration_ms > 0 else None
 
     def _browser_renderable(self, entry: BrowserEntry, selected: bool, queued: bool) -> Text:
         text = render_filename(
@@ -1222,10 +1142,7 @@ class VLCQApp(App[None]):
         if entry.is_dir:
             return text
         if queued:
-            text.append(" · queued", style="magenta")
-        history = self._history_label(entry.path)
-        if history:
-            text.append(" · " + history, style="green" if self._history_watched(entry.path) else "yellow")
+            text.append("  +", style="magenta")
         return text
 
     def _queue_renderable(
@@ -1238,17 +1155,10 @@ class VLCQApp(App[None]):
         else:
             text.append("  ")
         text.append(render_filename(entry.path.name))
-        display_state = (
-            entry.state
-            if current_id == entry.id or entry.state not in _TRANSIENT_QUEUE_STATES
-            else "queued"
-        )
-        state_label = _QUEUE_STATE_LABELS.get(display_state)
-        if state_label:
-            text.append(" · " + state_label, style="yellow")
-        history = self._history_label(entry.path)
-        if history:
-            text.append(" · " + history, style="green" if self._history_watched(entry.path) else "yellow")
+        if entry.state == "missing":
+            text.append("  !", style="bold red")
+        elif entry.state == "failed":
+            text.append("  ×", style="bold red")
         return text
 
     def _apply_browser_history_rows(self) -> None:
@@ -1270,10 +1180,8 @@ class VLCQApp(App[None]):
                 row.query_one(".row-label", Label).update(
                     self._browser_renderable(entry, entry.path in self.selected_paths, entry.path in queued_paths)
                 )
-                row.query_one(ItemProgress).set_progress(
-                    self._history_percentage(entry.path),
-                    self._history_watched(entry.path),
-                    visible=self._history_visible(entry.path),
+                row.query_one(HistoricalCoverage).set_percentage(
+                    self._history_percentage(entry.path)
                 )
             except NoMatches:
                 continue
@@ -1300,10 +1208,10 @@ class VLCQApp(App[None]):
                 row.query_one(".row-label", Label).update(
                     self._queue_renderable(entry, current_id, selected_id)
                 )
-                row.query_one(ItemProgress).set_progress(
-                    self._history_percentage(entry.path),
-                    self._history_watched(entry.path),
-                    visible=self._history_visible(entry.path),
+                position, duration = self._queue_current_position(entry, current_id)
+                row.query_one(ItemProgress).set_position(position, duration)
+                row.query_one(HistoricalCoverage).set_percentage(
+                    self._history_percentage(entry.path)
                 )
             except NoMatches:
                 continue
@@ -1366,9 +1274,12 @@ class VLCQApp(App[None]):
             if self.search_query and self.search_query not in entry.name.casefold():
                 continue
             history = self.history.get(entry.path)
-            watched = history is not None and history.watched(self.watched_percent)
+            watched = history is not None and history.coverage_watched(self.watched_percent)
             if self.history_filter == "progress" and not (
-                history is not None and history.position_ms > 0 and not watched
+                history is not None
+                and history.coverage_ms is not None
+                and history.coverage_ms > 0
+                and not watched
             ):
                 continue
             if self.history_filter == "not-completed" and watched:
@@ -1391,10 +1302,8 @@ class VLCQApp(App[None]):
                 self._browser_renderable(entry, entry.path in self.selected_paths, entry.path in queued_paths)
             )
             if not entry.is_dir:
-                row.query_one(ItemProgress).set_progress(
-                    self._history_percentage(entry.path),
-                    self._history_watched(entry.path),
-                    visible=self._history_visible(entry.path),
+                row.query_one(HistoricalCoverage).set_percentage(
+                    self._history_percentage(entry.path)
                 )
         except NoMatches:
             pass
@@ -1666,19 +1575,6 @@ class VLCQApp(App[None]):
         else:
             self._refresh_browser_history()
 
-    @staticmethod
-    def _queue_state_class(state: str) -> str:
-        return {
-            "queued": "queue-queued",
-            "playing": "queue-playing",
-            "paused": "queue-paused",
-            "stopped": "queue-stopped",
-            "skipped": "queue-skipped",
-            "completed": "queue-completed",
-            "missing": "queue-missing",
-            "failed": "queue-failed",
-        }.get(state, "queue-failed")
-
     def _update_queue_row(
         self,
         row: QueueListItem,
@@ -1686,23 +1582,15 @@ class VLCQApp(App[None]):
         current_id: int | None,
         selected_id: int | None,
     ) -> None:
-        display_state = (
-            entry.state
-            if current_id == entry.id or entry.state not in _TRANSIENT_QUEUE_STATES
-            else "queued"
-        )
-        classes = self._queue_state_class(display_state)
-        if selected_id == entry.id:
-            classes += " queue-selected"
-        row.set_classes(classes)
+        row.set_classes("queue-selected" if selected_id == entry.id else "")
         try:
             row.query_one(".row-label", Label).update(
                 self._queue_renderable(entry, current_id, selected_id)
             )
-            row.query_one(ItemProgress).set_progress(
-                self._history_percentage(entry.path),
-                self._history_watched(entry.path),
-                visible=self._history_visible(entry.path),
+            position, duration = self._queue_current_position(entry, current_id)
+            row.query_one(ItemProgress).set_position(position, duration)
+            row.query_one(HistoricalCoverage).set_percentage(
+                self._history_percentage(entry.path)
             )
         except NoMatches:
             pass
@@ -1802,6 +1690,8 @@ class VLCQApp(App[None]):
                             history_percentage=self._history_percentage(entry.path),
                             history_watched=self._history_watched(entry.path),
                             history_visible=self._history_visible(entry.path),
+                            current_position_ms=self._queue_current_position(entry, current_id)[0],
+                            current_duration_ms=self._queue_current_position(entry, current_id)[1],
                         )
                     )
             if target_present:
@@ -1825,66 +1715,8 @@ class VLCQApp(App[None]):
         self._render_headers()
 
     def refresh_playback(self) -> None:
-        if self.controller.last_error is not None:
-            self._notice = self.controller.last_error
-        current = self.queue.current()
-        if self.no_vlc:
-            state = current.state if current else "idle"
-            position_ms = 0
-            duration_ms = 0
-            connected = False
-        else:
-            state = self.controller.status.state if current else "idle"
-            position_ms = self.controller.status.position_ms if current else 0
-            duration_ms = self.controller.status.duration_ms if current else 0
-            connected = self.controller.client is not None
-        connection = "OFFLINE" if self.no_vlc else ("CONNECTED" if connected else "DISCONNECTED")
-        state_style = {
-            "playing": "bold green",
-            "paused": "bold yellow",
-            "failed": "bold red",
-            "unavailable": "bold red",
-        }.get(state, "bold cyan")
-        active = Text(no_wrap=True, overflow="ellipsis")
-        active.append("ACTIVE  ", style="bold magenta")
-        if current is None:
-            active.append("No active media", style="bright_black")
-        else:
-            active.append(current.path.name, style="bold white")
-            active.append("  ·  SOURCE  ", style="bold cyan")
-            active.append(str(current.path.parent), style="cyan")
-
-        elapsed = self._format_time(position_ms) if current is not None else "--:--"
-        total = self._format_time(duration_ms) if duration_ms > 0 else "?"
-        remaining = self._format_time(max(0, duration_ms - position_ms)) if duration_ms > 0 else "?"
-        metadata = Text(no_wrap=True, overflow="ellipsis")
-        metadata.append("PLAYER  ", style="bold magenta")
-        metadata.append(state.upper(), style=state_style)
-        metadata.append("  ·  VLC  ", style="bold magenta")
-        metadata.append(connection, style="bold green" if connected else "bold red")
-        metadata.append("  ·  ELAPSED  ", style="bold cyan")
-        metadata.append(elapsed, style="white")
-        metadata.append("  ·  REMAINING  ", style="bold yellow")
-        metadata.append(remaining, style="yellow")
-        metadata.append("  ·  DURATION  ", style="bold cyan")
-        metadata.append(total, style="white")
-
-        percent = min(100.0, position_ms * 100 / duration_ms) if duration_ms > 0 else 0.0
-        try:
-            self.query_one("#player", Static).update(active)
-            self.query_one("#player-meta", Static).update(metadata)
-            self.query_one("#progress", ProgressBar).update(progress=percent)
-            self.query_one("#progress-percent", Static).update(
-                f"{round(percent):d}%" if duration_ms > 0 else "?%"
-            )
-            pause_label = "Pause" if state == "playing" else "Play"
-            self.query_one("#player-pause", Button).label = pause_label
-            notice = Text()
-            notice.append("NOTICE  ", style="bold magenta")
-            notice.append(self._notice, style="white")
-            self.query_one("#notice", Static).update(notice)
-        except NoMatches:
-            return
+        if self.controller.last_error is not None and self._notice != self.controller.last_error:
+            self.update_status(self.controller.last_error)
         self._refresh_browser_history()
         self.refresh_queue()
 
@@ -2009,6 +1841,18 @@ class VLCQApp(App[None]):
         entry = entries[index]
         current = self.queue.current()
         if current is not None and current.id == entry.id and current.state in {"playing", "paused"}:
+            if choice == "start_over":
+                history = self.queue.database.history_for(entry.path, root=self.root)
+                await self._run_database_operation(
+                    lambda: self.queue.update_progress(
+                        entry.path,
+                        0,
+                        history.duration_ms if history is not None else 0,
+                        trustworthy=True,
+                        resume_position_ms=0,
+                        allow_resume_reset=True,
+                    )
+                )
             if current.state == "paused":
                 await self._run_database_operation(
                     lambda: self.queue.set_current_state(current.id, "playing")
@@ -2019,6 +1863,16 @@ class VLCQApp(App[None]):
         )
         if offer.completed:
             await self._run_database_operation(lambda: self.queue.play_now(index))
+            await self._run_database_operation(
+                lambda: self.queue.update_progress(
+                    entry.path,
+                    0,
+                    offer.duration_ms,
+                    trustworthy=True,
+                    resume_position_ms=0,
+                    allow_resume_reset=True,
+                )
+            )
             return True
         if self._offer_requires_choice(offer):
             if choice is None and not automatic:
@@ -2028,6 +1882,17 @@ class VLCQApp(App[None]):
             if choice not in {None, "resume", "start_over"}:
                 raise ValueError("unknown resume choice")
         await self._run_database_operation(lambda: self.queue.play_now(index))
+        if choice == "start_over":
+            await self._run_database_operation(
+                lambda: self.queue.update_progress(
+                    entry.path,
+                    0,
+                    offer.duration_ms,
+                    trustworthy=True,
+                    resume_position_ms=0,
+                    allow_resume_reset=True,
+                )
+            )
         return True
 
     async def _play_queue_index(
@@ -2556,27 +2421,38 @@ class VLCQApp(App[None]):
     def _details_text(self, entry: BrowserEntry, history: HistoryProjection | None) -> str:
         queued = any(item.path == entry.path for item in self.queue.entries())
         queue_label = "queued" if queued else "not queued"
-        if history is None or not history.has_recorded_progress:
+        if history is None:
             return (
                 f"{entry.name}\nFull path: {entry.path}\n{queue_label}\n"
-                "No recorded progress\nResume position: unknown\nFurthest progress: unknown\n"
-                f"Duration: unknown\nWatched threshold: {self.watched_percent}%\n"
-                "Watched: no\nLast played: unknown"
+                "History: absent\nCurrent/resume position: unknown\nHistorical coverage: —\n"
+                f"Duration: unknown\nCoverage threshold: {self.watched_percent}%\n"
+                "Coverage classification: Not watched\nLast trustworthy playback: unknown\n"
+                "Legacy maximum: absent\nLegacy completion: absent"
             )
-        last_played = history.last_played_at or "unknown"
         if history.resume_position_ms is not None:
             resume = self._format_time(history.resume_position_ms)
         elif history.fallback_resume_position_ms is not None:
-            resume = f"{self._format_time(history.fallback_resume_position_ms)} (furthest recorded fallback)"
+            resume = f"unknown (legacy maximum {self._format_time(history.fallback_resume_position_ms)} is a fallback only)"
         else:
             resume = "unknown"
+        if history.coverage_ms is None:
+            coverage = "— (tracking not initialized; legacy history was not converted)"
+        else:
+            covered = self._format_time(history.coverage_ms)
+            percentage = history.coverage_percentage()
+            coverage = f"{covered} ({percentage}%)" if percentage is not None else f"{covered} (percent unknown)"
+        classification = (
+            "Watched" if history.coverage_watched(self.watched_percent) else "Not watched"
+        )
         return (
             f"{entry.name}\nFull path: {entry.path}\n{queue_label}\n"
-            f"Resume position: {resume}\nFurthest progress: {self._format_time(history.position_ms)}\n"
+            f"Current/resume position: {resume}\nHistorical coverage: {coverage}\n"
             f"Duration: {self._format_time(history.duration_ms) if history.duration_ms else 'unknown'}\n"
-            f"Watched threshold: {self.watched_percent}%\n"
-            f"Watched: {'yes' if history.watched(self.watched_percent) else 'no'}\n"
-            f"Last played: {last_played}"
+            f"Coverage threshold: {self.watched_percent}%\n"
+            f"Coverage classification: {classification}\n"
+            f"Last trustworthy playback: {history.last_played_at or 'unknown'}\n"
+            f"Legacy maximum: {self._format_time(history.position_ms)}\n"
+            f"Legacy completion: {'yes' if history.completion_observed else 'no'}"
         )
 
     async def _open_details(
@@ -2691,22 +2567,34 @@ class VLCQApp(App[None]):
             entry.state == "completed"
             or (
                 (history := self.history.get(entry.path)) is not None
-                and history.watched(self.watched_percent)
+                and history.coverage_watched(self.watched_percent)
             )
             for entry in self.queue.entries()
         )
 
     def _context_actions_for_queue_section(self, target: SectionTarget) -> list[ContextAction]:
-        """Return only hidden queue-management actions."""
+        """Return queue overflow plus selection-independent application actions."""
         medium = self.size.width >= 100
         wide = self.size.width >= 140
         actions: list[ContextAction] = []
+        selected = self._context_queue_target()
+        if selected is not None:
+            actions.append(ContextAction("details-queue", "Details", selected))
         if not medium and len(self.queue.entries()) > 1:
             actions.append(ContextAction("sort-queue", "Sort naturally", target))
         if not medium and self.queue.undo_available:
             actions.append(ContextAction("undo", "Undo latest removal", target))
         if not wide and self.queue.entries():
             actions.append(ContextAction("clear-all", "Clear queue", target))
+        actions.extend(
+            [
+                ContextAction("reconnect", "Reconnect", target, not self.no_vlc),
+                ContextAction("help", "Help", target),
+                ContextAction("quit", "Quit", target),
+            ]
+        )
+        if self._notice:
+            actions.append(ContextAction("notice-details", "Last notice details", target))
         return actions
 
     def _context_queue_target(self) -> QueueTarget | None:
@@ -2730,30 +2618,8 @@ class VLCQApp(App[None]):
             ContextAction("move-up", "Move up", target),
             ContextAction("move-down", "Move down", target),
             ContextAction("remove-queue", "Remove from queue", target),
+            ContextAction("details-queue", "Details", target),
         ]
-
-    def _context_actions_for_player(self, target: PlayerTarget) -> list[ContextAction]:
-        current = self.queue.current()
-        connected = self.no_vlc or self.controller.client is not None
-        medium = self.size.width >= 100
-        wide = self.size.width >= 140
-        actions: list[ContextAction] = []
-        if not medium:
-            actions.extend(
-                [
-                    ContextAction("seek-back", "Seek back 10s", target, connected and current is not None),
-                    ContextAction("seek-forward", "Seek forward 10s", target, connected and current is not None),
-                    ContextAction("reconnect", "Reconnect", target, not self.no_vlc),
-                ]
-            )
-        if not wide:
-            actions.extend(
-                [
-                    ContextAction("help", "Help", target),
-                    ContextAction("quit", "Quit", target),
-                ]
-            )
-        return actions
 
     def _open_context_menu(
         self, actions: list[ContextAction], source: Widget | None, x: int | None, y: int | None
@@ -2850,9 +2716,6 @@ class VLCQApp(App[None]):
         if isinstance(target, SectionTarget) and target.root_generation != self._root_generation:
             self.update_status("Action expired after the library root changed")
             return
-        if isinstance(target, PlayerTarget) and target.root_generation != self._root_generation:
-            self.update_status("Player action expired after the library root changed")
-            return
         key = action.key
         if key == "files-toggle":
             self._toggle_section("files")
@@ -2928,18 +2791,16 @@ class VLCQApp(App[None]):
             await self.action_move_down()
         elif key == "remove-queue":
             await self.action_remove_target(target)
-        elif key == "pause":
-            await self.action_pause()
-        elif key == "previous":
-            await self.action_previous()
-        elif key == "next":
-            await self.action_next()
-        elif key == "seek-back":
-            await self.action_seek(-10)
-        elif key == "seek-forward":
-            await self.action_seek(10)
+        elif key == "details-queue" and isinstance(target, QueueTarget):
+            assert queue_entry is not None
+            await self._open_details(
+                BrowserEntry(queue_entry.path, queue_entry.path.name, False, True),
+                pane="queue",
+            )
         elif key == "reconnect":
             await self.action_reconnect()
+        elif key == "notice-details":
+            self.push_screen(NoticeDetailsPrompt(self._notice))
         elif key == "help":
             self.action_help()
         elif key == "quit":
@@ -3031,14 +2892,8 @@ class VLCQApp(App[None]):
             source = self.focused
             self._open_section_menu("queue", source, source.region.x if source else 1, source.region.y if source else 1)
         else:
-            source = self.query_one("#player-menu", Button)
-            current = self.queue.current()
-            self._open_context_menu(
-                self._context_actions_for_player(PlayerTarget(current.path if current else None, self._root_generation)),
-                source,
-                source.region.x,
-                source.region.y,
-            )
+            source = self.query_one("#queue-actions", Button)
+            self._open_section_menu("queue", source, source.region.x, source.region.y)
 
     def action_toggle_files(self) -> None:
         self._toggle_section("files")
@@ -3142,34 +2997,10 @@ class VLCQApp(App[None]):
             await self.action_undo()
         elif button_id == "queue-clear-all":
             self.action_clear_all()
-        elif button_id == "player-previous":
-            await self.action_previous()
-        elif button_id == "player-pause":
-            await self.action_pause()
-        elif button_id == "player-next":
-            await self.action_next()
-        elif button_id == "player-seek-back":
-            await self.action_seek(-10)
-        elif button_id == "player-seek-forward":
-            await self.action_seek(10)
-        elif button_id == "player-reconnect":
-            await self.action_reconnect()
-        elif button_id == "player-help":
-            self.action_help()
-        elif button_id == "player-quit":
-            self.action_quit_app()
         elif button_id == "files-actions":
             self._open_section_menu("files", button, button.region.x, button.region.y)
         elif button_id == "queue-actions":
             self._open_section_menu("queue", button, button.region.x, button.region.y)
-        elif button_id == "player-menu":
-            current = self.queue.current()
-            self._open_context_menu(
-                self._context_actions_for_player(PlayerTarget(current.path if current else None, self._root_generation)),
-                button,
-                button.region.x,
-                button.region.y,
-            )
 
     async def action_open_root_from_menu(self) -> None:
         self.action_open_root()

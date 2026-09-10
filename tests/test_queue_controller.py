@@ -71,6 +71,28 @@ class PlaylistFakeClient(FakeClient):
         return VLCStatus("playing", path=self.playlist_items[0].path if self.playlist_items else None)
 
 
+def observed_status(
+    state: str,
+    position_ms: int,
+    duration_ms: int,
+    path: Path,
+    playlist_id: str,
+    second: float,
+    *,
+    rate: float | None = 1.0,
+) -> VLCStatus:
+    return VLCStatus(
+        state,
+        position_ms,
+        duration_ms,
+        path.resolve(),
+        playlist_id,
+        rate,
+        second,
+        second + 0.05,
+    )
+
+
 def setup_queue(tmp_path: Path) -> tuple[Database, QueueService, list[Path]]:
     root = tmp_path / "show"
     root.mkdir()
@@ -312,6 +334,54 @@ async def test_native_next_adopts_staged_successor_without_replaying_it(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_controller_persists_only_qualified_disjoint_coverage(tmp_path: Path) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    client = PlaylistFakeClient()
+    controller = PlaybackController(queue, process=FakeProcess())  # type: ignore[arg-type]
+    controller.client = client  # type: ignore[assignment]
+    await controller.play_index(0)
+    active_id = controller.active_vlc_id
+    assert active_id is not None
+    generation = controller.playback_generation
+    for second in range(6):
+        await controller._observe(
+            observed_status(
+                "playing", second * 1_000, 60_000,
+                videos[0], active_id, float(second),
+            ),
+            generation=generation,
+        )
+    assert db.progress_for(videos[0])["coverage_ranges"] == ((0, 5_000),)
+
+    await controller.seek(10)
+    generation = controller.playback_generation
+    for second in range(6):
+        await controller._observe(
+            observed_status(
+                "playing", 30_000 + second * 1_000, 60_000,
+                videos[0], active_id, 20.0 + second,
+            ),
+            generation=generation,
+        )
+    progress = db.progress_for(videos[0])
+    assert progress["coverage_ranges"] == ((0, 5_000), (30_000, 35_000))
+    assert progress["coverage_ms"] == 10_000
+
+    await controller.toggle_pause()
+    generation = controller.playback_generation
+    for second in range(4):
+        await controller._observe(
+            observed_status(
+                "playing", 40_000 + second * 1_000, 60_000,
+                videos[0], active_id, 40.0 + second,
+            ),
+            generation=generation,
+        )
+    assert db.progress_for(videos[0])["coverage_ms"] == 10_000
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_identity_free_observation_fails_closed_without_history_update(
     tmp_path: Path,
 ) -> None:
@@ -413,7 +483,7 @@ async def test_no_longer_staged_successor_is_not_adopted_after_reorder(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_native_transition_classifies_completion_from_near_end_evidence(
+async def test_native_transition_classifies_completion_from_qualified_near_end_evidence(
     tmp_path: Path,
 ) -> None:
     db, queue, videos = setup_queue(tmp_path)
@@ -426,12 +496,16 @@ async def test_native_transition_classifies_completion_from_near_end_evidence(
     generation = controller.playback_generation
     assert active_id is not None and staged_id is not None
 
+    for second in range(6):
+        await controller._observe(
+            observed_status(
+                "playing", 14_000 + second * 1_000, 20_000,
+                videos[0], active_id, float(second),
+            ),
+            generation=generation,
+        )
     await controller._observe(
-        VLCStatus("playing", 9_000, 10_000, videos[0].resolve(), active_id),
-        generation=generation,
-    )
-    await controller._observe(
-        VLCStatus("playing", 500, 10_000, videos[1].resolve(), staged_id),
+        observed_status("playing", 500, 20_000, videos[1], staged_id, 6.0),
         generation=generation,
     )
 
@@ -439,9 +513,40 @@ async def test_native_transition_classifies_completion_from_near_end_evidence(
     progress = db.progress_for(videos[0])
     assert first.state == "completed"
     assert progress["completion_observed"] == 1
-    assert progress["position_ms"] == 10_000
-    assert progress["resume_position_ms"] == 10_000
+    assert progress["position_ms"] == 19_000
+    assert progress["resume_position_ms"] == 19_000
+    assert progress["coverage_ms"] == 5_000
     assert queue.current() is not None and queue.current().path == videos[1].resolve()
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_native_next_near_end_does_not_infer_completion(tmp_path: Path) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    client = PlaylistFakeClient()
+    controller = PlaybackController(queue, process=FakeProcess())  # type: ignore[arg-type]
+    controller.client = client  # type: ignore[assignment]
+    await controller.play_index(0)
+    active_id = controller.active_vlc_id
+    staged_id = controller.staged_vlc_id
+    generation = controller.playback_generation
+    assert active_id is not None and staged_id is not None
+    for second in range(6):
+        await controller._observe(
+            observed_status(
+                "playing", 12_000 + second * 1_000, 20_000,
+                videos[0], active_id, float(second),
+            ),
+            generation=generation,
+        )
+    await controller._observe(
+        observed_status("playing", 100, 20_000, videos[1], staged_id, 5.1),
+        generation=generation,
+    )
+    assert queue.entries()[0].state == "skipped"
+    progress = db.progress_for(videos[0])
+    assert progress["completion_observed"] == 0
+    assert progress["coverage_ms"] == 5_000
     db.close()
 
 
@@ -460,10 +565,14 @@ async def test_native_transition_rolls_back_history_when_queue_update_fails(
     first = queue.entries()[0]
     assert active_id is not None and staged_id is not None
 
-    await controller._observe(
-        VLCStatus("playing", 9_000, 10_000, videos[0].resolve(), active_id),
-        generation=generation,
-    )
+    for second in range(6):
+        await controller._observe(
+            observed_status(
+                "playing", 14_000 + second * 1_000, 20_000,
+                videos[0], active_id, float(second),
+            ),
+            generation=generation,
+        )
     before = dict(db.progress_for(videos[0]))
     db.connection.execute(
         "CREATE TRIGGER reject_completed_transition "
@@ -473,7 +582,7 @@ async def test_native_transition_rolls_back_history_when_queue_update_fails(
     )
 
     await controller._observe(
-        VLCStatus("playing", 500, 10_000, videos[1].resolve(), staged_id),
+        observed_status("playing", 500, 20_000, videos[1], staged_id, 6.0),
         generation=generation,
     )
 
@@ -672,7 +781,7 @@ async def test_controller_keeps_missing_media_visible_during_stale_poll(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_controller_controls_and_conservative_completion(tmp_path: Path) -> None:
+async def test_seek_near_end_then_stop_does_not_establish_completion(tmp_path: Path) -> None:
     db, queue, videos = setup_queue(tmp_path)
     process = FakeProcess()
     controller = PlaybackController(queue, process=process)  # type: ignore[arg-type]
@@ -684,9 +793,10 @@ async def test_controller_controls_and_conservative_completion(tmp_path: Path) -
     assert process.client.commands == [("pl_pause", {}), ("seek", {"val": "+10"})]
     await controller._observe(VLCStatus("playing", 9_000, 10_000, videos[0].resolve()))
     await controller._observe(VLCStatus("stopped", 9_000, 10_000, videos[0].resolve()))
-    assert queue.entries()[0].state == "completed"
-    assert queue.current() is not None and queue.current().path == videos[1].resolve()
-    assert db.progress_for(videos[0])["completion_observed"] == 1
+    assert queue.entries()[0].state == "stopped"
+    assert queue.current() is not None and queue.current().path == videos[0].resolve()
+    assert db.progress_for(videos[0])["completion_observed"] == 0
+    assert db.progress_for(videos[0])["coverage_ms"] is None
     db.close()
 
 

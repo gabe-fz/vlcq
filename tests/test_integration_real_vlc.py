@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
 import subprocess
+import wave
 from pathlib import Path
 
 import pytest
@@ -47,35 +47,33 @@ async def test_real_vlc_temporary_media_play_seek_pause_stop_and_reconnect(
     executable = Path("/Applications/VLC.app/Contents/MacOS/VLC")
     if not executable.is_file():
         pytest.skip("macOS VLC application is not installed")
-    ffmpeg = shutil.which("ffmpeg")
-    if ffmpeg is None:
-        pytest.skip("ffmpeg is required to generate temporary integration media")
-    media_paths = [tmp_path / f"generated-{index}.mp4" for index in range(1, 4)]
-    for media in media_paths:
+    media_paths = [tmp_path / f"generated-{index}.mp4" for index in range(1, 5)]
+    for index, media in enumerate(media_paths):
+        source = tmp_path / f"source-{index}.wav"
+        with wave.open(str(source), "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(8_000)
+            output.writeframes(b"\0\0" * 8_000 * 12)
+        encoded = media.with_suffix(".m4a")
         result = await asyncio.to_thread(
             subprocess.run,
             [
-                ffmpeg,
-                "-v",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "color=c=black:s=160x90:r=10",
-                "-t",
-                "4",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:v",
-                "mpeg4",
-                "-y",
-                str(media),
+                "/usr/bin/avconvert",
+                "--source",
+                str(source),
+                "--preset",
+                "PresetAppleM4A",
+                "--output",
+                str(encoded),
+                "--replace",
             ],
             check=False,
             capture_output=True,
         )
         if result.returncode != 0:
-            pytest.skip("ffmpeg could not generate the temporary test media")
+            pytest.fail("macOS avconvert could not generate temporary integration media")
+        encoded.replace(media)
 
     database = Database(tmp_path / "integration.sqlite3")
     queue = QueueService(database)
@@ -88,70 +86,107 @@ async def test_real_vlc_temporary_media_play_seek_pause_stop_and_reconnect(
         except (OSError, TimeoutError, VLCError) as exc:
             pytest.skip(f"VLC HTTP startup unavailable in this environment: {exc}")
 
-        # Seed only temporary history, then exercise the same policy used by
-        # the CLI and TUI for a persisted resume point.
-        database.set_resume_position(media_paths[0], 1_000, 4_000)
+        # Exercise persisted resume, real status rate/timing, and normal
+        # five-second qualification using only generated temporary media.
+        database.set_resume_position(media_paths[0], 1_000, 12_000)
         await controller.play_with_policy(0, choice="resume")
         await asyncio.sleep(0.5)
-        status = await controller.client.status() if controller.client is not None else None
-        assert status is not None
-        duration = status.duration_ms or 3_000
-        await controller.seek_absolute(0, duration)
-        progress = database.progress_for(media_paths[0])
-        assert progress["position_ms"] >= 1_000
-        assert progress["resume_position_ms"] == 0
+        client = controller.client
+        assert client is not None
+        status = await client.status()
+        assert status.rate is not None and status.rate > 0
+        assert status.request_started is not None
+        assert status.response_received is not None
+        duration = status.duration_ms or 12_000
+        await asyncio.sleep(6.5)
         await controller.toggle_pause()
-        await controller.toggle_pause()
-        assert await controller.stop_playback()
+        normal = database.progress_for(media_paths[0])
+        assert normal["resume_position_ms"] > 0
+        assert 3_000 <= normal["coverage_ms"] < duration
 
-        # Replaying the first temporary file should naturally advance to the
-        # second without an interactive resume prompt. The first observation
-        # can be a direct playing-to-playing transition, with no stopped poll.
-        await controller.play_index(0)
-        for _ in range(30):
+        # Replay mostly overlapping material. Union growth is bounded by only
+        # the newly reached edge, never by the full replayed elapsed interval.
+        await controller.seek_absolute(2_000, duration)
+        await controller.toggle_pause()
+        await asyncio.sleep(6.2)
+        await controller.toggle_pause()
+        overlap = database.progress_for(media_paths[0])
+        assert normal["coverage_ms"] <= overlap["coverage_ms"]
+        assert overlap["coverage_ms"] <= normal["coverage_ms"] + 2_500
+
+        # A real external rate change invalidates pending evidence; subsequent
+        # coherent observations use VLC's reported finite positive rate.
+        await client.set_rate(1.5)
+        await controller.seek_absolute(2_000, duration)
+        await controller.toggle_pause()
+        await asyncio.sleep(5.5)
+        variable_status = await client.status()
+        assert variable_status.rate == pytest.approx(1.5, rel=0.1)
+        await controller.toggle_pause()
+
+        # Seeking near the end and playing only a brief tail may transition to
+        # the successor, but cannot force full coverage or completion.
+        await controller.seek_absolute(max(0, duration - 800), duration)
+        await controller.toggle_pause()
+        for _ in range(12):
             if queue.current() is not None and queue.current().path == media_paths[1].resolve():
                 break
             await asyncio.sleep(0.5)
-        assert queue.entries()[0].state == "completed"
-        assert database.progress_for(media_paths[0])["completion_observed"] == 1
-        active = queue.current()
-        assert active is not None and active.path == media_paths[1].resolve()
-        client = controller.client
-        assert client is not None
-        window = await client.playlist()
-        assert [item.path for item in window] == [
-            media_paths[1].resolve(),
-            media_paths[2].resolve(),
-        ]
-        assert len(window) <= 2
+        first_progress = database.progress_for(media_paths[0])
+        assert queue.entries()[0].state == "skipped"
+        assert first_progress["completion_observed"] == 0
+        assert first_progress["coverage_ms"] < duration
 
-        # Exercise VLC's native Next directly. It must adopt the staged third
-        # file without issuing another in_play command.
-        await client.command("pl_next")
-        for _ in range(10):
+        # Let the second item advance naturally. Its qualified recent
+        # continuity—not a single near-end sample—supports the queue outcome.
+        for _ in range(34):
             if queue.current() is not None and queue.current().path == media_paths[2].resolve():
                 break
             await asyncio.sleep(0.5)
         assert queue.current() is not None and queue.current().path == media_paths[2].resolve()
-        assert queue.entries()[1].state == "skipped"
+        second_progress = database.progress_for(media_paths[1])
+        assert queue.entries()[1].state == "completed", second_progress
+        assert second_progress["completion_observed"] == 1
+        assert second_progress["coverage_ms"] >= 5_000
+        assert second_progress["coverage_ms"] < duration
+        await controller.synchronize_playlist()
         window = await client.playlist()
-        assert [item.path for item in window] == [media_paths[2].resolve()]
+        assert [item.path for item in window] == [
+            media_paths[2].resolve(),
+            media_paths[3].resolve(),
+        ]
         assert len(window) <= 2
 
-        assert await controller.stop_playback()
-        active_index = next(
-            index for index, entry in enumerate(queue.entries()) if entry.id == active.id
-        )
-        queue.remove(active_index, stop_confirmed=True)
-        await controller.synchronize_playlist(force=True)
-        assert media_paths[2].is_file()
+        # VLC-native Next adopts exactly the staged fourth item and records no
+        # completion or unseen coverage for the manually skipped third item.
+        await client.command("pl_next")
+        for _ in range(12):
+            if queue.current() is not None and queue.current().path == media_paths[3].resolve():
+                break
+            await asyncio.sleep(0.5)
+        assert queue.current() is not None and queue.current().path == media_paths[3].resolve()
+        assert queue.entries()[2].state == "skipped"
+        third_progress = database.progress_for(media_paths[2])
+        assert third_progress["completion_observed"] == 0
+        assert third_progress["coverage_ms"] in {None, 0}
+        await controller.synchronize_playlist()
+        window = await client.playlist()
+        assert [item.path for item in window] == [media_paths[3].resolve()]
+        assert len(window) <= 2
+
+        assert all(path.is_file() for path in media_paths)
 
         # Overlapping recovery requests share one owned lifecycle and never
-        # select or autoplay the remaining queue.
+        # select or autoplay the persisted stopped item.
+        saved_current = queue.current()
+        assert saved_current is not None
+        await controller.stop()
         clients = await asyncio.gather(controller.reconnect(), controller.reconnect())
         assert clients == [None, None]
         assert controller.client is not None
-        assert queue.current() is None
+        assert queue.current() is not None
+        assert queue.current().id == saved_current.id
+        assert queue.current().state == "stopped"
     finally:
         await controller.stop()
         database.close()

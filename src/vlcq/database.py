@@ -11,9 +11,15 @@ from typing import Any
 
 from .models import HistoryProjection, QueueEntry
 from .paths import canonical_root, is_beneath
-from .progress import is_watched
+from .progress import (
+    clipped_coverage_ms,
+    coverage_is_watched,
+    coverage_percentage,
+    is_watched,
+    merge_intervals,
+)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _locked_method(method: Callable[..., Any]) -> Callable[..., Any]:
@@ -143,7 +149,15 @@ class Database:
                     "completion_observed INTEGER NOT NULL DEFAULT 0, "
                     "first_observed TEXT NOT NULL, last_observed TEXT NOT NULL, "
                     "resume_position_ms INTEGER, last_played_at TEXT, "
+                    "coverage_initialized_at TEXT, "
                     "UNIQUE(path, device, inode, size, mtime_ns))"
+                ),
+                (
+                    "CREATE TABLE coverage_ranges("
+                    "media_id INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE, "
+                    "start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, "
+                    "CHECK(start_ms>=0 AND end_ms>start_ms), "
+                    "PRIMARY KEY(media_id,start_ms,end_ms))"
                 ),
                 (
                     "CREATE TABLE queue_entries("
@@ -167,6 +181,28 @@ class Database:
                     (
                         "ALTER TABLE media ADD COLUMN resume_position_ms INTEGER",
                         "ALTER TABLE media ADD COLUMN last_played_at TEXT",
+                        "ALTER TABLE media ADD COLUMN coverage_initialized_at TEXT",
+                        (
+                            "CREATE TABLE coverage_ranges("
+                            "media_id INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE, "
+                            "start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, "
+                            "CHECK(start_ms>=0 AND end_ms>start_ms), "
+                            "PRIMARY KEY(media_id,start_ms,end_ms))"
+                        ),
+                    ),
+                    SCHEMA_VERSION,
+                )
+            elif version == 2:
+                self._transactional_schema_change(
+                    (
+                        "ALTER TABLE media ADD COLUMN coverage_initialized_at TEXT",
+                        (
+                            "CREATE TABLE coverage_ranges("
+                            "media_id INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE, "
+                            "start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, "
+                            "CHECK(start_ms>=0 AND end_ms>start_ms), "
+                            "PRIMARY KEY(media_id,start_ms,end_ms))"
+                        ),
                     ),
                     SCHEMA_VERSION,
                 )
@@ -594,7 +630,10 @@ class Database:
                 key = str(path.resolve())
                 row = existing.get(key)
                 if row is not None:
-                    if int(row["media_id"]) != media_id and row["state"] not in {"playing", "paused"}:
+                    if int(row["media_id"]) != media_id and row["state"] not in {
+                        "playing",
+                        "paused",
+                    }:
                         self.connection.execute(
                             "UPDATE queue_entries SET media_id=?,state='queued' WHERE id=?",
                             (media_id, row["id"]),
@@ -630,8 +669,7 @@ class Database:
                 (
                     int(row["id"])
                     for row in rows
-                    if int(row["id"]) == current_id
-                    and str(row["state"]) in {"playing", "paused"}
+                    if int(row["id"]) == current_id and str(row["state"]) in {"playing", "paused"}
                 ),
                 None,
             )
@@ -644,7 +682,10 @@ class Database:
                     if int(row["id"]) == active_id:
                         continue
                     selected_ids.append(int(row["id"]))
-                    if int(row["media_id"]) != media_id and row["state"] not in {"playing", "paused"}:
+                    if int(row["media_id"]) != media_id and row["state"] not in {
+                        "playing",
+                        "paused",
+                    }:
                         self.connection.execute(
                             "UPDATE queue_entries SET media_id=?,state='queued' WHERE id=?",
                             (media_id, row["id"]),
@@ -819,19 +860,76 @@ class Database:
             played_at=played_at,
         )
 
+    def merge_coverage(
+        self,
+        path: Path,
+        ranges: Iterable[tuple[int, int]],
+        duration_ms: int = 0,
+        *,
+        initialized_at: str | None = None,
+    ) -> None:
+        """Merge confirmed half-open ranges for the path's current fingerprint."""
+        additions = merge_intervals(ranges)
+        now = initialized_at or datetime.now(UTC).isoformat()
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            media_id = self.ensure_media(path)
+            existing = [
+                (int(row[0]), int(row[1]))
+                for row in self.connection.execute(
+                    "SELECT start_ms,end_ms FROM coverage_ranges WHERE media_id=? ORDER BY start_ms",
+                    (media_id,),
+                )
+            ]
+            merged = merge_intervals((*existing, *additions))
+            self.connection.execute("DELETE FROM coverage_ranges WHERE media_id=?", (media_id,))
+            self.connection.executemany(
+                "INSERT INTO coverage_ranges(media_id,start_ms,end_ms) VALUES(?,?,?)",
+                ((media_id, start, end) for start, end in merged),
+            )
+            self.connection.execute(
+                "UPDATE media SET coverage_initialized_at=COALESCE(coverage_initialized_at,?), "
+                "duration_ms=MAX(duration_ms,?) WHERE id=?",
+                (now, max(0, int(duration_ms)), media_id),
+            )
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def initialize_coverage(self, path: Path, duration_ms: int = 0) -> None:
+        self.merge_coverage(path, (), duration_ms)
+
+    def coverage_ranges_for_media(self, media_id: int) -> tuple[tuple[int, int], ...]:
+        return tuple(
+            (int(row[0]), int(row[1]))
+            for row in self.connection.execute(
+                "SELECT start_ms,end_ms FROM coverage_ranges WHERE media_id=? ORDER BY start_ms",
+                (media_id,),
+            )
+        )
+
     def progress_for(self, path: Path) -> dict[str, Any]:
         media_id = self.ensure_media(path.resolve())
         row = self.connection.execute(
             "SELECT position_ms,duration_ms,completion_observed,last_observed,"
-            "resume_position_ms,last_played_at,first_observed FROM media WHERE id=?",
+            "resume_position_ms,last_played_at,first_observed,coverage_initialized_at "
+            "FROM media WHERE id=?",
             (media_id,),
         ).fetchone()
         if row is None:
             raise RuntimeError("media record disappeared")
-        return dict(row)
+        result = dict(row)
+        ranges = self.coverage_ranges_for_media(media_id)
+        result["coverage_ranges"] = ranges
+        result["coverage_ms"] = (
+            clipped_coverage_ms(ranges, int(row["duration_ms"]))
+            if row["coverage_initialized_at"] is not None
+            else None
+        )
+        return result
 
-    @staticmethod
-    def _projection(row: sqlite3.Row, path: Path) -> HistoryProjection:
+    def _projection(self, row: sqlite3.Row, path: Path) -> HistoryProjection:
         return HistoryProjection(
             path=path,
             media_id=int(row["id"]),
@@ -844,6 +942,15 @@ class Database:
             first_observed=str(row["first_observed"]) if row["first_observed"] else None,
             last_observed=str(row["last_observed"]) if row["last_observed"] else None,
             last_played_at=str(row["last_played_at"]) if row["last_played_at"] else None,
+            coverage_initialized_at=(
+                str(row["coverage_initialized_at"]) if row["coverage_initialized_at"] else None
+            ),
+            coverage_ranges=(ranges := self.coverage_ranges_for_media(int(row["id"]))),
+            coverage_ms=(
+                clipped_coverage_ms(ranges, int(row["duration_ms"]))
+                if row["coverage_initialized_at"] is not None
+                else None
+            ),
         )
 
     def history_for(self, path: Path, root: str | Path | None = None) -> HistoryProjection | None:
@@ -869,7 +976,7 @@ class Database:
         result: dict[Path, HistoryProjection] = {}
         columns = (
             "id,path,position_ms,duration_ms,completion_observed,first_observed,"
-            "last_observed,resume_position_ms,last_played_at"
+            "last_observed,resume_position_ms,last_played_at,coverage_initialized_at"
         )
         for path, fingerprint in identities:
             row = self.connection.execute(
@@ -897,9 +1004,7 @@ class Database:
                 continue
             if not path.is_file():
                 continue
-            identities.append(
-                (path, (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns))
-            )
+            identities.append((path, (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)))
         return self.history_for_identities(identities)
 
     # Descriptive alias used by rendering code and external integrations.
@@ -924,19 +1029,26 @@ class Database:
         base = canonical_root(root)
         records: dict[str, dict[str, Any]] = {}
         for row in self.connection.execute(
-            "SELECT path,position_ms,duration_ms,completion_observed,last_observed FROM media "
-            "WHERE position_ms>0 OR completion_observed=1"
+            "SELECT id,path,device,inode,size,mtime_ns,position_ms,duration_ms,"
+            "completion_observed,last_observed,coverage_initialized_at FROM media "
+            "WHERE position_ms>0 OR completion_observed=1 OR coverage_initialized_at IS NOT NULL"
         ):
             path = Path(row["path"])
             try:
-                canonical = path.resolve(strict=False)
-            except RuntimeError:
+                canonical = path.resolve(strict=True)
+                stat = canonical.stat()
+            except (OSError, RuntimeError):
                 continue
-            if not is_beneath(canonical, base):
+            fingerprint = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+            stored = (int(row["device"]), int(row["inode"]), int(row["size"]), int(row["mtime_ns"]))
+            if not is_beneath(canonical, base) or fingerprint != stored:
                 continue
             relative = canonical.relative_to(base).as_posix()
             duration = int(row["duration_ms"])
             position = int(row["position_ms"])
+            initialized = row["coverage_initialized_at"] is not None
+            ranges = self.coverage_ranges_for_media(int(row["id"])) if initialized else ()
+            covered = clipped_coverage_ms(ranges, duration) if initialized else None
             records[relative] = {
                 "positionMs": position,
                 "durationMs": duration,
@@ -948,5 +1060,14 @@ class Database:
                     threshold=watched_percent,
                 ),
                 "observedAt": row["last_observed"],
+                "coverageMs": covered,
+                "coveragePercent": (
+                    coverage_percentage(covered, duration) if covered is not None else None
+                ),
+                "coverageWatched": (
+                    coverage_is_watched(covered, duration, threshold=watched_percent)
+                    if covered is not None and duration > 0
+                    else None
+                ),
             }
         return dict(sorted(records.items()))

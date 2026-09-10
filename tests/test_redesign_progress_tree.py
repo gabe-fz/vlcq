@@ -17,7 +17,7 @@ from vlcq.models import VLCStatus
 from vlcq.paths import discover_tree
 from vlcq.progress import clamped_percentage, is_watched
 from vlcq.queue import QueueService
-from vlcq.tui import ItemProgress, VLCQApp, render_filename
+from vlcq.tui import HistoricalCoverage, ItemProgress, VLCQApp, render_filename
 
 
 def video(path: Path, content: bytes = b"video") -> Path:
@@ -108,13 +108,14 @@ async def test_threshold_classification_does_not_advance_and_watched_replay_star
     assert database.progress_for(first)["completion_observed"] == 0
 
     database.merge_progress(second, 5_000, 10_000)
+    database.merge_coverage(second, [(0, 5_000)], 10_000)
     assert await controller.play_with_policy(1)
     assert client.played == [second.resolve()]
     history = database.history_for(second, root=root)
     assert history is not None
     assert history.position_ms == 5_000
     assert history.resume_position_ms == 0
-    assert history.watched(50)
+    assert history.coverage_watched(50)
     database.close()
 
 
@@ -137,7 +138,7 @@ def test_recursive_discovery_is_confined_natural_and_deduplicated(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_tree_progress_filters_direct_controls_and_seek_surface(tmp_path: Path) -> None:
+async def test_tree_coverage_filters_keyboard_transport_and_read_only_rows(tmp_path: Path) -> None:
     root = tmp_path / "library"
     left = video(root / "left" / "left-episode.mkv", b"left")
     right = video(root / "right" / "right-episode.mkv", b"right")
@@ -145,8 +146,11 @@ async def test_tree_progress_filters_direct_controls_and_seek_surface(tmp_path: 
     unplayed = video(root / "unplayed.mkv", b"unplayed")
     database = Database(tmp_path / "state.sqlite3")
     database.merge_progress(left, 45_000, 60_000)
+    database.merge_coverage(left, [(0, 45_000)], 60_000)
     database.merge_progress(right, 85_000, 100_000)
+    database.merge_coverage(right, [(0, 85_000)], 100_000)
     database.merge_progress(unknown, 1_000, 0)
+    database.initialize_coverage(unknown, 0)
     app = VLCQApp(root=root, database=database, no_vlc=True, watched_percent=80)
 
     async with app.run_test(size=(80, 24)) as pilot:
@@ -163,16 +167,15 @@ async def test_tree_progress_filters_direct_controls_and_seek_surface(tmp_path: 
         assert {folders["left"].path, folders["right"].path}.issubset(app.expanded_paths)
 
         rows = {row.path: row for row in browser.children}
-        partial_bar = rows[left.resolve()].query_one(ItemProgress)
-        watched_bar = rows[right.resolve()].query_one(ItemProgress)
-        unknown_bar = rows[unknown.resolve()].query_one(ItemProgress)
-        unplayed_bar = rows[unplayed.resolve()].query_one(ItemProgress)
-        assert "75%" in str(partial_bar.renderable)
-        assert partial_bar.watched is False
-        assert "85%" in str(watched_bar.renderable)
-        assert watched_bar.watched is True
-        assert "?%" in str(unknown_bar.renderable)
-        assert unplayed_bar.display is False
+        partial_history = rows[left.resolve()].query_one(HistoricalCoverage)
+        watched_history = rows[right.resolve()].query_one(HistoricalCoverage)
+        unknown_history = rows[unknown.resolve()].query_one(HistoricalCoverage)
+        unplayed_history = rows[unplayed.resolve()].query_one(HistoricalCoverage)
+        assert "75%" in str(partial_history.renderable)
+        assert "85%" in str(watched_history.renderable)
+        assert "hist    —" in str(unknown_history.renderable)
+        assert "hist    —" in str(unplayed_history.renderable)
+        assert not rows[left.resolve()].query(ItemProgress)
 
         await pilot.click("#files-search")
         assert app.screen.__class__.__name__ == "SearchFilterPrompt"
@@ -186,14 +189,14 @@ async def test_tree_progress_filters_direct_controls_and_seek_surface(tmp_path: 
         app.refresh_queue()
         await pilot.pause()
         current_before = app.queue.current()
-        await pilot.click(partial_bar)
+        await pilot.click(partial_history)
         assert app.queue.current() == current_before
 
-        await pilot.click("#player-pause")
+        await pilot.press("space")
         assert app.queue.current() is not None and app.queue.current().state == "paused"
-        await pilot.click("#player-pause")
+        await pilot.press("space")
         assert app.queue.current() is not None and app.queue.current().state == "playing"
-        await pilot.click("#player-next")
+        await pilot.press("n")
         assert app.queue.current() is not None and app.queue.current().path == right.resolve()
 
         await pilot.click("#files-actions")
@@ -203,10 +206,9 @@ async def test_tree_progress_filters_direct_controls_and_seek_surface(tmp_path: 
         await pilot.click("#queue-actions")
         queue_overflow = {str(button.label) for button in app.screen.query(Button)}
         assert "Clear watched/completed" not in queue_overflow
-        await pilot.press("escape")
-        await pilot.click("#player-menu")
-        player_overflow = {str(button.label) for button in app.screen.query(Button)}
-        assert {"Pause / resume", "Previous", "Next"}.isdisjoint(player_overflow)
+        assert {"Pause / resume", "Previous", "Next", "Seek back 10s"}.isdisjoint(
+            queue_overflow
+        )
         await pilot.press("escape")
 
         app.search_query = ""
@@ -219,14 +221,18 @@ async def test_tree_progress_filters_direct_controls_and_seek_surface(tmp_path: 
         app.no_vlc = False
         app.controller.client = client  # type: ignore[assignment]
         app.controller.status = VLCStatus("playing", 50_000, 100_000, right.resolve())
-        await pilot.click("#progress", offset=(2, 0))
+        app.refresh_playback()
         await pilot.pause(0.05)
-        assert any(command == "seek" for command, _ in client.commands)
-        command_count = len(client.commands)
+        queue_row = app.query_one("#queue", ListView).children[1]
+        current_progress = queue_row.query_one(ItemProgress)
+        assert "50%" in str(current_progress.renderable)
+        await pilot.click(current_progress)
+        assert client.commands == []
         app.controller.status = VLCStatus("playing", 1_000, 0, right.resolve())
-        await pilot.click("#progress", offset=(2, 0))
+        app.refresh_playback()
         await pilot.pause()
-        assert len(client.commands) == command_count
+        assert "--%" in str(current_progress.renderable)
+        assert client.commands == []
         app.no_vlc = True
         app.controller.client = None
 

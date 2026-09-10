@@ -22,7 +22,10 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         prog="vlcq",
         description="Folder-first deterministic VLC queue",
-        epilog="Watched status uses VLCQ_WATCHED_PERCENT (whole 1-100, default 90).",
+        epilog=(
+            "Historical watched coverage uses VLCQ_WATCHED_PERCENT "
+            "(whole 1-100, default 90)."
+        ),
     )
     result.add_argument("--database", type=Path, default=None, help=argparse.SUPPRESS)
     sub = result.add_subparsers(dest="command")

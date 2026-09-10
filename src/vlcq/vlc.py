@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import secrets
 import shutil
@@ -19,6 +20,16 @@ from .paths import PathError, file_uri_to_path
 
 class VLCError(RuntimeError):
     pass
+
+
+def _rate(value: object) -> float | None:
+    try:
+        if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+            return None
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result) and result > 0 else None
 
 
 def _number(value: object) -> int:
@@ -146,6 +157,7 @@ def parse_status(payload: object) -> VLCStatus:
         _number(payload.get("length")) * 1000,
         path,
         _current_playlist_id(payload),
+        _rate(payload.get("rate")),
     )
 
 
@@ -168,7 +180,7 @@ class VLCClient:
             base_url=f"http://127.0.0.1:{port}",
             auth=("", password),
             follow_redirects=False,
-            timeout=2,
+            timeout=5,
             transport=transport,
         )
         self._playlist_paths: dict[str, Path] = {}
@@ -181,8 +193,23 @@ class VLCClient:
             raise VLCError("VLC returned unexpected content")
         return response.json()
 
-    async def _status_from_payload(self, payload: object) -> VLCStatus:
-        status = parse_status(payload)
+    async def _status_from_payload(
+        self,
+        payload: object,
+        request_started: float | None = None,
+        response_received: float | None = None,
+    ) -> VLCStatus:
+        parsed = parse_status(payload)
+        status = VLCStatus(
+            parsed.state,
+            parsed.position_ms,
+            parsed.duration_ms,
+            parsed.path,
+            parsed.playlist_id,
+            parsed.rate,
+            request_started,
+            response_received,
+        )
         playlist_id = status.playlist_id
         if status.path is not None or playlist_id is None:
             return status
@@ -192,7 +219,16 @@ class VLCClient:
             path = next((item.path for item in items if item.playlist_id == playlist_id), None)
         if path is None:
             return status
-        return VLCStatus(status.state, status.position_ms, status.duration_ms, path, playlist_id)
+        return VLCStatus(
+            status.state,
+            status.position_ms,
+            status.duration_ms,
+            path,
+            playlist_id,
+            status.rate,
+            status.request_started,
+            status.response_received,
+        )
 
     async def playlist(self) -> list[VLCPlaylistItem]:
         """Inspect VLC's nested playlist without exposing its raw response."""
@@ -209,8 +245,20 @@ class VLCClient:
 
     async def status(self) -> VLCStatus:
         try:
+            clock = asyncio.get_running_loop().time
+            started = clock()
             response = await self._client.get("/requests/status.json")
-            return await self._status_from_payload(self._response_payload(response))
+            status = await self._status_from_payload(self._response_payload(response))
+            return VLCStatus(
+                status.state,
+                status.position_ms,
+                status.duration_ms,
+                status.path,
+                status.playlist_id,
+                status.rate,
+                started,
+                clock(),
+            )
         except (httpx.HTTPError, json.JSONDecodeError) as exc:
             raise VLCError("VLC is unavailable") from exc
 
@@ -239,18 +287,36 @@ class VLCClient:
             "pl_delete",
             "pl_empty",
             "seek",
+            "rate",
         }
         if command not in allowed:
             raise VLCError("unsupported VLC command")
         params: dict[str, str | int] = {"command": command, **parameters}
         try:
+            clock = asyncio.get_running_loop().time
+            started = clock()
             response = await self._client.get("/requests/status.json", params=params)
             status = await self._status_from_payload(self._response_payload(response))
+            status = VLCStatus(
+                status.state,
+                status.position_ms,
+                status.duration_ms,
+                status.path,
+                status.playlist_id,
+                status.rate,
+                started,
+                clock(),
+            )
             if command in {"in_enqueue", "pl_delete", "pl_empty"}:
                 self._playlist_paths.clear()
             return status
         except (httpx.HTTPError, json.JSONDecodeError) as exc:
             raise VLCError("VLC command failed") from exc
+
+    async def set_rate(self, rate: float) -> VLCStatus:
+        if not math.isfinite(rate) or rate <= 0:
+            raise VLCError("playback rate must be finite and positive")
+        return await self.command("rate", val=str(rate))
 
     async def play(self, path: Path) -> VLCStatus:
         canonical = self._validated_media_path(path)
