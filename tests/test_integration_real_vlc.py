@@ -54,7 +54,11 @@ async def test_real_vlc_temporary_media_play_seek_pause_stop_and_reconnect(
             output.setnchannels(1)
             output.setsampwidth(2)
             output.setframerate(8_000)
-            output.writeframes(b"\0\0" * 8_000 * 12)
+            # Give the first item enough headroom for the controller's initial
+            # idle poll plus the five-second qualification window. The later
+            # items stay short so natural-successor checks remain bounded.
+            seconds = 20 if index == 0 else 12
+            output.writeframes(b"\0\0" * 8_000 * seconds)
         encoded = media.with_suffix(".m4a")
         result = await asyncio.to_thread(
             subprocess.run,
@@ -88,7 +92,7 @@ async def test_real_vlc_temporary_media_play_seek_pause_stop_and_reconnect(
 
         # Exercise persisted resume, real status rate/timing, and normal
         # five-second qualification using only generated temporary media.
-        database.set_resume_position(media_paths[0], 1_000, 12_000)
+        database.set_resume_position(media_paths[0], 1_000, 20_000)
         await controller.play_with_policy(0, choice="resume")
         await asyncio.sleep(0.5)
         client = controller.client
@@ -97,8 +101,15 @@ async def test_real_vlc_temporary_media_play_seek_pause_stop_and_reconnect(
         assert status.rate is not None and status.rate > 0
         assert status.request_started is not None
         assert status.response_received is not None
-        duration = status.duration_ms or 12_000
-        await asyncio.sleep(6.5)
+        duration = status.duration_ms or 20_000
+        # Startup can leave the polling loop in its idle backoff briefly. Wait
+        # for the observable qualification result rather than racing exactly
+        # five seconds from the first controller-owned sample.
+        for _ in range(20):
+            normal = database.progress_for(media_paths[0])
+            if (normal["coverage_ms"] or 0) >= 3_000:
+                break
+            await asyncio.sleep(0.5)
         await controller.toggle_pause()
         normal = database.progress_for(media_paths[0])
         assert normal["resume_position_ms"] > 0
@@ -123,6 +134,9 @@ async def test_real_vlc_temporary_media_play_seek_pause_stop_and_reconnect(
         variable_status = await client.status()
         assert variable_status.rate == pytest.approx(1.5, rel=0.1)
         await controller.toggle_pause()
+        # Restore normal rate so the short successor has a full five-second
+        # qualification window before its natural end.
+        await client.set_rate(1.0)
 
         # Seeking near the end and playing only a brief tail may transition to
         # the successor, but cannot force full coverage or completion.
