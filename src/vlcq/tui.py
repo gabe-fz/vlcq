@@ -764,7 +764,7 @@ class VLCQApp(App[None]):
     }
     .subtitle-subitem:hover, .subtitle-subitem:focus { color: white; background: $surface-lighten-2; }
     .row-label { width: auto; height: 1; min-height: 1; overflow-x: hidden; }
-    .folder-label { width: auto; padding: 0 1; background: $warning-darken-2; }
+    .folder-label { width: auto; padding: 0 1; background: $primary; }
     .current-progress { width: auto; min-width: 20; height: 1; min-height: 1; margin-left: 1; padding: 0; content-align: left middle; overflow-x: hidden; }
     .history-value { width: auto; min-width: 8; height: 1; min-height: 1; margin-left: 1; padding: 0; content-align: left middle; }
     .folder-entry { background: transparent; }
