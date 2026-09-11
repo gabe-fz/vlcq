@@ -6,7 +6,7 @@ Subtitle choices are currently discoverable only after a file is loaded into the
 
 - Add bounded, asynchronous offline subtitle discovery for supported video files through a required `ffprobe`/FFmpeg runtime dependency.
 - Discover both embedded subtitle streams and root-confined sidecar subtitle files associated with an episode, with conservative language and characteristic extraction.
-- Show an always-visible compact subtitle name in the same row as every eligible Files and Queue video title, with active/selected markers only; keep source, language, characteristics, and alternatives in its picker.
+- Show an always-visible compact subtitle name as a white-on-gray badge in the same row as every eligible Files and Queue video title, without status glyphs; keep source, language, characteristics, and alternatives in its picker.
 - Let a pre-playback choice, including **Off**, persist as the semantic preference for the confidently inferred whole show; show the resolved remembered or English-fallback choice when browsing other episodes.
 - Reconcile offline descriptors with VLC-reported tracks at playback time, and safely attach/select a matching sidecar when needed, without trusting ffprobe stream identifiers as VLC identifiers.
 - Fail closed with bounded feedback when probing, sidecar validation, show inference, or VLC reconciliation is unavailable.

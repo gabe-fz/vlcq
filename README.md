@@ -60,8 +60,8 @@ always targets the highlighted item rather than an unrelated selected batch.
 All rows remain one line. Filenames remain literal while folders, stem text, bracketed
 spans, numbers, punctuation, and extensions use semantic colors. Compact markers convey
 selection, queued membership, and the current item without relying on color. Beside each
-video filename, `● name` is VLC-confirmed active and `★ name` is selected for later
-playback; the row shows only the subtitle's literal title or filename. Missing and
+video filename, the chosen subtitle's literal title or filename appears as white text on
+a gray badge. Folder names use the same semantic filename coloring on a gray row background. Missing and
 failed queue entries retain `!`/`×` indicators. Ordinary queued, playing, paused,
 stopped, skipped, completed, and watched labels are intentionally not repeated in rows;
 queue outcomes remain available in Details.
@@ -71,7 +71,7 @@ queue outcomes remain available in Details.
 Files rows show the filename and `hist N%` only—never a progress bar. Queue rows show:
 
 ```text
-◆ episode.mkv  ★ Full  [████░░░░] 40% 12:00/30:00  hist 85%
+◆ episode.mkv  Full  [████░░░░] 40% 12:00/30:00  hist 85%
 ```
 
 The Queue bar, percentage, and time are the current/latest viewing position. For the
@@ -118,7 +118,7 @@ duplicate process/poll loop and never selects, loads, or autoplays media.
 ### Subtitle selection and preferences
 
 The inline subtitle status inspects visible videos in the background and shows only the
-literal subtitle title (or sidecar filename), plus a compact active/selected marker.
+literal subtitle title (or sidecar filename) as a white-on-gray badge.
 Language, embedded/sidecar source, characteristics, and all alternatives remain in its
 picker. The picker lists `Off`, embedded streams
 discovered by local `ffprobe`, and immediate same-stem sidecars (`.srt`, `.ass`, `.ssa`,

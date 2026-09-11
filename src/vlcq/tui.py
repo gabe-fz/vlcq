@@ -98,12 +98,11 @@ def render_filename(name: str, *, folder: bool = False, depth: int = 0, expanded
     prefix = "  " * max(0, depth)
     if folder:
         text.append(prefix + ("▾ " if expanded else "▸ "), style="bold cyan")
-        text.append(name, style="bold cyan")
-        return text
-
-    suffix = Path(name).suffix
+        suffix = ""
+    else:
+        text.append(prefix)
+        suffix = Path(name).suffix
     stem = name[: -len(suffix)] if suffix else name
-    text.append(prefix)
     index = 0
     bracket = False
     while index < len(stem):
@@ -221,7 +220,7 @@ class BrowserListItem(ListItem):
             super().__init__(Label(renderable, classes="row-label", markup=False), classes=classes)
         else:
             marker = "☑" if selected else "☐"
-            subtitle = subtitle_renderable or Text("○ Inspecting…", no_wrap=True)
+            subtitle = subtitle_renderable or Text("Inspecting…", no_wrap=True)
             super().__init__(
                 Horizontal(
                     CompactButton(
@@ -259,7 +258,7 @@ class QueueListItem(ListItem):
     ) -> None:
         del history_visible
         self.entry_id = entry.id
-        subtitle = subtitle_renderable or Text("○ Inspecting…", no_wrap=True)
+        subtitle = subtitle_renderable or Text("Inspecting…", no_wrap=True)
         super().__init__(
             Horizontal(
                 Label(renderable, classes="row-label", markup=False),
@@ -756,14 +755,15 @@ class VLCQApp(App[None]):
     .browser-row, .queue-row { width: 1fr; height: 1; min-height: 1; }
     .browser-check { width: 3; min-width: 3; height: 1; min-height: 1; margin: 0; padding: 0; border: none; }
     .subtitle-subitem {
-        width: auto; height: 1; min-height: 1; margin: 0 0 0 1; padding: 0;
-        content-align: left middle; text-align: left; color: $text-muted; overflow-x: hidden;
+        width: auto; height: 1; min-height: 1; margin: 0 0 0 1; padding: 0 1;
+        content-align: left middle; text-align: left; color: white; background: $boost;
+        overflow-x: hidden;
     }
-    .subtitle-subitem:hover, .subtitle-subitem:focus { color: $text; background: $boost; }
+    .subtitle-subitem:hover, .subtitle-subitem:focus { color: white; background: $surface-lighten-2; }
     .row-label { width: auto; height: 1; min-height: 1; overflow-x: hidden; }
     .current-progress { width: auto; min-width: 20; height: 1; min-height: 1; margin-left: 1; padding: 0; content-align: left middle; overflow-x: hidden; }
     .history-value { width: auto; min-width: 8; height: 1; min-height: 1; margin-left: 1; padding: 0; content-align: left middle; }
-    .folder-entry { color: $primary-lighten-2; text-style: bold; }
+    .folder-entry { background: $boost; }
     .video-entry { color: $text; }
     .selected-video { color: $warning; text-style: bold; }
     .queue-selected { background: $boost; text-style: bold; }
@@ -1406,7 +1406,7 @@ class VLCQApp(App[None]):
     def _subtitle_renderable(self, path: Path, *, depth: int = 0) -> Text:
         del depth
         canonical = path.expanduser().resolve(strict=False)
-        text = Text(no_wrap=True, overflow="ellipsis")
+        text = Text(style="white", no_wrap=True, overflow="ellipsis")
         snapshot = self._subtitle_snapshots.get(canonical)
         current = self.controller.status.path is not None and self.controller._same_path(
             self.controller.status.path, canonical
@@ -1415,42 +1415,36 @@ class VLCQApp(App[None]):
         if choice is None and current:
             choice = self._subtitle_row_choices.get(canonical)
         if choice is not None and current:
-            text.append("● ", style="bold green")
-            text.append(self._subtitle_choice_name(choice), style="green")
+            text.append(self._subtitle_choice_name(choice))
             return text
         if current and snapshot is not None:
             active_track = next((track for track in snapshot.tracks if track.active is True), None)
             if active_track is not None:
-                text.append("● ", style="bold green")
-                text.append(self._subtitle_choice_name(SubtitleChoice.track_choice(active_track)), style="green")
+                text.append(self._subtitle_choice_name(SubtitleChoice.track_choice(active_track)))
                 return text
             if snapshot.tracks and any(track.active is not None for track in snapshot.tracks):
-                text.append("● Off", style="bold green")
+                text.append("Off")
                 return text
         if current:
-            text.append("○ Current/default", style="yellow")
+            text.append("Current/default")
             return text
         planned = self._subtitle_row_choices.get(canonical)
         if planned is None and snapshot is not None:
             planned = snapshot.planned_choice
         if planned is not None:
-            text.append("★ ", style="bold cyan")
-            text.append(self._subtitle_choice_name(planned), style="cyan")
+            text.append(self._subtitle_choice_name(planned))
             return text
         if self.database.remember_subtitles_by_show():
             descriptor = self.database.show_subtitle_preference(canonical, root=self.root)
             if descriptor is not None:
-                text.append("★ Off" if descriptor.mode == "off" else "○ Resolving…", style="cyan")
+                text.append("Off" if descriptor.mode == "off" else "Resolving…")
                 return text
         if snapshot is not None:
-            text.append(
-                "○ None selected" if snapshot.candidates else "○ No subtitles",
-                style="bright_black",
-            )
+            text.append("None selected" if snapshot.candidates else "No subtitles")
         elif canonical in self._subtitle_summary_failures:
-            text.append("⚠ Unavailable", style="yellow")
+            text.append("Unavailable")
         else:
-            text.append("○ Inspecting…", style="bright_black")
+            text.append("Inspecting…")
         return text
 
     def _update_subtitle_row(self, row: BrowserListItem | QueueListItem, path: Path) -> None:

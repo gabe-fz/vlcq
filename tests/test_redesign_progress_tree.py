@@ -47,6 +47,9 @@ def test_watched_configuration_helpers_and_export_are_threshold_consistent(
     rendered_name = render_filename("[WEB-DL] Episode 01.mkv")
     assert rendered_name.plain == "[WEB-DL] Episode 01.mkv"
     assert len({str(span.style) for span in rendered_name.spans}) >= 4
+    rendered_folder = render_filename("[Anime] Season 02", folder=True)
+    assert rendered_folder.plain == "▸ [Anime] Season 02"
+    assert len({str(span.style) for span in rendered_folder.spans}) >= 4
 
     root = tmp_path / "library"
     item = video(root / "episode.mkv")
