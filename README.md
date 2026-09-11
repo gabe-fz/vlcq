@@ -61,8 +61,8 @@ All rows remain one line. Filenames remain literal while folders, stem text, bra
 spans, numbers, punctuation, and extensions use semantic colors. Compact markers convey
 selection, queued membership, and the current item without relying on color. Beside each
 video filename, the chosen subtitle's literal title or filename appears as white text on
-a gray badge. Folder names use the same semantic filename coloring on a slightly darker,
-text-width gray badge, leaving row hover/highlight visually distinct. Missing and
+a gray badge. Folder names use the same semantic filename coloring on a text-width dark
+mustard badge, leaving row hover/highlight visually distinct. Missing and
 failed queue entries retain `!`/`×` indicators. Ordinary queued, playing, paused,
 stopped, skipped, completed, and watched labels are intentionally not repeated in rows;
 queue outcomes remain available in Details.
