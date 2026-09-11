@@ -144,6 +144,10 @@ async def test_headers_lead_with_color_coded_pane_specific_controls(tmp_path: Pa
         assert not app.query_one("#files-clear-selection", Button).display
         assert not app.query_one("#files-actions", Button).display
         assert app.query_one("#queue-actions", Button).display
+        folder_row = app.query_one(".folder-entry")
+        folder_label = folder_row.query_one(".folder-label", Label)
+        assert folder_label.region.width < folder_row.region.width
+        assert folder_label.styles.background != folder_row.styles.background
         await pilot.click("#queue-actions")
         assert {str(button.label) for button in app.screen.query(Button)} == {
             "☐ Remember subtitles by show", "☑ Prefer English subtitles",

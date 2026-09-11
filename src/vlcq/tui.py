@@ -217,7 +217,10 @@ class BrowserListItem(ListItem):
         if selected:
             classes += " selected-video"
         if entry.is_dir:
-            super().__init__(Label(renderable, classes="row-label", markup=False), classes=classes)
+            super().__init__(
+                Label(renderable, classes="row-label folder-label", markup=False),
+                classes=classes,
+            )
         else:
             marker = "☑" if selected else "☐"
             subtitle = subtitle_renderable or Text("Inspecting…", no_wrap=True)
@@ -761,9 +764,10 @@ class VLCQApp(App[None]):
     }
     .subtitle-subitem:hover, .subtitle-subitem:focus { color: white; background: $surface-lighten-2; }
     .row-label { width: auto; height: 1; min-height: 1; overflow-x: hidden; }
+    .folder-label { width: auto; padding: 0 1; background: $surface-darken-1; }
     .current-progress { width: auto; min-width: 20; height: 1; min-height: 1; margin-left: 1; padding: 0; content-align: left middle; overflow-x: hidden; }
     .history-value { width: auto; min-width: 8; height: 1; min-height: 1; margin-left: 1; padding: 0; content-align: left middle; }
-    .folder-entry { background: $boost; }
+    .folder-entry { background: transparent; }
     .video-entry { color: $text; }
     .selected-video { color: $warning; text-style: bold; }
     .queue-selected { background: $boost; text-style: bold; }
