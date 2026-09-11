@@ -236,19 +236,23 @@ async def test_video_rows_add_compact_subtitle_subitems_without_changing_metadat
         progress_history = rows[progress.resolve()].query_one(HistoricalCoverage)
         assert "hist  19%" in str(progress_history.renderable)
         assert "hist 100%" in str(rows[completed.resolve()].query_one(HistoricalCoverage).renderable)
-        assert progress_history.region.x - progress_label.region.right <= 1
+        progress_subtitle = rows[progress.resolve()].query_one(SubtitleSubitem)
+        assert progress_subtitle.region.x - progress_label.region.right <= 1
+        assert progress_history.region.x - progress_subtitle.region.right <= 1
         absent_history = rows[absent.resolve()].query_one(HistoricalCoverage)
-        assert absent_history.region.right <= browser.content_region.right
+        absent_subtitle = rows[absent.resolve()].query_one(SubtitleSubitem)
+        assert absent_subtitle.region.x >= absent_label.region.right
+        assert absent_history.region.x >= absent_subtitle.region.right
         checkbox = rows[absent.resolve()].query_one(".browser-check", Button)
         assert checkbox.region.width <= 3
         assert checkbox.region.height == 1
-        assert all(row.region.height == 2 for row in browser.children)
+        assert all(row.region.height == 1 for row in browser.children)
         assert all(
-            "↳ Subtitles:" in str(row.query_one(SubtitleSubitem).renderable)
+            row.query_one(SubtitleSubitem).region.y == row.query_one(Label).region.y
             for row in browser.children
         )
         queue_row = app.query_one("#queue", ListView).children[0]
-        assert queue_row.region.height == 2
+        assert queue_row.region.height == 1
         assert "×" in str(queue_row.query_one(Label).renderable)
         queue_label = queue_row.query_one(Label)
         queue_progress = queue_row.query_one(ItemProgress)
@@ -256,7 +260,9 @@ async def test_video_rows_add_compact_subtitle_subitems_without_changing_metadat
         assert "Completed" not in str(queue_label.renderable)
         assert "hist 100%" in str(queue_history.renderable)
         assert "100%" in str(queue_progress.renderable)
-        assert queue_progress.region.x - queue_label.region.right <= 1
+        queue_subtitle = queue_row.query_one(SubtitleSubitem)
+        assert queue_subtitle.region.x - queue_label.region.right <= 1
+        assert queue_progress.region.x - queue_subtitle.region.right <= 1
         assert queue_history.region.x - queue_progress.region.right <= 1
     db.close()
 

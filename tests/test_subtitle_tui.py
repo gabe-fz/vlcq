@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 from textual import events
-from textual.widgets import Button, Static
+from textual.widgets import Button, Label, Static
 
 from vlcq.database import Database
 from vlcq.models import VLCStatus
@@ -97,8 +97,8 @@ async def test_subtitle_subitem_is_visible_and_video_menu_no_longer_owns_subtitl
         assert len(rows) == 2
         current_subtitle = rows[0].query_one(SubtitleSubitem)
         inactive_subtitle = rows[1].query_one(SubtitleSubitem)
-        assert "● Active: Off" in str(current_subtitle.renderable)
-        assert "Subtitles:" in str(inactive_subtitle.renderable)
+        assert "● Off" in str(current_subtitle.renderable)
+        assert str(inactive_subtitle.renderable)
         current_actions = app._context_actions_for_queue(QueueTarget(entry.id, app._root_generation))
         inactive_entry = app.queue.entries()[1]
         inactive_actions = app._context_actions_for_queue(
@@ -134,7 +134,7 @@ async def test_inactive_subtitle_subitem_opens_persistent_picker_without_vlc(
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause()
         subtitle = app.query_one("#queue").children[0].query_one(SubtitleSubitem)
-        assert "Subtitles:" in str(subtitle.renderable)
+        assert str(subtitle.renderable)
         assert app.controller.client is None
         app.on_click(
             events.Click(
@@ -153,7 +153,7 @@ async def test_inactive_subtitle_subitem_opens_persistent_picker_without_vlc(
         )
         await pilot.pause()
         assert isinstance(app.screen, SubtitlePicker)
-        assert "★ Selected for playback: Off" in str(subtitle.renderable)
+        assert "★ Off" in str(subtitle.renderable)
         await pilot.press("escape")
         subtitle.focus()
         await pilot.press("shift+f10")
@@ -188,11 +188,10 @@ async def test_visible_subtitle_subitem_resolves_mkv_english_choice_in_backgroun
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause(0.1)
         subtitle = app.query_one("#browser").children[0].query_one(SubtitleSubitem)
-        assert (
-            "★ Selected for playback: Embedded · English · English Full Dialogue"
-            in str(subtitle.renderable)
-        )
-        assert subtitle.region.x <= 1
+        assert "★ English Full Dialogue" in str(subtitle.renderable)
+        title = app.query_one("#browser").children[0].query_one(".row-label", Label)
+        assert subtitle.region.y == title.region.y
+        assert subtitle.region.x >= title.region.right
     db.close()
 
 

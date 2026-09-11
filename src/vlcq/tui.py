@@ -25,7 +25,6 @@ from .paths import VIDEO_EXTENSIONS, PathError, is_beneath, list_folder, natural
 from .queue import QueueService
 from .subtitles import (
     SubtitleChoice,
-    SubtitleDescriptor,
     SubtitleDiscovery,
     SubtitleSnapshot,
     SubtitleTarget,
@@ -222,21 +221,18 @@ class BrowserListItem(ListItem):
             super().__init__(Label(renderable, classes="row-label", markup=False), classes=classes)
         else:
             marker = "☑" if selected else "☐"
-            subtitle = subtitle_renderable or Text("↳ Subtitles: ○ Inspecting…", no_wrap=True)
+            subtitle = subtitle_renderable or Text("○ Inspecting…", no_wrap=True)
             super().__init__(
-                Vertical(
-                    Horizontal(
-                        CompactButton(
-                            marker,
-                            classes="browser-check",
-                            tooltip="Deselect video" if selected else "Select video",
-                        ),
-                        Label(renderable, classes="row-label", markup=False),
-                        HistoricalCoverage(history_percentage, watched=history_watched),
-                        classes="browser-row",
+                Horizontal(
+                    CompactButton(
+                        marker,
+                        classes="browser-check",
+                        tooltip="Deselect video" if selected else "Select video",
                     ),
+                    Label(renderable, classes="row-label", markup=False),
                     SubtitleSubitem(entry.path, subtitle),
-                    classes="video-with-subtitle",
+                    HistoricalCoverage(history_percentage, watched=history_watched),
+                    classes="browser-row",
                 ),
                 classes=classes,
             )
@@ -263,17 +259,14 @@ class QueueListItem(ListItem):
     ) -> None:
         del history_visible
         self.entry_id = entry.id
-        subtitle = subtitle_renderable or Text("↳ Subtitles: ○ Inspecting…", no_wrap=True)
+        subtitle = subtitle_renderable or Text("○ Inspecting…", no_wrap=True)
         super().__init__(
-            Vertical(
-                Horizontal(
-                    Label(renderable, classes="row-label", markup=False),
-                    ItemProgress(current_position_ms, current_duration_ms),
-                    HistoricalCoverage(history_percentage, watched=history_watched),
-                    classes="queue-row",
-                ),
+            Horizontal(
+                Label(renderable, classes="row-label", markup=False),
                 SubtitleSubitem(entry.path, subtitle),
-                classes="video-with-subtitle",
+                ItemProgress(current_position_ms, current_duration_ms),
+                HistoricalCoverage(history_percentage, watched=history_watched),
+                classes="queue-row",
             )
         )
         del current_id
@@ -759,15 +752,12 @@ class VLCQApp(App[None]):
     .section-body { height: 1fr; min-height: 1; }
     .section.collapsed .section-body { display: none; }
     #browser, #queue { height: 1fr; min-height: 1; overflow-x: auto; overflow-y: auto; }
-    #browser > ListItem, #queue > ListItem { width: auto; min-width: 100%; }
-    #browser > ListItem.folder-entry { height: 1; min-height: 1; }
-    #browser > ListItem.video-entry, #queue > ListItem { height: 2; min-height: 2; }
-    .video-with-subtitle { width: 1fr; height: 2; min-height: 2; }
+    #browser > ListItem, #queue > ListItem { width: auto; min-width: 100%; height: 1; min-height: 1; }
     .browser-row, .queue-row { width: 1fr; height: 1; min-height: 1; }
     .browser-check { width: 3; min-width: 3; height: 1; min-height: 1; margin: 0; padding: 0; border: none; }
     .subtitle-subitem {
-        width: 100%; height: 1; min-height: 1; margin: 0; padding: 0;
-        border: none; content-align: left middle; text-align: left; color: $text-muted;
+        width: auto; height: 1; min-height: 1; margin: 0 0 0 1; padding: 0;
+        content-align: left middle; text-align: left; color: $text-muted; overflow-x: hidden;
     }
     .subtitle-subitem:hover, .subtitle-subitem:focus { color: $text; background: $boost; }
     .row-label { width: auto; height: 1; min-height: 1; overflow-x: hidden; }
@@ -1394,39 +1384,29 @@ class VLCQApp(App[None]):
         return text
 
     @staticmethod
-    def _subtitle_choice_label(choice: SubtitleChoice) -> str:
+    def _subtitle_choice_name(choice: SubtitleChoice) -> str:
         if choice.mode == "off":
             return "Off"
         if choice.candidate is not None:
-            return choice.candidate.label
+            candidate = choice.candidate
+            if candidate.title is not None:
+                return candidate.title
+            if candidate.path is not None:
+                return candidate.path.name
+            if candidate.language is not None:
+                return "English" if candidate.language == "en" else candidate.language
+            return "Unnamed subtitle"
         assert choice.track is not None
-        return choice.track.label
-
-    @staticmethod
-    def _subtitle_descriptor_label(descriptor: SubtitleDescriptor) -> str:
-        if descriptor.mode == "off":
-            return "Off"
-        parts: list[str] = []
-        if descriptor.source is not None:
-            parts.append(descriptor.source.title())
-        if descriptor.language is not None:
-            parts.append("English" if descriptor.language == "en" else descriptor.language)
-        if descriptor.sidecar_variant is not None:
-            parts.append(descriptor.sidecar_variant)
-        if descriptor.full_dialogue is True:
-            parts.append("full dialogue")
-        if descriptor.signs_songs is True:
-            parts.append("signs/songs")
-        if descriptor.forced is True:
-            parts.append("forced")
-        if descriptor.sdh is True:
-            parts.append("SDH")
-        return " · ".join(parts) if parts else "Remembered track"
+        if choice.track.title is not None:
+            return choice.track.title
+        if choice.track.language is not None:
+            return "English" if choice.track.language == "en" else choice.track.language
+        return f"Track {choice.track.track_id}"
 
     def _subtitle_renderable(self, path: Path, *, depth: int = 0) -> Text:
+        del depth
         canonical = path.expanduser().resolve(strict=False)
-        prefix = "  " * max(0, depth) + "↳ Subtitles: "
-        text = Text(prefix, style="bright_black", no_wrap=True, overflow="ellipsis")
+        text = Text(no_wrap=True, overflow="ellipsis")
         snapshot = self._subtitle_snapshots.get(canonical)
         current = self.controller.status.path is not None and self.controller._same_path(
             self.controller.status.path, canonical
@@ -1435,45 +1415,42 @@ class VLCQApp(App[None]):
         if choice is None and current:
             choice = self._subtitle_row_choices.get(canonical)
         if choice is not None and current:
-            text.append("● Active: ", style="bold green")
-            text.append(self._subtitle_choice_label(choice), style="green")
+            text.append("● ", style="bold green")
+            text.append(self._subtitle_choice_name(choice), style="green")
             return text
         if current and snapshot is not None:
             active_track = next((track for track in snapshot.tracks if track.active is True), None)
             if active_track is not None:
-                text.append("● Active: ", style="bold green")
-                text.append(active_track.label, style="green")
+                text.append("● ", style="bold green")
+                text.append(self._subtitle_choice_name(SubtitleChoice.track_choice(active_track)), style="green")
                 return text
             if snapshot.tracks and any(track.active is not None for track in snapshot.tracks):
-                text.append("● Active: Off", style="bold green")
+                text.append("● Off", style="bold green")
                 return text
         if current:
-            text.append("○ VLC current/default · exact track unreported", style="yellow")
+            text.append("○ Current/default", style="yellow")
             return text
         planned = self._subtitle_row_choices.get(canonical)
         if planned is None and snapshot is not None:
             planned = snapshot.planned_choice
         if planned is not None:
-            text.append("★ Selected for playback: ", style="bold cyan")
-            text.append(self._subtitle_choice_label(planned), style="cyan")
+            text.append("★ ", style="bold cyan")
+            text.append(self._subtitle_choice_name(planned), style="cyan")
             return text
         if self.database.remember_subtitles_by_show():
             descriptor = self.database.show_subtitle_preference(canonical, root=self.root)
             if descriptor is not None:
-                text.append("★ Selected for playback: ", style="bold cyan")
-                text.append(self._subtitle_descriptor_label(descriptor), style="cyan")
+                text.append("★ Off" if descriptor.mode == "off" else "○ Resolving…", style="cyan")
                 return text
         if snapshot is not None:
             text.append(
-                "○ No planned subtitle" if snapshot.candidates else "○ No subtitles found",
+                "○ None selected" if snapshot.candidates else "○ No subtitles",
                 style="bright_black",
             )
         elif canonical in self._subtitle_summary_failures:
-            text.append("○ Inspection unavailable · activate to retry", style="yellow")
-        elif self.database.prefer_english_subtitles():
-            text.append("○ Inspecting MKV subtitles…", style="cyan")
+            text.append("⚠ Unavailable", style="yellow")
         else:
-            text.append("○ Inspecting subtitles…", style="bright_black")
+            text.append("○ Inspecting…", style="bright_black")
         return text
 
     def _update_subtitle_row(self, row: BrowserListItem | QueueListItem, path: Path) -> None:
