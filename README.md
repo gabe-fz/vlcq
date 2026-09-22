@@ -40,7 +40,8 @@ and split available list space equally. Each can be collapsed independently with
 losing tree expansion, selection, highlight, or scroll position; if both are collapsed,
 their one-line headers and Queue application menu remain reachable.
 
-The Files header provides **Open**, **Search/filter**, **Add**, and an overflow menu. The
+The Files header provides **Open**, **Search/filter**, **Refresh**, **Add**, and an overflow
+menu. Refresh reloads the root and expanded folders from disk without collapsing the tree.
 Queue header provides removal, reorder, clear actions, and an overflow menu. Right-click
 opens row-specific actions; `Shift+F10` is the keyboard menu fallback. Every supported
 Files and Queue video shows a compact **subtitle name** beside its filename. Left-click,

@@ -745,7 +745,7 @@ class VLCQApp(App[None]):
         border: none; content-align: center middle;
     }
     #files-toggle, #queue-toggle, #files-actions, #queue-actions { width: 3; min-width: 3; padding: 0; }
-    #files-open, #files-search, #files-add, #files-up, #files-sort,
+    #files-open, #files-search, #files-refresh, #files-add, #files-up, #files-sort,
     #files-clear-selection, #queue-remove, #queue-up, #queue-down,
     #queue-clear, #queue-sort, #queue-undo, #queue-clear-all { min-width: 5; }
     .responsive-action { display: none; }
@@ -891,6 +891,7 @@ class VLCQApp(App[None]):
                     yield Static(self.root.name, id="files-title", classes="section-title")
                     yield CompactButton("Open", id="files-open", variant="primary", tooltip="Open or change library root")
                     yield CompactButton("Search", id="files-search", variant="success", tooltip="Search and filter files")
+                    yield CompactButton("Refresh", id="files-refresh", tooltip="Refresh files from disk")
                     yield CompactButton("Add", id="files-add", variant="warning", tooltip="Add highlighted or selected files")
                     yield CompactButton("Up", id="files-up", classes="responsive-action responsive-medium", tooltip="Move browsing focus to the parent folder")
                     yield CompactButton("Sort", id="files-sort", classes="responsive-action responsive-medium", tooltip="Reverse filename order")
@@ -1984,6 +1985,31 @@ class VLCQApp(App[None]):
                 self._recursive_task = None
                 self._recursive_cancel = None
                 self._search_loading = False
+
+    async def action_refresh_files(self) -> None:
+        """Reload the file tree and transient subtitle metadata from disk."""
+        self.subtitle_discovery.invalidate()
+        for task in self._subtitle_summary_tasks.values():
+            task.cancel()
+        self._subtitle_summary_tasks.clear()
+        self._subtitle_snapshots.clear()
+        self._subtitle_summary_failures.clear()
+        self._refresh_subtitle_rows()
+
+        self._tree_children.clear()
+        self._tree_loaded.clear()
+        self._recursive_entries.clear()
+        await self.refresh_browser()
+
+        # Refresh branches that the user left expanded, in ancestor order, so
+        # newly added or removed descendants appear without collapsing the tree.
+        generation = self._tree_generation
+        for folder in sorted(self.expanded_paths, key=lambda path: len(path.parts)):
+            if generation != self._tree_generation:
+                return
+            await self._load_tree_branch(folder, generation)
+        self.call_after_refresh(self._schedule_visible_subtitle_inspections)
+        self.update_status("Files refreshed")
 
     async def refresh_browser(self) -> None:
         self._browser_refresh_token += 1
@@ -3606,6 +3632,8 @@ class VLCQApp(App[None]):
             self.action_open_root()
         elif button_id == "files-search":
             self.action_search_filter()
+        elif button_id == "files-refresh":
+            await self.action_refresh_files()
         elif button_id == "files-add":
             await self.action_add_selected()
         elif button_id == "files-up":

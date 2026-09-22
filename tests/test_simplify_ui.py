@@ -118,6 +118,34 @@ async def test_stacked_sections_collapse_and_resize_without_rebuilding(
 
 
 @pytest.mark.asyncio
+async def test_files_refresh_button_reloads_root_and_expanded_folders(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    nested = root / "season"
+    make_files(root, 1)
+    make_files(nested, 1)
+    db = Database(tmp_path / "state.sqlite3")
+    app = VLCQApp(root=root, database=db, no_vlc=True)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause(0.1)
+        await app._open_browser_folder(nested.resolve())
+        await pilot.pause()
+        assert nested.resolve() in app.expanded_paths
+
+        (root / "new-root.mkv").write_bytes(b"video")
+        (nested / "new-nested.mkv").write_bytes(b"video")
+        await pilot.click("#files-refresh")
+        await pilot.pause(0.1)
+
+        visible = {entry.path for entry in app.browser_entries}
+        assert (root / "new-root.mkv").resolve() in visible
+        assert (nested / "new-nested.mkv").resolve() in visible
+        assert nested.resolve() in app.expanded_paths
+        assert "Files refreshed" in app._notice
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_headers_lead_with_color_coded_pane_specific_controls(tmp_path: Path) -> None:
     root = tmp_path / "library"
     nested = root / "season"
@@ -137,6 +165,7 @@ async def test_headers_lead_with_color_coded_pane_specific_controls(tmp_path: Pa
         assert "focus:" not in str(app.query_one("#files-title", Static).renderable)
         assert app.query_one("#files-open", Button).variant == "primary"
         assert app.query_one("#files-search", Button).variant == "success"
+        assert str(app.query_one("#files-refresh", Button).label) == "Refresh"
         assert app.query_one("#queue-remove", Button).variant == "error"
         assert app.query_one("#files-sort", Button).display
         assert not app.query_one("#queue-undo", Button).display
