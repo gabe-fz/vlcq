@@ -16,6 +16,7 @@ from .finder import resolve_handoff
 from .ipc import ControllerBusy, ControllerLock
 from .paths import PathError, canonical_root, common_root, validate_video
 from .queue import QueueService
+from .recovery import recover_history
 from .subtitles import SubtitleDiscovery
 from .tui import VLCQApp
 
@@ -51,6 +52,14 @@ def parser() -> argparse.ArgumentParser:
     progress = sub.add_parser("progress", help="export playback progress")
     progress.add_argument("--root", required=True, type=Path)
     progress.add_argument("--json", action="store_true", required=True)
+    recovery = sub.add_parser(
+        "recover-history", help="preview legacy history recovery after filesystem device renumbering"
+    )
+    recovery.add_argument("--root", required=True, type=Path)
+    recovery.add_argument(
+        "--apply", action="store_true",
+        help="back up the database and explicitly trust unique path/inode/size/mtime matches",
+    )
     finder = sub.add_parser(
         "finder-handoff", help="accept Finder/Automator folder or file selections"
     )
@@ -140,6 +149,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         if value
                     )
                     print(label)
+            return 0
+        if args.command == "recover-history":
+            print(json.dumps(recover_history(db_path, args.root, apply=args.apply), indent=2))
             return 0
         if args.command == "progress":
             progress_root = canonical_root(args.root)

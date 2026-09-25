@@ -20,6 +20,7 @@ from textual.widgets import Button, Input, Label, ListItem, ListView, Static
 from .config import resolve_watched_percent
 from .controller import PlaybackController, ResumeChoiceRequired, ResumeOffer
 from .database import Database
+from .identity import FileIdentity, file_identity
 from .models import BrowserEntry, HistoryProjection, QueueEntry
 from .paths import VIDEO_EXTENSIONS, PathError, is_beneath, list_folder, natural_key
 from .queue import QueueService
@@ -36,16 +37,16 @@ from .vlc import VLCError
 
 def _file_identity(
     raw_path: Path, root: Path
-) -> tuple[Path, tuple[int, int, int, int]] | None:
+) -> tuple[Path, FileIdentity] | None:
     """Resolve and stat one browser path away from the Textual event loop."""
     try:
         path = raw_path.expanduser().resolve(strict=False)
         if not is_beneath(path, root) or not path.is_file():
             return None
         stat = path.stat()
+        return path, file_identity(path, stat)
     except (OSError, RuntimeError):
         return None
-    return path, (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
 
 
 @dataclass(frozen=True)
@@ -847,7 +848,7 @@ class VLCQApp(App[None], inherit_bindings=False):
         self._browser_highlight_path: Path | None = None
         self.history: dict[Path, HistoryProjection] = {}
         self._history_cache: dict[
-            Path, tuple[tuple[int, int, int, int] | None, HistoryProjection | None]
+            Path, tuple[FileIdentity | None, HistoryProjection | None]
         ] = {}
         self._history_tasks: dict[str, asyncio.Task[None]] = {}
         self._browser_mount_task: asyncio.Task[None] | None = None
@@ -1241,7 +1242,7 @@ class VLCQApp(App[None], inherit_bindings=False):
         if not normalized:
             return {}
         root = self.root
-        identities: list[tuple[Path, tuple[int, int, int, int]] | None] = []
+        identities: list[tuple[Path, FileIdentity] | None] = []
         for start in range(0, len(normalized), 100):
             identities.extend(
                 await asyncio.gather(
@@ -1249,7 +1250,7 @@ class VLCQApp(App[None], inherit_bindings=False):
                 )
             )
             await asyncio.sleep(0)
-        uncached: list[tuple[Path, tuple[int, int, int, int]]] = []
+        uncached: list[tuple[Path, FileIdentity]] = []
         result: dict[Path, HistoryProjection] = {}
         for path, identity in zip(normalized, identities, strict=True):
             if identity is None:
@@ -1536,7 +1537,7 @@ class VLCQApp(App[None], inherit_bindings=False):
             canonical,
             None,
             root_generation,
-            before[1],
+            before[1][:4],
         )
         self._subtitle_snapshots[canonical] = SubtitleSnapshot(
             target,
@@ -3229,8 +3230,8 @@ class VLCQApp(App[None], inherit_bindings=False):
             return None
         try:
             stat = entry.path.stat()
-            fingerprint = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
-            if fingerprint != self.database.media_fingerprint(entry.media_id):
+            fingerprint = file_identity(entry.path, stat)
+            if not self.database.media_fingerprint(entry.media_id).matches(fingerprint):
                 self.update_status("Queue action refused a replaced media file")
                 return None
         except (OSError, RuntimeError):

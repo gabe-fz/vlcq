@@ -394,15 +394,25 @@ While the controller runs, `vlcq` SHALL poll VLC status for the current local me
 - **THEN** progress is retained but the item is not marked complete solely because of the seek or stop
 
 ### Requirement: Media identity and path safety
-For roots and selected, observed, or queued media, `vlcq` SHALL accept only local directories and regular local files. It SHALL reject remote hosts, credentials, query strings, fragments, malformed escapes, NULs, non-file schemes, unsupported extensions, missing paths, and out-of-root files. Paths SHALL be canonicalized, containment SHALL account for symlink traversal rather than string prefixes, and state storage SHALL NOT follow unsafe symlinks. Browsing and validation MUST NOT modify, move, copy, or delete media. Identity SHALL include device, inode, size, and modification time; a changed fingerprint SHALL be treated as replacement content rather than silently inheriting progress. Same-filesystem renames MAY be recognized by device and inode.
+For roots and selected, observed, or queued media, `vlcq` SHALL accept only local directories and regular local files. It SHALL reject remote hosts, credentials, query strings, fragments, malformed escapes, NULs, non-file schemes, unsupported extensions, missing paths, and out-of-root files. Paths SHALL be canonicalized, containment SHALL account for symlink traversal rather than string prefixes, and state storage SHALL NOT follow unsafe symlinks. Browsing and validation MUST NOT modify, move, copy, or delete media. Persistent identity SHALL include the canonical path, filesystem volume UUID when available, inode, size, and modification time. On macOS, a matching volume UUID SHALL preserve history across restart/remount device-number changes; a different volume UUID or changed inode, size, or modification time SHALL be treated as replacement content rather than silently inheriting progress. A previously UUID-pinned identity SHALL fail closed if UUID discovery becomes unavailable. Filesystems without UUID support SHALL retain strict device-based identity. Renames and moves need not preserve history. Migration SHALL pin legacy records only when their complete old device-based identity still matches; already-renumbered legacy records SHALL require explicit recovery with a private SQLite backup and unique canonical-path/inode/size/mtime validation. Recovery SHALL NOT infer played coverage, rewrite playback timestamps, or modify media.
 
 #### Scenario: Symlink escapes the root
 - **WHEN** a selected path lexically appears in the root but canonically resolves outside it
 - **THEN** `vlcq` rejects it and does not add, play, or modify it
 
 #### Scenario: File fingerprint changes
-- **WHEN** a path's device, inode, size, or modification-time fingerprint indicates replacement
+- **WHEN** a path's volume UUID, inode, size, or modification-time fingerprint indicates replacement
 - **THEN** old progress is not silently applied to the replacement
+
+#### Scenario: Mac restart renumbers the same filesystem
+- **WHEN** a recorded file has the same canonical path, volume UUID, inode, size, and modification time but a different device number
+- **THEN** history, resume position, coverage, and queue media identity remain associated with that file without creating a new media record
+
+#### Scenario: Explicit recovery of legacy device-only records
+- **WHEN** the user previews legacy recovery after a restart
+- **THEN** the database is not migrated or modified and only unique, root-confined canonical-path/inode/size/mtime matches with changed device numbers and available current volume UUIDs are proposed
+- **WHEN** the user explicitly applies recovery
+- **THEN** vlcq acquires its controller lock, creates a private SQLite backup including committed WAL state, revalidates the candidates, and pins their volume UUIDs without changing history evidence or timestamps
 
 ### Requirement: Durable private persistence
 By default `vlcq` SHALL store data at `~/Library/Application Support/vlcq/vlcq.sqlite3`, with its application directory mode 0700 and state files mode 0600. SQLite SHALL use WAL, transactions, serialized writes, bounded busy timeouts, and a versioned schema with explicit migrations. Corruption or migration failure SHALL preserve the original and report recovery guidance rather than replacing it. Persistence SHALL model media identity/progress, durable ordered queues and states, distinct current-playback and selected-entry identities, and—if retained—bounded compact observations.

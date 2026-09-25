@@ -223,10 +223,19 @@ half-open millisecond intervals tied to the existing canonical file fingerprint.
 poll event log, attention tracking, telemetry, remote request, VLC credential, raw status
 payload, or unrelated media path is recorded.
 
-Schema version 4 adds subtitle toggles and a bounded semantic show-preference table;
-the English preference defaults on and show remembering defaults off. Version 1/2/3
-queue order, current/selected identities, resume position, legacy maximum, completion,
-fingerprints, timestamps, and coverage ranges are retained. Migration deliberately
+Schema version 5 adds a persistent filesystem volume UUID to media identities on macOS.
+Device numbers can change after a restart or remount; a matching volume UUID, canonical
+path, inode, size, and modification time keeps the same watch history across those changes.
+Different volumes or changed file metadata still cannot inherit history. Renaming/moving
+files is not supported. On filesystems without UUID support, the old strict device-based
+identity remains; previously UUID-pinned records fail closed if UUID discovery fails.
+No sidecars or media metadata are written.
+
+Migration pins existing records only when their complete old identity still matches.
+A device change that already happened before upgrading needs explicit recovery (below).
+Version 1/2/3/4 queue order, current/selected identities, resume position, legacy maximum,
+completion, fingerprints, timestamps, and coverage ranges are retained. Subtitle toggles
+and show preferences are unchanged; English defaults on and show remembering defaults off. Migration deliberately
 infers no coverage from old maximum/completion evidence. A migration failure rolls back
 and reports recovery guidance without replacing the database.
 
@@ -238,15 +247,39 @@ includes WAL state:
 import sqlite3
 from pathlib import Path
 source = Path.home() / "Library/Application Support/vlcq/vlcq.sqlite3"
-backup = source.with_name("vlcq.sqlite3.before-v4")
+backup = source.with_name("vlcq.sqlite3.before-v5")
 with sqlite3.connect(source) as src, sqlite3.connect(backup) as dst:
     src.backup(dst)
 PY
 ```
 
-Older binaries reject schema 4. Rollback means closing vlcq and restoring the backup—not
+Older binaries reject schema 5. Rollback means closing vlcq and restoring the backup—not
 decrementing `PRAGMA user_version` or deleting tables. Progress after the backup will be
 lost.
+
+### Recovering pre-upgrade history after a restart
+
+Close vlcq, then preview candidates without changing or migrating the database:
+
+```sh
+vlcq recover-history --root ~/Videos
+```
+
+Only unique records with the same canonical path, inode, size, and modification time,
+but a different device number and no saved volume UUID, are eligible. Missing, moved,
+replaced, root-escaping, and ambiguous records are left alone. Old records cannot prove
+the original volume UUID: review the candidates and apply only if this was a restart or
+remount of the same filesystem, not a replacement disk or cloned filesystem:
+
+```sh
+vlcq recover-history --root ~/Videos --apply
+```
+
+Apply acquires the controller lock, makes a private SQLite backup (including committed WAL
+state), revalidates candidates, and saves the current volume UUID. It does not fabricate
+coverage, rewrite playback timestamps, or modify media. The JSON result includes the backup
+path. Subsequent restarts use UUID matching automatically; no repeated recovery is needed.
+History for absent files remains in the database but is not displayed or exported.
 
 VLC is launched with its visible macOS interface plus an authenticated loopback-only HTTP
 interface and with repeat/loop/random disabled. `vlcq` performs no non-loopback network

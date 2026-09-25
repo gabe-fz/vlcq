@@ -122,7 +122,7 @@ def test_subtitle_preferences_migrate_restart_and_keep_queue_data(tmp_path: Path
     assert reopened.remember_subtitles_by_show()
     assert reopened.prefer_english_subtitles()
     assert reopened.show_subtitle_preference(path, root=root) == SubtitleDescriptor("track", "en", True)
-    assert reopened.connection.execute("SELECT user_version FROM pragma_user_version").fetchone()[0] == 4
+    assert reopened.connection.execute("SELECT user_version FROM pragma_user_version").fetchone()[0] == 5
     reopened.close()
 
 

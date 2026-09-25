@@ -11,6 +11,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
+from .identity import FileIdentity, file_identity
 from .models import HistoryProjection, QueueEntry
 from .paths import canonical_root, is_beneath
 from .progress import (
@@ -22,7 +23,7 @@ from .progress import (
 )
 from .subtitles import SubtitleDescriptor, SubtitleError, scoped_show_key
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 SUBTITLE_REMEMBER_SETTING = "remember_subtitles_by_show"
 SUBTITLE_ENGLISH_SETTING = "prefer_english_subtitles"
 
@@ -128,6 +129,10 @@ class Database:
         try:
             for statement in statements:
                 self.connection.execute(statement)
+            columns = {row[1] for row in self.connection.execute("PRAGMA table_info(media)")}
+            if version >= 5 and "volume_uuid" not in columns:
+                self.connection.execute("ALTER TABLE media ADD COLUMN volume_uuid TEXT")
+                self._pin_legacy_volumes()
             self.connection.execute(f"PRAGMA user_version={version}")
             self.connection.execute("COMMIT")
         except BaseException:
@@ -277,10 +282,32 @@ class Database:
                     ),
                     SCHEMA_VERSION,
                 )
-            elif version == SCHEMA_VERSION:
+            elif version in (4, SCHEMA_VERSION):
                 self._upgrade_subtitle_descriptor_constraint()
+                if version == 4:
+                    self._transactional_schema_change((), SCHEMA_VERSION)
         except Exception as exc:
             raise DatabaseMigrationError(self.path, exc) from exc
+
+    def _pin_legacy_volumes(self) -> None:
+        """Upgrade only exact legacy matches; never guess across device changes."""
+        for row in self.connection.execute(
+            "SELECT id,path,device,inode,size,mtime_ns FROM media WHERE volume_uuid IS NULL"
+        ).fetchall():
+            try:
+                path = Path(row["path"])
+                if path.resolve(strict=True) != path or not path.is_file():
+                    continue
+                current = file_identity(path)
+            except (OSError, RuntimeError):
+                continue
+            stored = FileIdentity(
+                int(row["device"]), int(row["inode"]), int(row["size"]), int(row["mtime_ns"])
+            )
+            if stored.matches(current) and current.volume_uuid:
+                self.connection.execute(
+                    "UPDATE media SET volume_uuid=? WHERE id=?", (current.volume_uuid, row["id"])
+                )
 
     def close(self) -> None:
         self._secure_files()
@@ -673,17 +700,24 @@ class Database:
     def ensure_media(self, path: Path) -> int:
         canonical, stat = self._canonical_file(path)
         now = datetime.now(UTC).isoformat()
-        values = (str(canonical), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
-        row = self.connection.execute(
-            "SELECT id FROM media WHERE path=? AND device=? AND inode=? AND size=? AND mtime_ns=?",
-            values,
-        ).fetchone()
+        identity = file_identity(canonical, stat)
+        row = self._matching_media(canonical, identity)
         if row:
-            return int(row[0])
+            if row["volume_uuid"] is None and identity.volume_uuid is not None:
+                self.connection.execute(
+                    "UPDATE media SET volume_uuid=? WHERE id=?", (identity.volume_uuid, row["id"])
+                )
+            return int(row["id"])
+        if identity.volume_uuid is None and self.connection.execute(
+            "SELECT 1 FROM media WHERE path=? AND inode=? AND size=? AND mtime_ns=? "
+            "AND volume_uuid IS NOT NULL LIMIT 1",
+            (str(canonical), identity.inode, identity.size, identity.mtime_ns),
+        ).fetchone():
+            raise RuntimeError("cannot validate saved media volume UUID; history was preserved")
         cursor = self.connection.execute(
-            "INSERT INTO media(path,device,inode,size,mtime_ns,first_observed,last_observed) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (*values, now, now),
+            "INSERT INTO media(path,device,inode,size,mtime_ns,volume_uuid,first_observed,last_observed) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (str(canonical), *identity, now, now),
         )
         if cursor.lastrowid is None:
             raise RuntimeError("failed to create media record")
@@ -900,13 +934,31 @@ class Database:
             self.connection.execute("ROLLBACK")
             raise
 
-    def media_fingerprint(self, media_id: int) -> tuple[int, int, int, int]:
+    @staticmethod
+    def _row_identity(row: sqlite3.Row) -> FileIdentity:
+        return FileIdentity(
+            int(row["device"]), int(row["inode"]), int(row["size"]), int(row["mtime_ns"]),
+            row["volume_uuid"],
+        )
+
+    def _matching_media(self, path: Path, identity: FileIdentity) -> sqlite3.Row | None:
+        rows = self.connection.execute(
+            "SELECT * FROM media WHERE path=? AND inode=? AND size=? AND mtime_ns=?",
+            (str(path), identity.inode, identity.size, identity.mtime_ns),
+        ).fetchall()
+        matches = [row for row in rows if self._row_identity(row).matches(identity)]
+        # Ambiguous identities must not silently choose or combine histories.
+        if len(matches) > 1:
+            raise RuntimeError("ambiguous media identity; preserve the database and recover explicitly")
+        return matches[0] if matches else None
+
+    def media_fingerprint(self, media_id: int) -> FileIdentity:
         row = self.connection.execute(
-            "SELECT device,inode,size,mtime_ns FROM media WHERE id=?", (media_id,)
+            "SELECT device,inode,size,mtime_ns,volume_uuid FROM media WHERE id=?", (media_id,)
         ).fetchone()
         if row is None:
             raise RuntimeError("media record not found")
-        return (int(row["device"]), int(row["inode"]), int(row["size"]), int(row["mtime_ns"]))
+        return self._row_identity(row)
 
     def restore_entries(self, rows: list[dict[str, int | str]], ordered_ids: list[int]) -> None:
         """Restore a previously removed set in one transaction."""
@@ -1126,7 +1178,7 @@ class Database:
 
     def history_for_identities(
         self,
-        identities: Iterable[tuple[Path, tuple[int, int, int, int]]],
+        identities: Iterable[tuple[Path, FileIdentity]],
     ) -> dict[Path, HistoryProjection]:
         """Read history for already-validated identities without filesystem I/O.
 
@@ -1136,16 +1188,8 @@ class Database:
         calls while also preserving the connection's thread ownership.
         """
         result: dict[Path, HistoryProjection] = {}
-        columns = (
-            "id,path,position_ms,duration_ms,completion_observed,first_observed,"
-            "last_observed,resume_position_ms,last_played_at,coverage_initialized_at"
-        )
         for path, fingerprint in identities:
-            row = self.connection.execute(
-                f"SELECT {columns} FROM media WHERE path=? AND device=? AND inode=? "
-                "AND size=? AND mtime_ns=?",
-                (str(path), *fingerprint),
-            ).fetchone()
+            row = self._matching_media(path, fingerprint)
             if row is not None:
                 result[path] = self._projection(row, path)
         return result
@@ -1155,18 +1199,17 @@ class Database:
     ) -> dict[Path, HistoryProjection]:
         """Bulk, read-only history lookup keyed by canonical current paths."""
         base = canonical_root(root) if root is not None else None
-        identities: list[tuple[Path, tuple[int, int, int, int]]] = []
+        identities: list[tuple[Path, FileIdentity]] = []
         for raw_path in paths:
             path = Path(raw_path).expanduser().resolve(strict=False)
             if base is not None and not is_beneath(path, base):
                 continue
             try:
                 stat = path.stat()
+                if path.is_file():
+                    identities.append((path, file_identity(path, stat)))
             except (OSError, RuntimeError):
                 continue
-            if not path.is_file():
-                continue
-            identities.append((path, (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)))
         return self.history_for_identities(identities)
 
     # Descriptive alias used by rendering code and external integrations.
@@ -1191,7 +1234,7 @@ class Database:
         base = canonical_root(root)
         records: dict[str, dict[str, Any]] = {}
         for row in self.connection.execute(
-            "SELECT id,path,device,inode,size,mtime_ns,position_ms,duration_ms,"
+            "SELECT id,path,device,inode,size,mtime_ns,volume_uuid,position_ms,duration_ms,"
             "completion_observed,last_observed,coverage_initialized_at FROM media "
             "WHERE position_ms>0 OR completion_observed=1 OR coverage_initialized_at IS NOT NULL"
         ):
@@ -1199,11 +1242,13 @@ class Database:
             try:
                 canonical = path.resolve(strict=True)
                 stat = canonical.stat()
+                fingerprint = file_identity(canonical, stat)
             except (OSError, RuntimeError):
                 continue
-            fingerprint = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
-            stored = (int(row["device"]), int(row["inode"]), int(row["size"]), int(row["mtime_ns"]))
-            if not is_beneath(canonical, base) or fingerprint != stored:
+            if (
+                canonical != path or not canonical.is_file() or not is_beneath(canonical, base)
+                or not self._row_identity(row).matches(fingerprint)
+            ):
                 continue
             relative = canonical.relative_to(base).as_posix()
             duration = int(row["duration_ms"])

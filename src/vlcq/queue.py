@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .database import Database
+from .identity import FileIdentity, file_identity
 from .models import QueueEntry
 from .paths import VIDEO_EXTENSIONS, deduplicate_natural, is_beneath, natural_key, validate_video
 
@@ -17,7 +18,7 @@ class ActivePlaybackError(RuntimeError):
 class QueueUndoSnapshot:
     rows: list[dict[str, int | str]]
     ordered_ids: list[int]
-    fingerprints: dict[int, tuple[int, int, int, int]]
+    fingerprints: dict[int, FileIdentity]
 
 
 class QueueService:
@@ -229,7 +230,7 @@ class QueueService:
         selected_ids = {entry.id for entry in selected}
         selected = [entry for entry in all_entries if entry.id in selected_ids]
         rows: list[dict[str, int | str]] = []
-        fingerprints: dict[int, tuple[int, int, int, int]] = {}
+        fingerprints: dict[int, FileIdentity] = {}
         for entry in selected:
             rows.append(
                 {
@@ -322,8 +323,8 @@ class QueueService:
                 except FileNotFoundError:
                     # Missing media is restored as a visible missing queue row.
                     continue
-                fingerprint = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
-                if fingerprint != snapshot.fingerprints[int(row["id"])]:
+                fingerprint = file_identity(path, stat)
+                if not snapshot.fingerprints[int(row["id"])].matches(fingerprint):
                     raise ValueError("undo refused a replaced media file")
             self.database.restore_entries(snapshot.rows, snapshot.ordered_ids)
         except (OSError, RuntimeError, ValueError):
