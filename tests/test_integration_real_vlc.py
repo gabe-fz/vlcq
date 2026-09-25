@@ -123,20 +123,38 @@ def _write_generated_multitrack_mkv(path: Path) -> None:
     os.environ.get("VLCQ_REAL_VLC") != "1",
     reason="set VLCQ_REAL_VLC=1 for installed VLC 3 smoke test",
 )
-async def test_real_vlc_authenticated_loopback_start_and_clean_stop() -> None:
+async def test_real_vlc_authenticated_loopback_start_and_clean_stop(tmp_path: Path) -> None:
     executable = Path("/Applications/VLC.app/Contents/MacOS/VLC")
     if not executable.is_file():
         pytest.skip("macOS VLC application is not installed")
-    process = VLCProcess(executable)
+    lock_path = tmp_path / "vlcq-vlc-instance.lock"
+    process = VLCProcess(executable, instance_lock_path=lock_path)
+    second_process = VLCProcess(executable, instance_lock_path=lock_path)
     try:
         client = await process.start(timeout=15)
-    except (OSError, TimeoutError, VLCError) as exc:
-        pytest.skip(f"VLC HTTP startup unavailable in this environment: {exc}")
-    assert process.port > 0
-    status = await client.status()
-    assert status.state in {"stopped", "paused", "playing", "unavailable"}
-    await process.stop()
-    assert process.process is None
+        owned_process = process.process
+        assert owned_process is not None
+        # Drop the parent's descriptor without LOCK_UN, as on parent death.
+        # Actual VLC must retain its inherited descriptor for the lock to hold.
+        assert process._instance_lock is not None
+        assert process._instance_lock.file is not None
+        process._instance_lock.file.close()
+        process._instance_lock = None
+        with pytest.raises(VLCError, match="another vlcq-owned VLC instance"):
+            await second_process.start(timeout=15)
+        assert process.port > 0
+        status = await client.status()
+        assert status.state in {"stopped", "paused", "playing", "unavailable"}
+        await process.stop()
+        assert process.process is None
+        assert owned_process.returncode is not None
+        # Releasing the child-held lock must allow a subsequent owned instance.
+        await second_process.start(timeout=15)
+    finally:
+        try:
+            await second_process.stop()
+        finally:
+            await process.stop()
 
 
 @pytest.mark.asyncio

@@ -115,7 +115,10 @@ or clickable seek track. Queue progress is read-only.
 VLC's native **Next** is supported because vlcq stages and validates one authorized
 successor. Native Previous and arbitrary VLC playlist navigation are not supported;
 unexpected media fails closed instead of inheriting history. Reconnect creates no
-duplicate process/poll loop and never selects, loads, or autoplays media.
+duplicate process/poll loop and never selects, loads, or autoplays media. Only one
+vlcq-owned VLC instance can run per macOS user at a time, even with separate database
+paths or `VLCQ_HOME` overrides; quitting
+vlcq always stops its owned instance and never leaves it running.
 
 ### Subtitle selection and preferences
 
@@ -175,7 +178,7 @@ below the lists.
 | `c` | Confirm and clear watched/completed entries |
 | `Shift+F10` | Open contextual actions |
 | `?` | Help |
-| `q` | Quit after choosing whether to stop or keep owned VLC |
+| `Ctrl+C` / `q` | Quit and stop the VLC instance owned by vlcq |
 
 Text inputs own ordinary typing, so shortcut letters do not trigger application actions.
 Clear operations require confirmation and never delete media. One in-memory undo follows

@@ -14,6 +14,7 @@ from typing import cast
 
 import httpx
 
+from .ipc import ControllerBusy, ControllerLock
 from .models import VLCStatus
 from .paths import PathError, canonical_root, file_uri_to_path, is_beneath
 from .subtitles import SIDECAR_EXTENSIONS, SubtitleError, SubtitleTrack
@@ -411,7 +412,12 @@ class VLCClient:
 
 
 class VLCProcess:
-    def __init__(self, executable: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        executable: str | Path | None = None,
+        *,
+        instance_lock_path: str | Path | None = None,
+    ) -> None:
         default = "/Applications/VLC.app/Contents/MacOS/VLC"
         self.executable = str(
             executable or (default if Path(default).is_file() else shutil.which("vlc") or default)
@@ -420,6 +426,28 @@ class VLCProcess:
         self.port = self._free_port()
         self.process: asyncio.subprocess.Process | None = None
         self.client: VLCClient | None = None
+        self.instance_lock_path = Path(instance_lock_path) if instance_lock_path else None
+        self._instance_lock: ControllerLock | None = None
+
+    def _acquire_instance_lock(self) -> int:
+        # Process ownership is per user, not per database or VLCQ_HOME override.
+        # The explicit override is reserved for isolated tests.
+        lock_path = self.instance_lock_path or (
+            Path.home() / "Library" / "Application Support" / "vlcq" / "vlc-instance.lock"
+        )
+        lock = ControllerLock(lock_path)
+        try:
+            lock.acquire()
+        except ControllerBusy as exc:
+            raise VLCError("another vlcq-owned VLC instance is already running") from exc
+        self._instance_lock = lock
+        assert lock.file is not None
+        return lock.file.fileno()
+
+    def _release_instance_lock(self) -> None:
+        if self._instance_lock is not None:
+            self._instance_lock.release()
+            self._instance_lock = None
 
     @staticmethod
     def _free_port() -> int:
@@ -467,43 +495,60 @@ class VLCProcess:
         ]
 
     async def start(self, timeout: float = 10) -> VLCClient:
-        if self.process is not None or self.client is not None:
+        if self.process is not None or self.client is not None or self._instance_lock is not None:
             await self.stop()
         if not Path(self.executable).is_file():
             raise VLCError("VLC executable not found; install VLC 3 or configure its path")
         await self._validate_version()
-        self.process = await asyncio.create_subprocess_exec(
-            *self.launch_arguments(),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        self.client = VLCClient(self.port, self.password)
-        deadline = asyncio.get_running_loop().time() + timeout
-        while asyncio.get_running_loop().time() < deadline:
-            if self.process.returncode is not None:
-                break
-            try:
-                await self.client.status()
-                return self.client
-            except VLCError:
-                await asyncio.sleep(0.1)
-        await self.stop()
-        raise VLCError("VLC HTTP interface did not become ready")
+        try:
+            lock_fd = self._acquire_instance_lock()
+            self.process = await asyncio.create_subprocess_exec(
+                *self.launch_arguments(),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                pass_fds=(lock_fd,),
+            )
+            self.client = VLCClient(self.port, self.password)
+            deadline = asyncio.get_running_loop().time() + timeout
+            while asyncio.get_running_loop().time() < deadline:
+                if self.process.returncode is not None:
+                    break
+                try:
+                    await self.client.status()
+                    return self.client
+                except VLCError:
+                    await asyncio.sleep(0.1)
+            raise VLCError("VLC HTTP interface did not become ready")
+        except BaseException:
+            await self.stop()
+            raise
 
     async def stop(self) -> None:
-        if self.client:
-            try:
-                await self.client.command("pl_stop")
-            except (VLCError, OSError, RuntimeError):
-                pass
-            await self.client.close()
-            self.client = None
-        if self.process and self.process.returncode is None:
-            self.process.terminate()
-            try:
-                await asyncio.wait_for(self.process.wait(), 3)
-            except TimeoutError:
-                if self.process.returncode is None:
-                    self.process.kill()
-                    await self.process.wait()
-        self.process = None
+        client = self.client
+        self.client = None
+        try:
+            if client is not None:
+                try:
+                    await client.command("pl_stop")
+                except (VLCError, OSError, RuntimeError):
+                    pass
+                await client.close()
+        finally:
+            process = self.process
+            if process is None:
+                self._release_instance_lock()
+            else:
+                if process.returncode is None:
+                    try:
+                        process.terminate()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.wait_for(process.wait(), 3)
+                    except TimeoutError:
+                        if process.returncode is None:
+                            process.kill()
+                        await process.wait()
+                if process.returncode is not None:
+                    self.process = None
+                    self._release_instance_lock()

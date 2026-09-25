@@ -146,6 +146,77 @@ async def test_files_refresh_button_reloads_root_and_expanded_folders(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_ctrl_c_uses_quit_prompt_without_ctrl_q(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    make_files(root, 1)
+    db = Database(tmp_path / "state.sqlite3")
+    app = VLCQApp(root=root, database=db, no_vlc=True)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        assert app.active_bindings["ctrl+c"].binding.action == "quit_app"
+        assert "ctrl+q" not in app.active_bindings
+
+        await pilot.press("ctrl+q")
+        await pilot.pause()
+        assert app.screen.__class__.__name__ != "QuitPrompt"
+
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        assert app.screen.__class__.__name__ == "QuitPrompt"
+        await pilot.press("escape")
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_quit_prompt_supports_arrow_navigation_and_enter(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    make_files(root, 1)
+    db = Database(tmp_path / "state.sqlite3")
+    app = VLCQApp(root=root, database=db, no_vlc=True)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        assert app.focused is not None and app.focused.id == "quit-stop"
+
+        await pilot.press("right")
+        assert app.focused is not None and app.focused.id == "quit-cancel"
+        await pilot.press("left")
+        assert app.focused is not None and app.focused.id == "quit-stop"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app._exit
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_quit_cleanup_runs_once_and_stops_owned_vlc(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    make_files(root, 1)
+    db = Database(tmp_path / "state.sqlite3")
+    app = VLCQApp(root=root, database=db, no_vlc=True)
+    calls: list[bool] = []
+
+    async def stop(*, stop_vlc: bool = True) -> None:
+        calls.append(stop_vlc)
+
+    app.controller.stop = stop  # type: ignore[method-assign]
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        app.no_vlc = False
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        await pilot.press("s")
+        await pilot.pause()
+    assert calls == [True]
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_headers_lead_with_color_coded_pane_specific_controls(tmp_path: Path) -> None:
     root = tmp_path / "library"
     nested = root / "season"

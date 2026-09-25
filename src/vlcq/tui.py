@@ -651,33 +651,27 @@ class ConfirmClearAll(ModalScreen[bool]):
             self.dismiss(False)
 
 
-class QuitPrompt(ModalScreen[str | None]):
+class QuitPrompt(ModalScreen[bool | None]):
     BINDINGS: ClassVar = [
-        Binding("s", "stop", "Stop VLC"),
-        Binding("k", "keep", "Keep VLC"),
+        Binding("s", "stop", "Quit and stop VLC"),
         Binding("escape", "cancel", "Cancel"),
     ]
 
     def compose(self) -> ComposeResult:
-        yield Static("Quit: stop VLC, keep VLC running, or cancel", classes="dialog-title")
+        yield Static("Quit vlcq and stop its VLC instance?", classes="dialog-title")
         with Horizontal(classes="dialog-actions"):
-            yield Button("Stop VLC", id="quit-stop", variant="warning")
-            yield Button("Keep VLC", id="quit-keep")
+            yield Button("Quit and stop VLC", id="quit-stop", variant="warning")
             yield Button("Cancel", id="quit-cancel")
 
     def action_stop(self) -> None:
-        self.dismiss("stop")
-
-    def action_keep(self) -> None:
-        self.dismiss("keep")
+        self.dismiss(True)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        choices: dict[str, str | None] = {
-            "quit-stop": "stop",
-            "quit-keep": "keep",
+        choices: dict[str, bool | None] = {
+            "quit-stop": True,
             "quit-cancel": None,
         }
         if event.button.id in choices:
@@ -710,7 +704,7 @@ class HelpPrompt(ModalScreen[None]):
         yield Static(
             "Keys: o open · arrows/backspace browse · Enter play/open · v select · "
             "a add · A add & play · Space pause · n/p next/previous · [ ] seek · "
-            "d remove · J/K reorder · r retry · c clear watched · ? help · q quit · Shift+F10 menu. "
+            "d remove · J/K reorder · r retry · c clear watched · ? help · Ctrl+C quit · Shift+F10 menu. "
             "Use VLC's visible controls for ordinary transport, or vlcq keyboard shortcuts. "
             "Native Next is supported; native Previous and arbitrary VLC playlist navigation are not. "
             "Subtitles… is available on supported Files and Queue rows; inactive rows use bounded "
@@ -730,7 +724,9 @@ class HelpPrompt(ModalScreen[None]):
             self.dismiss(None)
 
 
-class VLCQApp(App[None]):
+# Replace Textual's default Ctrl+Q quit and Ctrl+C help bindings with the
+# application's confirmation flow below.
+class VLCQApp(App[None], inherit_bindings=False):
     TITLE = "vlcq"
     CSS = """
     #sections { height: 1fr; width: 1fr; }
@@ -811,6 +807,7 @@ class VLCQApp(App[None]):
         Binding("c", "clear_completed", "Clear completed"),
         Binding("shift+f10", "context_menu", "Actions"),
         Binding("?", "help", "Help"),
+        Binding("ctrl+c", "quit_app", "Quit"),
         Binding("q", "quit_app", "Quit"),
     ]
 
@@ -933,8 +930,13 @@ class VLCQApp(App[None]):
         if not self.no_vlc:
             try:
                 await self.controller.start()
-            except (VLCError, OSError):
-                self.update_status("VLC unavailable — press r to retry")
+            except (VLCError, OSError) as exc:
+                message = (
+                    str(exc)
+                    if "another vlcq-owned" in str(exc)
+                    else "VLC unavailable — press r to retry"
+                )
+                self.update_status(message)
         if self.autoplay or self.resume_command:
             target = self._startup_target_index()
             if target is not None:
@@ -963,6 +965,7 @@ class VLCQApp(App[None]):
         for folder in list(self._tree_tasks):
             self._cancel_tree_task(folder)
         if not self.no_vlc:
+            # The VLC process belongs to this app and must not outlive it.
             await self.controller.stop()
 
     def on_resize(self, event: events.Resize) -> None:
@@ -2472,6 +2475,13 @@ class VLCQApp(App[None]):
             self.update_status("Folder expanded")
 
     async def action_activate(self) -> None:
+        if isinstance(self.screen, QuitPrompt):
+            focused = self.focused
+            if not isinstance(focused, Button):
+                focused = self.screen.focus_next(Button)
+            if isinstance(focused, Button):
+                focused.press()
+            return
         entry = self._browser_entry()
         if self._queue_has_focus():
             index = self._queue_index()
@@ -2737,12 +2747,18 @@ class VLCQApp(App[None]):
         self.refresh_queue()
 
     async def action_left(self) -> None:
+        if isinstance(self.screen, QuitPrompt):
+            self.screen.focus_previous(Button)
+            return
         if self._browser_has_focus():
             await self.action_parent()
         else:
             await self.action_seek(-10)
 
     async def action_right(self) -> None:
+        if isinstance(self.screen, QuitPrompt):
+            self.screen.focus_next(Button)
+            return
         entry = self._browser_entry()
         if self._browser_has_focus() and entry is not None and entry.is_dir:
             await self.action_activate()
@@ -3567,14 +3583,10 @@ class VLCQApp(App[None]):
     def action_help(self) -> None:
         self.push_screen(HelpPrompt())
 
-    async def _finish_quit(self, choice: str) -> None:
-        await self.controller.stop(stop_vlc=choice == "stop")
-        self.exit()
-
     def action_quit_app(self) -> None:
-        def chosen(value: str | None) -> None:
-            if value:
-                self.run_worker(self._finish_quit(value), exclusive=True)
+        def chosen(should_quit: bool | None) -> None:
+            if should_quit:
+                self.exit()
 
         self.push_screen(QuitPrompt(), chosen)
 

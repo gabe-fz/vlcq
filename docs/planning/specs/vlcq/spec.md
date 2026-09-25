@@ -104,7 +104,7 @@ The main screen SHALL present full-width Files above Queue, with independently c
 - **THEN** pending rows omit a redundant `QUEUED` badge and only the current entry can display `STOPPED`
 
 ### Requirement: TUI controls and non-destructive actions
-The TUI SHALL support opening/changing root (`o`), tree navigation and folder expansion (arrows, Enter, and Backspace as context permits), opening or playing (`Enter`), toggling selection (`v`), add (`a`), add-and-play (`A`), play/pause (`Space`), queue-only removal (`d`/Delete), reorder (`J`/`K`), next (`n`), previous (`p`), seek (Left/`[`/`]` as context permits), retry (`r`), clear completed (`c`), help (`?`), and quit (`q`) with an explicit VLC-process choice. Right-click menus SHALL provide row-contextual actions; compact visible action bars SHALL provide frequent section and player actions; ellipsis triggers and a keyboard menu binding SHALL expose overflow actions. Library-selection actions SHALL target explicit library selections or the highlighted library video; single-item playback SHALL target the clicked or highlighted item independently of a batch. Queue-item actions SHALL target only their declared queue entry. Collectively the action bars and menus SHALL provide Add to end, Play next, Play now, Resume, Start over, transport, reconnect, removal, reordering, undo, search, filters, details, help, and quit in the appropriate context. Resume and Start over SHALL be directly available for applicable highlighted items as well as through the playback-choice dialog. Unavailable visible actions SHALL be disabled and unavailable menu actions SHALL be disabled or omitted. Clearing the full queue or completed entries SHALL require confirmation. No queue control SHALL delete or modify an underlying media file. Text-entry fields SHALL receive ordinary typing without triggering global playback or navigation shortcuts.
+The TUI SHALL support opening/changing root (`o`), tree navigation and folder expansion (arrows, Enter, and Backspace as context permits), opening or playing (`Enter`), toggling selection (`v`), add (`a`), add-and-play (`A`), play/pause (`Space`), queue-only removal (`d`/Delete), reorder (`J`/`K`), next (`n`), previous (`p`), seek (Left/`[`/`]` as context permits), retry (`r`), clear completed (`c`), help (`?`), and quitting (`q`), which SHALL stop its owned VLC process before exit. Right-click menus SHALL provide row-contextual actions; compact visible action bars SHALL provide frequent section and player actions; ellipsis triggers and a keyboard menu binding SHALL expose overflow actions. Library-selection actions SHALL target explicit library selections or the highlighted library video; single-item playback SHALL target the clicked or highlighted item independently of a batch. Queue-item actions SHALL target only their declared queue entry. Collectively the action bars and menus SHALL provide Add to end, Play next, Play now, Resume, Start over, transport, reconnect, removal, reordering, undo, search, filters, details, help, and quit in the appropriate context. Resume and Start over SHALL be directly available for applicable highlighted items as well as through the playback-choice dialog. Unavailable visible actions SHALL be disabled and unavailable menu actions SHALL be disabled or omitted. Clearing the full queue or completed entries SHALL require confirmation. No queue control SHALL delete or modify an underlying media file. Text-entry fields SHALL receive ordinary typing without triggering global playback or navigation shortcuts.
 
 #### Scenario: Remove a queue item
 - **WHEN** the user removes or clears an item through a queue context menu
@@ -346,11 +346,19 @@ The bottom player area SHALL use a bounded, slightly taller layout showing the a
 - **THEN** the invalid identities are cleared and stale transient entries become pending without autoplay or media-file modification
 
 ### Requirement: Owned VLC process
-`vlcq` SHALL launch VLC directly as a dedicated instance, validate required VLC 3 command-line flags, record the owned PID, and verify process identity before signaling it. The dedicated instance SHALL start with repeat-current, repeat-all, and random playback explicitly disabled regardless of saved VLC preferences. It MUST NOT terminate or control an unrelated VLC process. Incompatible installations SHALL produce an actionable error.
+`vlcq` SHALL launch VLC directly as a dedicated instance, validate required VLC 3 command-line flags, record the owned PID, and verify process identity before signaling it. A per-user operating-system lock SHALL allow at most one vlcq-owned VLC process, including across different database paths and `VLCQ_HOME` overrides, and SHALL remain held by that process until it exits. Quitting vlcq SHALL stop its owned VLC process before exit; vlcq SHALL NOT offer to leave the owned process running. The dedicated instance SHALL start with repeat-current, repeat-all, and random playback explicitly disabled regardless of saved VLC preferences. vlcq MUST NOT terminate or control an unrelated VLC process. Incompatible installations SHALL produce an actionable error.
 
 #### Scenario: Existing unrelated VLC instance
 - **WHEN** VLC is already running outside `vlcq`
 - **THEN** `vlcq` starts and controls its dedicated instance without terminating the unrelated process
+
+#### Scenario: Another vlcq-owned VLC instance is active
+- **WHEN** a second vlcq session for the same macOS user tries to start VLC, including with a different database path or `VLCQ_HOME` override
+- **THEN** it does not launch another VLC process or interfere with the active session
+
+#### Scenario: Quit vlcq
+- **WHEN** the user confirms quitting vlcq
+- **THEN** vlcq stops and reaps its owned VLC process before exiting
 
 #### Scenario: Saved repeat preference
 - **WHEN** the user's VLC preferences previously enabled repeat-current, repeat-all, or random playback

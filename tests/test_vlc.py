@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +55,170 @@ async def test_process_stop_signals_only_the_owned_process() -> None:
     assert owned.terminated
     assert not unrelated.terminated
     assert process.process is None
+
+
+@pytest.mark.asyncio
+async def test_process_lock_allows_only_one_owned_instance_and_releases_on_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "vlc"
+    executable.write_text("fake executable")
+    lock_path = tmp_path / "vlc-instance.lock"
+    starts: list[tuple[int, ...]] = []
+
+    class FakeProcessHandle:
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+
+        def terminate(self) -> None:
+            self.returncode = 0
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            return self.returncode or 0
+
+    class FakeClient:
+        async def status(self) -> None:
+            return None
+
+        async def command(self, _command: str) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    async def validate_version() -> None:
+        return None
+
+    async def create_process(*_args: object, **kwargs: object) -> FakeProcessHandle:
+        pass_fds = kwargs["pass_fds"]
+        assert isinstance(pass_fds, tuple)
+        starts.append(pass_fds)
+        return FakeProcessHandle()
+
+    monkeypatch.setattr("vlcq.vlc.VLCClient", lambda *_args: FakeClient())
+    monkeypatch.setattr("vlcq.vlc.asyncio.create_subprocess_exec", create_process)
+    first = VLCProcess(executable, instance_lock_path=lock_path)
+    second = VLCProcess(executable, instance_lock_path=lock_path)
+    monkeypatch.setattr(first, "_validate_version", validate_version)
+    monkeypatch.setattr(second, "_validate_version", validate_version)
+
+    await first.start()
+    first_child = first.process
+    assert first_child is not None
+    with pytest.raises(VLCError, match="another vlcq-owned VLC instance"):
+        await second.start()
+    assert len(starts) == 1 and len(starts[0]) == 1
+
+    await first.stop()
+    assert first_child.returncode == 0
+    await second.start()
+    second_child = second.process
+    assert second_child is not None
+    assert len(starts) == 2
+    await second.stop()
+    assert second_child.returncode == 0
+
+
+def test_instance_lock_ignores_database_home_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setenv("VLCQ_HOME", str(tmp_path / "first-database-home"))
+    first = VLCProcess()
+    second = VLCProcess()
+    try:
+        first._acquire_instance_lock()
+        monkeypatch.setenv("VLCQ_HOME", str(tmp_path / "second-database-home"))
+        with pytest.raises(VLCError, match="another vlcq-owned VLC instance"):
+            second._acquire_instance_lock()
+    finally:
+        first._release_instance_lock()
+        second._release_instance_lock()
+
+
+def test_child_retains_instance_lock_after_parent_exits(tmp_path: Path) -> None:
+    lock_path = tmp_path / "instance.lock"
+    ready = tmp_path / "ready"
+    release = tmp_path / "release"
+    child = """
+import os, sys, time
+from pathlib import Path
+os.fstat(int(sys.argv[1]))
+Path(sys.argv[2]).touch()
+deadline = time.monotonic() + 10
+while not Path(sys.argv[3]).exists() and time.monotonic() < deadline:
+    time.sleep(0.02)
+"""
+    parent = """
+import os, subprocess, sys
+sys.path.insert(0, sys.argv[1])
+from vlcq.vlc import VLCProcess
+owner = VLCProcess(instance_lock_path=sys.argv[2])
+fd = owner._acquire_instance_lock()
+subprocess.Popen(
+    [sys.executable, '-c', sys.argv[3], str(fd), sys.argv[4], sys.argv[5]],
+    pass_fds=(fd,), stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+)
+os._exit(0)
+"""
+    contender = VLCProcess(instance_lock_path=lock_path)
+    try:
+        subprocess.run(
+            [sys.executable, "-c", parent, str(Path(__file__).resolve().parents[1] / "src"),
+             str(lock_path), child, str(ready), str(release)],
+            check=True, timeout=5,
+        )
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ready.exists()
+        with pytest.raises(VLCError, match="another vlcq-owned VLC instance"):
+            contender._acquire_instance_lock()
+    finally:
+        release.touch()
+        contender._release_instance_lock()
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            contender._acquire_instance_lock()
+            break
+        except VLCError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
+    contender._release_instance_lock()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [OSError, asyncio.CancelledError])
+async def test_failed_spawn_releases_instance_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: type[BaseException]
+) -> None:
+    executable = tmp_path / "vlc"
+    executable.touch()
+    lock_path = tmp_path / "instance.lock"
+    process = VLCProcess(executable, instance_lock_path=lock_path)
+
+    async def validate() -> None:
+        pass
+
+    async def fail(*args: object, **kwargs: object) -> None:
+        raise failure()
+
+    monkeypatch.setattr(process, "_validate_version", validate)
+    monkeypatch.setattr("vlcq.vlc.asyncio.create_subprocess_exec", fail)
+    with pytest.raises(failure):
+        await process.start()
+    assert process._instance_lock is None
+    contender = VLCProcess(instance_lock_path=lock_path)
+    try:
+        contender._acquire_instance_lock()
+    finally:
+        contender._release_instance_lock()
 
 
 @pytest.mark.parametrize(
