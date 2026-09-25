@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from textual import events
+from textual.color import Color
 from textual.widgets import Button, Input, Label, ListView, Static
 
 from vlcq.database import Database
@@ -247,6 +248,7 @@ async def test_headers_lead_with_color_coded_pane_specific_controls(tmp_path: Pa
         folder_row = app.query_one(".folder-entry")
         folder_label = folder_row.query_one(".folder-label", Label)
         assert folder_label.region.width < folder_row.region.width
+        assert folder_label.styles.background == Color.parse("#0b1f3a")
         assert folder_label.styles.background != folder_row.styles.background
         await pilot.click("#queue-actions")
         assert {str(button.label) for button in app.screen.query(Button)} == {
