@@ -250,11 +250,13 @@ requests and never deletes, moves, copies, or edits media.
 
 ## Development and verification
 
+Requirements and delivery plans live in [docs/planning/](docs/planning/README.md).
+Edit these Markdown documents directly; preserve unchecked tasks and verification evidence.
+
 ```sh
 .venv/bin/pytest
 .venv/bin/ruff check .
 .venv/bin/mypy src
-openspec validate browse-subtitles-before-playback --strict
 VLCQ_REAL_VLC=1 .venv/bin/pytest tests/test_integration_real_vlc.py
 ```
 
