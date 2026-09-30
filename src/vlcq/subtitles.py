@@ -283,6 +283,7 @@ class SubtitleCandidate:
             version=2,
             source=self.source,
             sidecar_variant=self.sidecar_variant,
+            title=self.title,
         )
 
 
@@ -342,6 +343,7 @@ class SubtitleTrack:
             sdh=self.sdh,
             version=2,
             source=self.source,
+            title=self.title,
         )
 
 
@@ -366,8 +368,11 @@ class SubtitleDescriptor:
     version: int = 2
     source: SubtitleSource | None = None
     sidecar_variant: str | None = None
+    title: str | None = None
 
     def __post_init__(self) -> None:
+        if self.title is not None:
+            object.__setattr__(self, "title", _bounded_text(self.title))
         if self.mode not in {"off", "track"}:
             raise ValueError("unknown subtitle mode")
         if self.version not in {1, 2}:
@@ -409,6 +414,8 @@ class SubtitleDescriptor:
         if self.version >= 2:
             result["source"] = self.source
             result["sidecar_variant"] = self.sidecar_variant
+            if self.title is not None:
+                result["title"] = self.title
         return result
 
     @classmethod
@@ -445,7 +452,10 @@ class SubtitleDescriptor:
             flags = [None, None, None, None]
             source = None
             variant = None
-        return cls(mode, language, flags[0], flags[1], flags[2], flags[3], int(version), source, variant)
+        title = value.get("title") if version == 2 and mode == "track" else None
+        if title is not None and not isinstance(title, str):
+            raise SubtitleError("invalid remembered subtitle title")
+        return cls(mode, language, flags[0], flags[1], flags[2], flags[3], int(version), source, variant, title)
 
 
 @dataclass(frozen=True)
@@ -626,7 +636,7 @@ def match_remembered_candidate(
     if not available:
         return None
 
-    def score(candidate: SubtitleCandidate) -> tuple[int, int, int, int, int, int, int]:
+    def score(candidate: SubtitleCandidate) -> tuple[int, ...]:
         agreements = 0
         conflicts = 0
         for expected, actual in (
@@ -649,6 +659,8 @@ def match_remembered_candidate(
         return (
             int(candidate.language == descriptor.language) if descriptor.language else 0,
             source_match,
+            int(descriptor.title is not None and candidate.title is not None
+                and descriptor.title.casefold() == candidate.title.casefold()),
             variant_match,
             agreements,
             -conflicts,
@@ -683,7 +695,7 @@ def match_remembered_track(
     if not candidates:
         return None
 
-    def score(track: SubtitleTrack) -> tuple[int, int, int, int, int, int]:
+    def score(track: SubtitleTrack) -> tuple[int, ...]:
         agreements = 0
         conflicts = 0
         for expected, actual in (
@@ -701,6 +713,8 @@ def match_remembered_track(
         return (
             int(descriptor.language is None or track.language == descriptor.language),
             int(descriptor.source is None or track.source == descriptor.source),
+            int(descriptor.title is not None and track.title is not None
+                and descriptor.title.casefold() == track.title.casefold()),
             agreements,
             -conflicts,
             1 if track.full_dialogue is True else 0,
