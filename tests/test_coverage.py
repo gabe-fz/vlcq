@@ -48,8 +48,8 @@ def test_interval_union_clipping_floor_and_raw_threshold() -> None:
     assert coverage_percentage(59_999, 60_000) == 99
     assert coverage_percentage(60_000, 60_000) == 100
     assert coverage_percentage(1, 0) is None
-    assert coverage_is_watched(54_000, 60_000)
-    assert not coverage_is_watched(53_999, 60_000)
+    assert coverage_is_watched(48_000, 60_000)
+    assert not coverage_is_watched(47_999, 60_000)
     with pytest.raises(ValueError):
         coverage_is_watched(1, 1, threshold=0)
 

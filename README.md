@@ -100,11 +100,14 @@ intentionally undercounted. End inference and Next never fill an unseen tail or 
 100%; only actually qualified ranges are stored. This measures conservative observed
 playback, not human attention and not every tiny native seek.
 
-The watched threshold defaults to 90% unique coverage and can be changed with a whole
+The watched threshold defaults to 80% unique coverage and can be changed with a whole
 `VLCQ_WATCHED_PERCENT=1..100`. Invalid values fail before queue/history mutation. The
 same raw threshold drives replay choices and Files filters. Reaching it does not stop,
 advance, or rewrite queue outcome state. Explicit completed queue outcomes remain
-eligible for finished-entry navigation and Clear completed independently.
+eligible for finished-entry navigation and Clear watched independently.
+The Queue header's **Clear watched** button removes entries at or above the watched
+threshold (80% by default), plus completed entries, after confirmation. Green
+historical coverage uses the same threshold. Media files and watch history are kept.
 
 ## Playback controls
 

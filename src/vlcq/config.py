@@ -44,7 +44,7 @@ def resolve_watched_percent(value: str | int | None = None) -> int:
     surface until vlcq has a settings UI.  Invalid values fail before command
     startup can open or mutate the database.
     """
-    raw: str | int = os.environ.get("VLCQ_WATCHED_PERCENT", "90") if value is None else value
+    raw: str | int = os.environ.get("VLCQ_WATCHED_PERCENT", "80") if value is None else value
     text = str(raw).strip()
     if not text or not text.isdecimal() or (len(text) > 1 and text.startswith("0")):
         raise ValueError("VLCQ_WATCHED_PERCENT must be a whole percentage from 1 through 100")

@@ -57,7 +57,7 @@ def coverage_is_watched(
     coverage_ms: int,
     duration_ms: int,
     *,
-    threshold: int = 90,
+    threshold: int = 80,
 ) -> bool:
     """Classify using raw unique coverage rather than a rounded percentage."""
     if not 1 <= int(threshold) <= 100:
@@ -70,7 +70,7 @@ def coverage_category(
     coverage_ms: int | None,
     duration_ms: int,
     *,
-    threshold: int = 90,
+    threshold: int = 80,
 ) -> str:
     if coverage_ms is None:
         return "none"
@@ -99,7 +99,7 @@ def is_watched(
     duration_ms: int,
     *,
     completion_observed: bool = False,
-    threshold: int = 90,
+    threshold: int = 80,
 ) -> bool:
     """Legacy classification retained for version-1 export compatibility."""
     if completion_observed:
@@ -120,7 +120,7 @@ def progress_category(
     duration_ms: int,
     *,
     completion_observed: bool = False,
-    threshold: int = 90,
+    threshold: int = 80,
 ) -> str:
     """Legacy category retained for consumers of furthest-position history."""
     if is_watched(

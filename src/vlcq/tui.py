@@ -805,7 +805,7 @@ class VLCQApp(App[None], inherit_bindings=False):
         Binding("r", "retry", "Retry"),
         Binding("R", "resume_highlighted", "Resume", show=False),
         Binding("S", "start_over_highlighted", "Start over", show=False),
-        Binding("c", "clear_completed", "Clear completed"),
+        Binding("c", "clear_completed", "Clear watched"),
         Binding("shift+f10", "context_menu", "Actions"),
         Binding("?", "help", "Help"),
         Binding("ctrl+c", "quit_app", "Quit"),
@@ -906,7 +906,7 @@ class VLCQApp(App[None], inherit_bindings=False):
                     yield CompactButton("Remove", id="queue-remove", variant="error", tooltip="Remove highlighted queue item")
                     yield CompactButton("↑", id="queue-up", variant="primary", tooltip="Move highlighted queue item up")
                     yield CompactButton("↓", id="queue-down", variant="primary", tooltip="Move highlighted queue item down")
-                    yield CompactButton("Clear", id="queue-clear", variant="warning", tooltip="Clear watched/completed queue entries")
+                    yield CompactButton("Clear watched", id="queue-clear", variant="warning", tooltip=f"Clear entries with at least {self.watched_percent}% watched coverage, or completed entries; keep media files")
                     yield CompactButton("Sort", id="queue-sort", classes="responsive-action responsive-medium", tooltip="Sort queue naturally")
                     yield CompactButton("Undo", id="queue-undo", classes="responsive-action responsive-medium", tooltip="Undo latest queue removal")
                     yield CompactButton("Clear all", id="queue-clear-all", classes="responsive-action responsive-wide", variant="error", tooltip="Clear every queue entry")

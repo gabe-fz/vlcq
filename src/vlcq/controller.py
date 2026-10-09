@@ -42,7 +42,7 @@ class ResumeChoiceRequired(VLCError):
 
 
 class ResumeOffer:
-    def __init__(self, history: HistoryProjection | None, watched_percent: int = 90) -> None:
+    def __init__(self, history: HistoryProjection | None, watched_percent: int = 80) -> None:
         if not 1 <= int(watched_percent) <= 100:
             raise ValueError("watched threshold must be an integer from 1 through 100")
         self.history = history

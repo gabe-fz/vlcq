@@ -30,7 +30,7 @@ def test_watched_configuration_helpers_and_export_are_threshold_consistent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.delenv("VLCQ_WATCHED_PERCENT", raising=False)
-    assert resolve_watched_percent() == 90
+    assert resolve_watched_percent() == 80
     monkeypatch.setenv("VLCQ_WATCHED_PERCENT", "75")
     assert resolve_watched_percent() == 75
     for invalid in ("", "0", "101", "90.0", " 09 ", "-1"):

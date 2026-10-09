@@ -98,7 +98,7 @@ class HistoryProjection:
             return "in_progress"
         return "none"
 
-    def watched(self, threshold: int = 90) -> bool:
+    def watched(self, threshold: int = 80) -> bool:
         return is_watched(
             self.position_ms,
             self.duration_ms,
@@ -114,12 +114,12 @@ class HistoryProjection:
             return None
         return coverage_percentage(self.coverage_ms, self.duration_ms)
 
-    def coverage_watched(self, threshold: int = 90) -> bool:
+    def coverage_watched(self, threshold: int = 80) -> bool:
         return self.coverage_ms is not None and coverage_is_watched(
             self.coverage_ms, self.duration_ms, threshold=threshold
         )
 
-    def coverage_category(self, threshold: int = 90) -> str:
+    def coverage_category(self, threshold: int = 80) -> str:
         return coverage_category(self.coverage_ms, self.duration_ms, threshold=threshold)
 
 

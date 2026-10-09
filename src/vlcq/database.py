@@ -1219,7 +1219,7 @@ class Database:
         return self.history_for_paths(paths, root=root)
 
     def export_progress(
-        self, root: str | Path, watched_percent: int = 90, *, threshold: int | None = None
+        self, root: str | Path, watched_percent: int = 80, *, threshold: int | None = None
     ) -> dict[str, dict[str, Any]]:
         """Export the stable version-1 document records for a confined root.
 
