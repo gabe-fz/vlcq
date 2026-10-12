@@ -35,6 +35,24 @@ from .subtitles import (
 from .vlc import VLCError
 
 
+def _update_if_changed(widget: Static, content: str | Text) -> None:
+    """Static.update always invalidates layout, even for identical content.
+
+    Rich Text equality alone ignores its base style and layout attributes, so
+    compare those too: a watched/style-only transition must still be painted.
+    """
+    previous = widget.renderable
+    if isinstance(previous, Text) and isinstance(content, Text):
+        if previous == content and all(
+            getattr(previous, name) == getattr(content, name)
+            for name in ("style", "justify", "overflow", "no_wrap", "end", "tab_size")
+        ):
+            return
+    elif isinstance(previous, str) and isinstance(content, str) and previous == content:
+        return
+    widget.update(content)
+
+
 def _file_identity(
     raw_path: Path, root: Path
 ) -> tuple[Path, FileIdentity] | None:
@@ -146,7 +164,7 @@ class HistoricalCoverage(Static):
         style = "bright_black" if percentage is None else ("bold green" if watched else "yellow")
         text = Text("hist ", style="bright_black", no_wrap=True)
         text.append(f"{value:>4}", style=style)
-        self.update(text)
+        _update_if_changed(self, text)
 
 
 class ItemProgress(Static):
@@ -160,7 +178,7 @@ class ItemProgress(Static):
 
     def set_position(self, position_ms: int | None, duration_ms: int | None) -> None:
         if position_ms is None:
-            self.update(Text("[????????] --% --:--/--:--", style="bright_black", no_wrap=True))
+            _update_if_changed(self, Text("[????????] --% --:--/--:--", style="bright_black", no_wrap=True))
             return
         duration = duration_ms if duration_ms is not None and duration_ms > 0 else None
         percent = min(100, max(0, position_ms) * 100 // duration) if duration else None
@@ -181,7 +199,7 @@ class ItemProgress(Static):
         text.append("░" * (self.BAR_WIDTH - filled) + "] ", style="bright_black")
         text.append(f"{value:>4} {current}", style=progress_style)
         text.append(f"/{total}", style="bright_black")
-        self.update(text)
+        _update_if_changed(self, text)
 
 
 class SubtitleSubitem(Static):
@@ -980,11 +998,11 @@ class VLCQApp(App[None], inherit_bindings=False):
         """Promote actions without also duplicating them in an overflow menu."""
         medium = self.size.width >= 100
         wide = self.size.width >= 140
-        for button in self.query(".responsive-medium"):
-            button.display = medium
-        for button in self.query(".responsive-wide"):
-            button.display = wide
+        # Other responsive actions also depend on selection/queue state and
+        # are owned by _refresh_action_buttons. Showing them here and hiding
+        # them there invalidated the entire layout on every playback tick.
         try:
+            self.query_one("#files-sort", Button).display = medium
             self.query_one("#files-actions", Button).display = (
                 not medium or (not wide and bool(self.selected_paths))
             )
@@ -1133,8 +1151,8 @@ class VLCQApp(App[None], inherit_bindings=False):
         queue_count = len(self.queue.entries())
         queue_title = f"{queue_count} entr{'y' if queue_count == 1 else 'ies'}"
         try:
-            self.query_one("#files-title", Static).update(title)
-            self.query_one("#queue-title", Static).update(queue_title)
+            _update_if_changed(self.query_one("#files-title", Static), title)
+            _update_if_changed(self.query_one("#queue-title", Static), queue_title)
             self._refresh_action_buttons()
         except NoMatches:
             pass
@@ -1459,7 +1477,7 @@ class VLCQApp(App[None], inherit_bindings=False):
     def _update_subtitle_row(self, row: BrowserListItem | QueueListItem, path: Path) -> None:
         try:
             depth = row.depth if isinstance(row, BrowserListItem) else 0
-            row.query_one(SubtitleSubitem).update(self._subtitle_renderable(path, depth=depth))
+            _update_if_changed(row.query_one(SubtitleSubitem), self._subtitle_renderable(path, depth=depth))
         except NoMatches:
             pass
 
@@ -1602,8 +1620,9 @@ class VLCQApp(App[None], inherit_bindings=False):
             if entry is None:
                 continue
             try:
-                row.query_one(".row-label", Label).update(
-                    self._browser_renderable(entry, entry.path in self.selected_paths, entry.path in queued_paths)
+                _update_if_changed(
+                    row.query_one(".row-label", Label),
+                    self._browser_renderable(entry, entry.path in self.selected_paths, entry.path in queued_paths),
                 )
                 row.query_one(HistoricalCoverage).set_percentage(
                     self._history_percentage(entry.path),
@@ -1632,8 +1651,9 @@ class VLCQApp(App[None], inherit_bindings=False):
             if entry is None:
                 continue
             try:
-                row.query_one(".row-label", Label).update(
-                    self._queue_renderable(entry, current_id, selected_id)
+                _update_if_changed(
+                    row.query_one(".row-label", Label),
+                    self._queue_renderable(entry, current_id, selected_id),
                 )
                 position, duration = self._queue_current_position(entry, current_id)
                 row.query_one(ItemProgress).set_position(position, duration)
@@ -2047,8 +2067,9 @@ class VLCQApp(App[None], inherit_bindings=False):
     ) -> None:
         row.set_classes("queue-selected" if selected_id == entry.id else "")
         try:
-            row.query_one(".row-label", Label).update(
-                self._queue_renderable(entry, current_id, selected_id)
+            _update_if_changed(
+                row.query_one(".row-label", Label),
+                self._queue_renderable(entry, current_id, selected_id),
             )
             position, duration = self._queue_current_position(entry, current_id)
             row.query_one(ItemProgress).set_position(position, duration)
@@ -2126,7 +2147,7 @@ class VLCQApp(App[None], inherit_bindings=False):
         empty = self.query_one("#queue-empty", Static)
         empty.display = not bool(entries)
         if not entries:
-            empty.update("Queue is empty — use Files actions to add a video.")
+            _update_if_changed(empty, "Queue is empty — use Files actions to add a video.")
 
         rows = list(view.children)
         reuse_rows = len(rows) == len(entries) and all(
