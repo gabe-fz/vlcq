@@ -620,6 +620,41 @@ class ActionMenu(ModalScreen[ContextAction | None]):
             self.dismiss(None)
 
 
+class ConfirmDeleteWatched(ModalScreen[bool]):
+    BINDINGS: ClassVar = [Binding("escape", "cancel", "Cancel")]
+    DEFAULT_CSS = """
+    ConfirmDeleteWatched { align: center middle; }
+    #delete-watched-dialog { width: 90%; height: 80%; padding: 1; background: $surface; border: solid $error; }
+    #delete-watched-list { height: 1fr; }
+    #delete-watched-list Static { height: auto; }
+    """
+
+    def __init__(self, paths: tuple[Path, ...]) -> None:
+        super().__init__()
+        self.paths = paths
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="delete-watched-dialog"):
+            yield Static(f"Permanently delete {len(self.paths)} watched video files? This cannot be undone.")
+            yield Static("Entire current library, including subfolders. Subtitles and current playback are excluded.")
+            with VerticalScroll(id="delete-watched-list"):
+                for path in self.paths:
+                    yield Static(str(path), markup=False)
+            with Horizontal(classes="dialog-actions"):
+                yield Button("Cancel", id="delete-watched-cancel")
+                yield Button("Delete files", id="delete-watched-confirm", variant="error")
+
+    def on_mount(self) -> None:
+        self.query_one("#delete-watched-cancel", Button).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.dismiss(event.button.id == "delete-watched-confirm")
+
+
 class ConfirmClear(ModalScreen[bool]):
     BINDINGS: ClassVar = [
         Binding("y", "confirm", "Yes"),
@@ -767,7 +802,7 @@ class VLCQApp(App[None], inherit_bindings=False):
     .section-name { width: auto; min-width: 7; height: 1; text-style: bold; }
     .section-title { width: auto; max-width: 30%; height: 1; padding: 0 1; color: $text-muted; overflow-x: hidden; }
     .section-body { height: 1fr; min-height: 1; }
-    .section.collapsed .section-body { display: none; }
+    .section.collapsed .section-body, .section.collapsed #files-delete-bar { display: none; }
     #browser, #queue { height: 1fr; min-height: 1; overflow-x: auto; overflow-y: auto; }
     #browser > ListItem, #queue > ListItem { width: auto; min-width: 100%; height: 1; min-height: 1; }
     .browser-row, .queue-row { width: 1fr; height: 1; min-height: 1; }
@@ -913,6 +948,8 @@ class VLCQApp(App[None], inherit_bindings=False):
                     yield CompactButton("Sort", id="files-sort", classes="responsive-action responsive-medium", tooltip="Reverse filename order")
                     yield CompactButton("Clear", id="files-clear-selection", classes="responsive-action responsive-wide", tooltip="Clear file selection")
                     yield CompactButton("…", id="files-actions", tooltip="More Files actions")
+                with Horizontal(id="files-delete-bar", classes="section-header"):
+                    yield CompactButton("Delete watched", id="files-delete-watched", variant="error", tooltip="Permanently delete watched videos in this library after confirmation")
                 with Vertical(id="files-body", classes="section-body"):
                     yield Static("No folders or playable videos here — use Files actions to open a root.", id="files-empty")
                     yield ListView(id="browser")
@@ -3612,6 +3649,58 @@ class VLCQApp(App[None], inherit_bindings=False):
 
         self.push_screen(QuitPrompt(), chosen)
 
+    def action_delete_watched(self) -> None:
+        root = self.root
+        generation = self._root_generation
+        current = self.queue.current()
+        excluded = current.path.resolve() if current else None
+        targets: dict[Path, FileIdentity] = {}
+        try:
+            for candidate in sorted(root.rglob("*")):
+                if candidate.is_symlink() or candidate.suffix.lower() not in VIDEO_EXTENSIONS:
+                    continue
+                identified = _file_identity(candidate, root)
+                if identified is None:
+                    continue
+                path, identity = identified
+                if path == excluded:
+                    continue
+                history = self.database.history_for(path, root=root)
+                if history is not None and history.coverage_watched(self.watched_percent):
+                    targets[path] = identity
+        except OSError as exc:
+            self.update_status(f"Cannot list watched files: {exc}")
+            return
+        if not targets:
+            self.update_status("No watched video files to delete (current playback excluded)")
+            return
+
+        async def confirmed(value: bool | None) -> None:
+            if not value or generation != self._root_generation:
+                return
+            deleted = 0
+            failures: list[str] = []
+            for path, identity in targets.items():
+                current = self.queue.current()
+                if current and current.path.resolve() == path:
+                    failures.append(f"{path}: current playback")
+                    continue
+                if path.is_symlink() or _file_identity(path, root) != (path, identity):
+                    failures.append(f"{path}: missing or changed since confirmation")
+                    continue
+                try:
+                    path.unlink()
+                    deleted += 1
+                except OSError as exc:
+                    failures.append(f"{path}: {exc}")
+            await self.refresh_browser()
+            self.refresh_queue()
+            self.update_status(f"Deleted {deleted} watched files; {len(failures)} skipped or failed")
+            if failures:
+                self.push_screen(NoticeDetailsPrompt("Files not deleted:\n" + "\n".join(failures)))
+
+        self.push_screen(ConfirmDeleteWatched(tuple(targets)), confirmed)
+
     def action_clear_completed(self) -> None:
         if not self._queue_has_clearable():
             self.update_status("No watched/completed queue entries to clear")
@@ -3666,6 +3755,8 @@ class VLCQApp(App[None], inherit_bindings=False):
             self.action_open_root()
         elif button_id == "files-search":
             self.action_search_filter()
+        elif button_id == "files-delete-watched":
+            self.action_delete_watched()
         elif button_id == "files-refresh":
             await self.action_refresh_files()
         elif button_id == "files-add":
