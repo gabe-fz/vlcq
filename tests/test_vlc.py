@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 import pytest
 
+from vlcq.models import VLCStatus
 from vlcq.subtitles import SubtitleTrack
 from vlcq.vlc import (
     VLCClient,
@@ -80,8 +81,8 @@ async def test_process_lock_allows_only_one_owned_instance_and_releases_on_stop(
             return self.returncode or 0
 
     class FakeClient:
-        async def status(self) -> None:
-            return None
+        async def status(self) -> VLCStatus:
+            return VLCStatus("stopped")
 
         async def command(self, _command: str) -> None:
             return None
@@ -92,11 +93,16 @@ async def test_process_lock_allows_only_one_owned_instance_and_releases_on_stop(
     async def validate_version() -> None:
         return None
 
+    handles: list[FakeProcessHandle] = []
+
     async def create_process(*_args: object, **kwargs: object) -> FakeProcessHandle:
+        assert all(handle.returncode is not None for handle in handles)
         pass_fds = kwargs["pass_fds"]
         assert isinstance(pass_fds, tuple)
         starts.append(pass_fds)
-        return FakeProcessHandle()
+        handle = FakeProcessHandle()
+        handles.append(handle)
+        return handle
 
     monkeypatch.setattr("vlcq.vlc.VLCClient", lambda *_args: FakeClient())
     monkeypatch.setattr("vlcq.vlc.asyncio.create_subprocess_exec", create_process)
@@ -105,7 +111,9 @@ async def test_process_lock_allows_only_one_owned_instance_and_releases_on_stop(
     monkeypatch.setattr(first, "_validate_version", validate_version)
     monkeypatch.setattr(second, "_validate_version", validate_version)
 
-    await first.start()
+    clients = await asyncio.gather(first.start(), first.start(), first.start())
+    assert all(client is clients[0] for client in clients)
+    assert len(starts) == 1
     first_child = first.process
     assert first_child is not None
     with pytest.raises(VLCError, match="another vlcq-owned VLC instance"):
@@ -118,8 +126,31 @@ async def test_process_lock_allows_only_one_owned_instance_and_releases_on_stop(
     second_child = second.process
     assert second_child is not None
     assert len(starts) == 2
+    # A user quit is detected on demand; the old client is never reused.
+    second_child.returncode = 0
+    old_client = second.client
+    await asyncio.gather(second.start(), second.start())
+    assert second.client is not old_client
+    assert len(starts) == 3
+    replacement = second.process
+    assert replacement is not None
+
+    # Force replacement must reap the old process before spawning another.
+    await second.start(restart=True)
+    assert replacement.returncode == 0
+    assert len(starts) == 4
+    assert second.client is not None
+    unhealthy = second.process
+
+    async def unavailable() -> VLCStatus:
+        raise VLCError("HTTP interface stopped responding")
+
+    monkeypatch.setattr(second.client, "status", unavailable)
+    await second.start()
+    assert unhealthy is not None and unhealthy.returncode is not None
+    assert len(starts) == 5
     await second.stop()
-    assert second_child.returncode == 0
+    assert second.process is None
 
 
 def test_instance_lock_ignores_database_home_override(

@@ -2362,12 +2362,6 @@ class VLCQApp(App[None], inherit_bindings=False):
                     return index
         return 0
 
-    def _require_vlc_for_play(self) -> bool:
-        if not self.no_vlc and self.controller.client is None:
-            self.update_status("VLC unavailable — press r to retry")
-            return False
-        return True
-
     async def _notify_queue_mutation(self) -> bool:
         """Repair the owned VLC successor after a queue identity mutation."""
         if self.no_vlc or self.controller.client is None:
@@ -2459,8 +2453,6 @@ class VLCQApp(App[None], inherit_bindings=False):
         try:
             if self.no_vlc:
                 return await self._play_queue_offline(index, choice=choice, automatic=automatic)
-            if not self._require_vlc_for_play():
-                return False
             return await self.controller.play_with_policy(index, choice=choice, automatic=automatic)
         except ResumeChoiceRequired as exc:
             def chosen(value: str | None) -> None:
@@ -2477,8 +2469,6 @@ class VLCQApp(App[None], inherit_bindings=False):
             return False
 
     async def _activate_browser_video(self, entry: BrowserEntry, choice: str | None = None) -> None:
-        if not self._require_vlc_for_play():
-            return
         offer = self._resume_offer_for_path(entry.path)
         if choice is None and self._offer_requires_choice(offer):
             def chosen(value: str | None) -> None:
@@ -2719,8 +2709,6 @@ class VLCQApp(App[None], inherit_bindings=False):
         if not paths:
             self.update_status("Nothing to play — highlight a playable video or select one")
             return
-        if not self._require_vlc_for_play():
-            return
         offer = self._resume_offer_for_path(paths[0])
         if self._offer_requires_choice(offer):
             def chosen(value: str | None) -> None:
@@ -2783,9 +2771,6 @@ class VLCQApp(App[None], inherit_bindings=False):
         if current is None:
             self.update_status("Nothing is playing")
             return
-        if not self.no_vlc and self.controller.client is None:
-            self.update_status("VLC unavailable — press r to retry")
-            return
         try:
             if self.no_vlc:
                 state = "paused" if current.state == "playing" else "playing"
@@ -2802,9 +2787,6 @@ class VLCQApp(App[None], inherit_bindings=False):
         self.refresh_queue()
 
     async def action_next(self) -> None:
-        if not self.no_vlc and self.controller.client is None:
-            self.update_status("VLC unavailable — press r to retry")
-            return
         try:
             if self.no_vlc:
                 entry = await self._run_database_operation(self.queue.next)
@@ -2818,9 +2800,6 @@ class VLCQApp(App[None], inherit_bindings=False):
         self.refresh_queue()
 
     async def action_previous(self) -> None:
-        if not self.no_vlc and self.controller.client is None:
-            self.update_status("VLC unavailable — press r to retry")
-            return
         try:
             if self.no_vlc:
                 entry = await self._run_database_operation(self.queue.previous)
@@ -3588,8 +3567,6 @@ class VLCQApp(App[None], inherit_bindings=False):
     async def _add_and_play_paths(self, paths: list[Path]) -> None:
         if not paths:
             self.update_status("Nothing to play")
-            return
-        if not self._require_vlc_for_play():
             return
         offer = self._resume_offer_for_path(paths[0])
         if self._offer_requires_choice(offer):

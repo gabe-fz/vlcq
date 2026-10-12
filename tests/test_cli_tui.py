@@ -543,7 +543,9 @@ async def test_tui_direct_enter_consumes_only_activated_selection(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_play_when_client_missing_shows_retry_status(tmp_path: Path) -> None:
+async def test_play_when_client_missing_attempts_automatic_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     root = tmp_path / "show"
     root.mkdir()
     video = root / "episode.mkv"
@@ -558,12 +560,20 @@ async def test_play_when_client_missing_shows_retry_status(tmp_path: Path) -> No
         queue.focus()
         queue.index = 0
         app.no_vlc = False
+        played: list[int] = []
 
+        async def play(index: int, **_kwargs: object) -> bool:
+            played.append(index)
+            app.queue.play_now(index)
+            return True
+
+        monkeypatch.setattr(app.controller, "play_with_policy", play)
+        assert app.controller.client is None
         await app.action_activate()
 
+        assert played == [0]
         rendered = str(app.query_one("#notice", Static).renderable)
-        assert "VLC unavailable — press r to retry" in rendered
-        assert "VLC is not connected" not in rendered
+        assert "Playing episode.mkv" in rendered
         app.no_vlc = True
     db.close()
 

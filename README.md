@@ -121,8 +121,14 @@ successor. Native Previous and arbitrary VLC playlist navigation are not support
 unexpected media fails closed instead of inheriting history. Reconnect creates no
 duplicate process/poll loop and never selects, loads, or autoplays media. Only one
 vlcq-owned VLC instance can run per macOS user at a time, even with separate database
-paths or `VLCQ_HOME` overrides; quitting
-vlcq always stops its owned instance and never leaves it running.
+paths or `VLCQ_HOME` overrides. Healthy instances are reused, and replacement waits
+for the previous owned process to exit. Play automatically starts VLC when disconnected
+and makes up to three attempts on failure, checking the connection before retrying and
+restarting the owned process for the final attempt. Resume/start-over choices and the
+validated successor window are retained across retries. Quitting VLC manually leaves it
+closed until another playback action or Reconnect; playing again relaunches it without
+requiring Reconnect first. Unrelated VLC instances are never stopped. Quitting vlcq
+always stops its owned instance and never leaves it running.
 
 ### Subtitle selection and preferences
 

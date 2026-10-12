@@ -161,16 +161,40 @@ class PlaybackController:
     async def start(self) -> None:
         """Connect exactly once and own exactly one polling task."""
         async with self._transition_lock:
-            if self.client is not None and self._running:
-                return
-            if self._poll_task is not None and not self._poll_task.done():
-                return
-            self.client = await self.process.start()
+            await self._connect_locked()
+
+    async def _connect_locked(self, *, restart: bool = False) -> None:
+        if restart:
+            await self.process.stop()
+        client = await self.process.start()
+        if client is not self.client:
+            self.client = client
+            self.status = VLCStatus("unavailable")
+            self._last_valid_status = None
             self._invalidate_playlist_window()
-            self.last_error = None
-            self._running = True
             self._generation += 1
+        self.last_error = None
+        self._running = True
+        if self._poll_task is None or self._poll_task.done():
             self._poll_task = asyncio.create_task(self._poll())
+
+    async def _current_is_loaded_locked(self, entry: QueueEntry) -> bool:
+        """Persisted playing/paused state alone does not prove VLC is still alive."""
+        client = self.client
+        if client is None:
+            return False
+        method = getattr(client, "status", None)
+        if not callable(method):
+            return self.status.state in {"playing", "paused"}
+        try:
+            status = await asyncio.wait_for(method(), self.observation_timeout)
+        except (VLCError, OSError, RuntimeError, TimeoutError):
+            return False
+        if status.state not in {"playing", "paused"} or not self._same_path(status.path, entry.path):
+            return False
+        self.status = status
+        await self._sync_queue_state(status, entry.path)
+        return True
 
     async def reconnect(self) -> None:
         # ``start`` is the idempotent lifecycle boundary and deliberately does
@@ -993,7 +1017,7 @@ class PlaybackController:
         self, initial: VLCStatus, expected: Path, generation: int
     ) -> VLCStatus:
         """Do not seek or sync queue state until VLC names the expected file."""
-        if initial.path is not None and self._same_path(initial.path, expected):
+        if initial.state == "playing" and self._same_path(initial.path, expected):
             return initial
         client = self.client
         if client is None:
@@ -1008,7 +1032,7 @@ class PlaybackController:
                 latest = await asyncio.wait_for(client.status(), min(0.25, remaining))
             except TimeoutError:
                 continue
-            if latest.path is not None and self._same_path(latest.path, expected):
+            if latest.state == "playing" and self._same_path(latest.path, expected):
                 return latest
             await asyncio.sleep(0)
         raise VLCError("VLC did not become ready for the expected media")
@@ -1037,6 +1061,56 @@ class PlaybackController:
         resume_position_ms: int | None = None,
         duration_ms: int = 0,
         start_over: bool = False,
+        force_reload: bool = False,
+    ) -> None:
+        # Validate before launching VLC or retrying. Missing/unsafe files are
+        # not availability failures and must never trigger process churn.
+        entries = self.queue.entries()
+        if not 0 <= entry_index < len(entries):
+            raise IndexError("queue index out of range")
+        entry = entries[entry_index]
+        try:
+            canonical = entry.path.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError) as exc:
+            raise VLCError("refusing unsafe queue media") from exc
+        if self.queue.root is None or not is_beneath(canonical, self.queue.root):
+            raise VLCError("refusing unsafe queue media")
+        if not canonical.is_file():
+            self.queue.database.set_state(entry.id, "missing")
+            raise FileNotFoundError("video is missing")
+        for attempt in range(3):
+            try:
+                if self.client is None or attempt:
+                    await self._connect_locked(restart=attempt == 2)
+                await self._play_entry_once_locked(
+                    entry_index,
+                    resume_position_ms=resume_position_ms,
+                    duration_ms=duration_ms,
+                    start_over=start_over,
+                    force_reload=force_reload or attempt > 0,
+                )
+                self.last_error = None
+                return
+            except (VLCError, OSError, TimeoutError):
+                self._generation += 1
+                self._invalidate_playlist_window()
+                self.status = VLCStatus("unavailable", path=entry.path)
+                if attempt == 2:
+                    await self._run_database_operation(
+                        lambda: self.queue.database.set_state(entry.id, "failed")
+                    )
+                    self.last_error = "VLC playback failed after 3 attempts — play again to retry"
+                    raise
+                await asyncio.sleep(0.1 * (attempt + 1))
+
+    async def _play_entry_once_locked(
+        self,
+        entry_index: int,
+        *,
+        resume_position_ms: int | None = None,
+        duration_ms: int = 0,
+        start_over: bool = False,
+        force_reload: bool = False,
     ) -> None:
         if self.client is None:
             raise VLCError("VLC is not connected")
@@ -1059,10 +1133,27 @@ class PlaybackController:
             current is not None
             and current.id == entry.id
             and current.state in {"playing", "paused"}
+            and not force_reload
+            and await self._current_is_loaded_locked(current)
         ):
             # Activating the current item is not a reload.  A paused item may
             # be resumed, but its media identity and position stay intact.
-            if current.state == "paused":
+            if start_over:
+                self._generation += 1
+                self._reset_playback_evidence()
+                await self.client.command("seek", val="0", type="absolute")
+                await self._run_database_operation(
+                    lambda: self.queue.update_progress(
+                        entry.path, 0, duration_ms or self.status.duration_ms,
+                        trustworthy=True, resume_position_ms=0, allow_resume_reset=True,
+                    )
+                )
+                self.status = VLCStatus(
+                    self.status.state, 0, duration_ms or self.status.duration_ms,
+                    entry.path, self.status.playlist_id,
+                )
+                self._last_valid_status = self.status
+            if self.status.state == "paused":
                 self._reset_playback_evidence()
                 self._generation += 1
                 self.status = await self.client.command("pl_pause")
@@ -1075,53 +1166,44 @@ class PlaybackController:
         generation = self._generation
         self._reset_playback_evidence()
         await self._run_database_operation(lambda: self.queue.play_now(entry_index))
-        try:
-            replace = getattr(self.client, "replace_playlist", None)
-            response = (
-                await replace(entry.path)
-                if callable(replace)
-                else await self.client.play(entry.path)
-            )
-            ready = await self._wait_for_expected_media(response, entry.path, generation)
-            self.status = ready
-            self._last_valid_status = ready
-            await self._sync_queue_state(ready, entry.path)
-            await self._synchronize_playlist_window_locked(force=True)
-            if start_over:
-                await self._run_database_operation(
-                    lambda: self.queue.update_progress(
-                        entry.path,
-                        0,
-                        duration_ms or ready.duration_ms,
-                        trustworthy=True,
-                        resume_position_ms=0,
-                        allow_resume_reset=True,
-                    )
-                )
-            if resume_position_ms is not None:
-                seek_duration = duration_ms or ready.duration_ms
-                if seek_duration <= 0:
-                    raise VLCError("cannot seek without a known duration")
-                await self._seek_absolute_locked(resume_position_ms, seek_duration, entry.path)
-                await self._run_database_operation(
-                    lambda: self.queue.update_progress(
-                        entry.path,
-                        resume_position_ms,
-                        seek_duration,
-                        trustworthy=True,
-                        resume_position_ms=resume_position_ms,
-                        allow_resume_reset=True,
-                    )
-                )
-            await self._apply_automatic_subtitles_locked()
-        except (VLCError, OSError, TimeoutError):
+        replace = getattr(self.client, "replace_playlist", None)
+        response = (
+            await replace(entry.path)
+            if callable(replace)
+            else await self.client.play(entry.path)
+        )
+        ready = await self._wait_for_expected_media(response, entry.path, generation)
+        self.status = ready
+        self._last_valid_status = ready
+        await self._sync_queue_state(ready, entry.path)
+        await self._synchronize_playlist_window_locked(force=True)
+        if start_over:
             await self._run_database_operation(
-                lambda: self.queue.set_current_state(entry.id, "failed")
+                lambda: self.queue.update_progress(
+                    entry.path,
+                    0,
+                    duration_ms or ready.duration_ms,
+                    trustworthy=True,
+                    resume_position_ms=0,
+                    allow_resume_reset=True,
+                )
             )
-            self.status = VLCStatus("unavailable", path=entry.path)
-            self._invalidate_playlist_window()
-            self.last_error = "VLC playback or playlist synchronization failed — press r to retry"
-            raise
+        if resume_position_ms is not None:
+            seek_duration = duration_ms or ready.duration_ms
+            if seek_duration <= 0:
+                raise VLCError("cannot seek without a known duration")
+            await self._seek_absolute_locked(resume_position_ms, seek_duration, entry.path)
+            await self._run_database_operation(
+                lambda: self.queue.update_progress(
+                    entry.path,
+                    resume_position_ms,
+                    seek_duration,
+                    trustworthy=True,
+                    resume_position_ms=resume_position_ms,
+                    allow_resume_reset=True,
+                )
+            )
+        await self._apply_automatic_subtitles_locked()
 
     def resume_offer(self, index: int) -> ResumeOffer:
         entries = self.queue.entries()
@@ -1143,52 +1225,19 @@ class PlaybackController:
         entries = self.queue.entries()
         if not 0 <= index < len(entries):
             raise IndexError("queue index out of range")
+        if choice == "cancel":
+            return False
         current = self.queue.current()
         offer = self.resume_offer(index)
         if (
             current is not None
             and current.id == entries[index].id
             and current.state in {"playing", "paused"}
+            and await self._current_is_loaded_locked(current)
         ):
-            # Ordinary activation is not a reload. An explicit Start over is
-            # different: invalidate evidence before seeking and persist zero
-            # without touching historical coverage.
-            if choice == "start_over":
-                client = self.client
-                if client is None:
-                    raise VLCError("VLC is not connected")
-                self._reset_playback_evidence()
-                self._generation += 1
-                response = await client.command("seek", val="0", type="absolute")
-                if current.state == "paused":
-                    response = await client.command("pl_pause")
-                duration = offer.duration_ms or response.duration_ms
-                self.status = VLCStatus(
-                    "playing",
-                    0,
-                    duration,
-                    current.path,
-                    response.playlist_id or self.active_vlc_id,
-                    response.rate,
-                    response.request_started,
-                    response.response_received,
-                )
-                self._last_valid_status = self.status
-                await self._run_database_operation(
-                    lambda: self.queue.update_progress(
-                        current.path,
-                        0,
-                        duration,
-                        trustworthy=True,
-                        resume_position_ms=0,
-                        allow_resume_reset=True,
-                    )
-                )
-                await self._run_database_operation(
-                    lambda: self.queue.set_current_state(current.id, "playing")
-                )
-            else:
-                await self._play_entry_locked(index)
+            await self._play_entry_locked(
+                index, start_over=choice == "start_over", duration_ms=offer.duration_ms
+            )
             return True
         if offer.completed:
             await self._play_entry_locked(
@@ -1276,6 +1325,10 @@ class PlaybackController:
 
     async def toggle_pause(self) -> None:
         async with self._transition_lock:
+            current = self.queue.current()
+            if current is not None and not await self._current_is_loaded_locked(current):
+                await self._play_automatic_entry_locked(current)
+                return
             if self.status.state == "playing":
                 # Preserve the last observed portion of a qualified run before
                 # the pause command invalidates continuity. A failed or stale
@@ -1328,65 +1381,24 @@ class PlaybackController:
             )
 
     async def _play_automatic_entry_locked(self, entry: QueueEntry) -> None:
-        if self.client is None:
-            return
-        path = entry.path
-        entry_id = entry.id
         offer = ResumeOffer(
-            self.queue.database.history_for(path, root=self.queue.root), self.watched_percent
+            self.queue.database.history_for(entry.path, root=self.queue.root), self.watched_percent
         )
-        resume_position = offer.position_ms if offer.usable_resume else None
-        start_over = offer.completed
-        try:
-            replace = getattr(self.client, "replace_playlist", None)
-            response = await replace(path) if callable(replace) else await self.client.play(path)
-            ready = await self._wait_for_expected_media(response, path, self._generation)
-            self.status = ready
-            self._last_valid_status = ready
-            await self._sync_queue_state(ready, path)
-            await self._synchronize_playlist_window_locked(force=True)
-            if start_over:
-                await self._run_database_operation(
-                    lambda: self.queue.update_progress(
-                        path,
-                        0,
-                        offer.duration_ms or ready.duration_ms,
-                        trustworthy=True,
-                        resume_position_ms=0,
-                        allow_resume_reset=True,
-                    )
-                )
-            if resume_position is not None:
-                duration = offer.duration_ms or ready.duration_ms
-                if duration <= 0:
-                    raise VLCError("cannot resume without a known duration")
-                await self._seek_absolute_locked(resume_position, duration, path)
-                await self._run_database_operation(
-                    lambda: self.queue.update_progress(
-                        path,
-                        resume_position,
-                        duration,
-                        trustworthy=True,
-                        resume_position_ms=resume_position,
-                        allow_resume_reset=True,
-                    )
-                )
-            await self._apply_automatic_subtitles_locked()
-        except (VLCError, OSError, TimeoutError):
-            await self._run_database_operation(
-                lambda: self.queue.set_current_state(entry_id, "failed")
-            )
-            self.status = VLCStatus("unavailable", path=path)
-            self._invalidate_playlist_window()
-            self.last_error = "VLC playback or playlist synchronization failed — press r to retry"
-            raise
+        index = next(i for i, candidate in enumerate(self.queue.entries()) if candidate.id == entry.id)
+        await self._play_entry_locked(
+            index,
+            resume_position_ms=(offer.position_ms if offer.usable_resume and not offer.completed else None),
+            duration_ms=offer.duration_ms,
+            start_over=offer.completed,
+            force_reload=True,
+        )
 
     async def _next_locked(self, completed: bool = False) -> None:
         await self._capture_final_observation_locked()
         self._reset_playback_evidence()
         self._generation += 1
         entry = await self._run_database_operation(lambda: self.queue.next(completed))
-        if entry and self.client:
+        if entry:
             await self._play_automatic_entry_locked(entry)
         elif self.client:
             await self._synchronize_playlist_window_locked(force=True)
@@ -1401,7 +1413,7 @@ class PlaybackController:
             self._reset_playback_evidence()
             self._generation += 1
             entry = await self._run_database_operation(self.queue.previous)
-            if entry and self.client:
+            if entry:
                 await self._play_automatic_entry_locked(entry)
             elif self.client:
                 await self._synchronize_playlist_window_locked(force=True)
@@ -1750,17 +1762,20 @@ class PlaybackController:
                     else min(5.0, delay * 1.5)
                 )
             except (VLCError, OSError, RuntimeError, AttributeError):
-                if self.client is client:
+                async with self._transition_lock:
+                    # A play/reconnect may have recovered while this failed
+                    # poll was waiting to reacquire the transition lock.
+                    if self.client is not client or generation != self._generation:
+                        continue
                     self.client = None
-                self._invalidate_playlist_window()
-                self.last_error = (
-                    "VLC is unavailable or playlist synchronization failed — press r to retry"
-                )
-                self.status = VLCStatus("unavailable")
-                try:
-                    await client.close()
-                except (VLCError, OSError, RuntimeError):
-                    pass
+                    self._generation += 1
+                    self._invalidate_playlist_window()
+                    self.last_error = "VLC is unavailable — play again to restart, or press r"
+                    self.status = VLCStatus("unavailable")
+                    try:
+                        await client.close()
+                    except (VLCError, OSError, RuntimeError):
+                        pass
                 break
             await asyncio.sleep(delay)
 

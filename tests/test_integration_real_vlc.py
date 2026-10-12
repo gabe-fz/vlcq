@@ -472,3 +472,58 @@ async def test_real_vlc_subtitle_enumeration_selection_and_off(tmp_path: Path) -
     finally:
         await controller.stop()
         database.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    os.environ.get("VLCQ_REAL_VLC") != "1",
+    reason="set VLCQ_REAL_VLC=1 for installed VLC 3 recovery test",
+)
+async def test_real_vlc_recovers_after_owned_process_quits(tmp_path: Path) -> None:
+    executable = Path("/Applications/VLC.app/Contents/MacOS/VLC")
+    if not executable.is_file():
+        pytest.skip("macOS VLC application is not installed")
+    media = tmp_path / "generated-recovery.mkv"
+    _write_generated_multitrack_mkv(media)
+    database = Database(tmp_path / "recovery.sqlite3")
+    queue = QueueService(database)
+    queue.open(tmp_path)
+    queue.add([media])
+    process = VLCProcess(executable)
+    controller = PlaybackController(queue, process=process)
+    try:
+        # Play is also the cold-start boundary; no explicit start required.
+        await controller.play_index(0)
+        first = process.process
+        assert first is not None
+        clients = await asyncio.gather(process.start(), process.start())
+        assert clients[0] is clients[1] is controller.client
+        assert process.process is first
+
+        # Simulate Quit without calling the controller's cleanup path.
+        first.terminate()
+        await asyncio.wait_for(first.wait(), 5)
+        await controller.play_with_policy(0, choice="start_over")
+        second = process.process
+        assert second is not None and second.pid != first.pid
+        assert first.returncode is not None
+        assert controller.client is not None
+        assert (await controller.client.status()).path == media.resolve()
+
+        # Also cover a quit that background polling has already noticed.
+        second.terminate()
+        await asyncio.wait_for(second.wait(), 5)
+        async with asyncio.timeout(10):
+            while controller.client is not None:
+                await asyncio.sleep(0.1)
+        assert process.process is second  # no unsolicited respawn
+        await controller.play_with_policy(0, choice="start_over")
+        third = process.process
+        assert third is not None and third.pid != second.pid
+        assert controller.status.state == "playing"
+        await controller.reconnect()
+        assert process.process is third
+    finally:
+        await controller.stop()
+        database.close()
+    assert process.process is None
