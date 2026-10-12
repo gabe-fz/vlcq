@@ -16,7 +16,6 @@ from vlcq.subtitles import (
     SubtitleTrack,
 )
 from vlcq.tui import (
-    ActionMenu,
     QueueTarget,
     SubtitlePicker,
     SubtitleSubitem,
@@ -202,12 +201,8 @@ async def test_preference_actions_are_reachable_with_empty_queue_and_persist(tmp
     db = Database(tmp_path / "state.sqlite3")
     app = VLCQApp(root=root, database=db, no_vlc=True)
     async with app.run_test(size=(80, 24)) as pilot:
-        await pilot.click("#queue-actions")
-        assert isinstance(app.screen, ActionMenu)
-        labels = {str(button.label) for button in app.screen.query(Button)}
-        assert "☐ Remember subtitles by show" in labels
-        assert "☑ Prefer English subtitles" in labels
-        remember = next(button for button in app.screen.query(Button) if "Remember subtitles" in str(button.label))
+        remember = app.query_one("#queue-extra-toggle-remember", Button)
+        assert remember.display
         await pilot.click(remember)
         await pilot.pause()
         assert db.remember_subtitles_by_show() is True

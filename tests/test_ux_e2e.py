@@ -28,6 +28,11 @@ async def test_mouse_workflow_at_compact_and_wide_sizes(tmp_path: Path, size: tu
     app = VLCQApp(root=root, database=db, no_vlc=True)
 
     async def choose_menu_action(pilot, selector: str, prefix: str) -> None:
+        direct = {"Clear queue": "#queue-clear-all", "Help": "#queue-extra-help", "Quit": "#queue-extra-quit"}.get(prefix)
+        if direct and app.query_one(direct, Button).display:
+            await pilot.click(direct)
+            await pilot.pause()
+            return
         await pilot.click(selector)
         await pilot.pause()
         app.refresh_playback()  # Polling while a menu is open must not retarget it.

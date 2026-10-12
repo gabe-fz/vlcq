@@ -626,7 +626,10 @@ class ConfirmDeleteWatched(ModalScreen[bool]):
     ConfirmDeleteWatched { align: center middle; }
     #delete-watched-dialog { width: 90%; height: 80%; padding: 1; background: $surface; border: solid $error; }
     #delete-watched-list { height: 1fr; }
-    #delete-watched-list Static { height: auto; }
+    #delete-watched-list > Vertical { height: auto; margin-bottom: 1; }
+    #delete-watched-list .delete-preview-row { width: auto; min-width: 100%; height: 1; }
+    #delete-watched-list .delete-path { height: auto; color: $text-muted; }
+    #delete-watched-list { overflow-x: auto; }
     """
 
     def __init__(self, paths: tuple[Path, ...]) -> None:
@@ -639,7 +642,18 @@ class ConfirmDeleteWatched(ModalScreen[bool]):
             yield Static("Entire current library, including subfolders. Subtitles and current playback are excluded.")
             with VerticalScroll(id="delete-watched-list"):
                 for path in self.paths:
-                    yield Static(str(path), markup=False)
+                    app = self.app
+                    assert isinstance(app, VLCQApp)
+                    history = app.database.history_for(path, root=app.root)
+                    with Vertical():
+                        with Horizontal(classes="delete-preview-row"):
+                            yield Label(render_filename(path.name), classes="row-label", markup=False)
+                            yield Static(app._subtitle_renderable(path), classes="subtitle-subitem", markup=False)
+                            yield HistoricalCoverage(
+                                history.coverage_percentage() if history else None,
+                                watched=history is not None and history.coverage_watched(app.watched_percent),
+                            )
+                        yield Static(str(path), classes="delete-path", markup=False)
             with Horizontal(classes="dialog-actions"):
                 yield Button("Cancel", id="delete-watched-cancel")
                 yield Button("Delete files", id="delete-watched-confirm", variant="error")
@@ -802,7 +816,7 @@ class VLCQApp(App[None], inherit_bindings=False):
     .section-name { width: auto; min-width: 7; height: 1; text-style: bold; }
     .section-title { width: auto; max-width: 30%; height: 1; padding: 0 1; color: $text-muted; overflow-x: hidden; }
     .section-body { height: 1fr; min-height: 1; }
-    .section.collapsed .section-body, .section.collapsed #files-delete-bar { display: none; }
+    .section.collapsed .section-body { display: none; }
     #browser, #queue { height: 1fr; min-height: 1; overflow-x: auto; overflow-y: auto; }
     #browser > ListItem, #queue > ListItem { width: auto; min-width: 100%; height: 1; min-height: 1; }
     .browser-row, .queue-row { width: 1fr; height: 1; min-height: 1; }
@@ -947,9 +961,8 @@ class VLCQApp(App[None], inherit_bindings=False):
                     yield CompactButton("Up", id="files-up", classes="responsive-action responsive-medium", tooltip="Move browsing focus to the parent folder")
                     yield CompactButton("Sort", id="files-sort", classes="responsive-action responsive-medium", tooltip="Reverse filename order")
                     yield CompactButton("Clear", id="files-clear-selection", classes="responsive-action responsive-wide", tooltip="Clear file selection")
-                    yield CompactButton("…", id="files-actions", tooltip="More Files actions")
-                with Horizontal(id="files-delete-bar", classes="section-header"):
                     yield CompactButton("Delete watched", id="files-delete-watched", variant="error", tooltip="Permanently delete watched videos in this library after confirmation")
+                    yield CompactButton("…", id="files-actions", tooltip="More Files actions")
                 with Vertical(id="files-body", classes="section-body"):
                     yield Static("No folders or playable videos here — use Files actions to open a root.", id="files-empty")
                     yield ListView(id="browser")
@@ -965,6 +978,8 @@ class VLCQApp(App[None], inherit_bindings=False):
                     yield CompactButton("Sort", id="queue-sort", classes="responsive-action responsive-medium", tooltip="Sort queue naturally")
                     yield CompactButton("Undo", id="queue-undo", classes="responsive-action responsive-medium", tooltip="Undo latest queue removal")
                     yield CompactButton("Clear all", id="queue-clear-all", classes="responsive-action responsive-wide", variant="error", tooltip="Clear every queue entry")
+                    for key, label in (("toggle-remember", "Remember subtitles"), ("toggle-prefer-english", "Prefer English"), ("reconnect", "Reconnect"), ("help", "Help"), ("quit", "Quit")):
+                        yield CompactButton(label, id=f"queue-extra-{key}")
                     yield CompactButton("…", id="queue-actions", tooltip="More Queue actions")
                 with Vertical(id="queue-body", classes="section-body"):
                     yield Static("Queue is empty — use Files actions to add a video.", id="queue-empty")
@@ -1032,20 +1047,33 @@ class VLCQApp(App[None], inherit_bindings=False):
         self._refresh_headers()
 
     def _refresh_responsive_controls(self) -> None:
-        """Promote actions without also duplicating them in an overflow menu."""
-        medium = self.size.width >= 100
-        wide = self.size.width >= 140
-        # Other responsive actions also depend on selection/queue state and
-        # are owned by _refresh_action_buttons. Showing them here and hiding
-        # them there invalidated the entire layout on every playback tick.
-        try:
-            self.query_one("#files-sort", Button).display = medium
-            self.query_one("#files-actions", Button).display = (
-                not medium or (not wide and bool(self.selected_paths))
-            )
-            self.query_one("#queue-actions", Button).display = True
-        except NoMatches:
-            pass
+        """Pack useful actions by their actual cell widths, reserving overflow."""
+        from rich.cells import cell_len
+
+        for section in ("files", "queue"):
+            try:
+                header = self.query_one(f"#{section}-header")
+                title = self.query_one(f"#{section}-title", Static)
+                available = self.size.width - 3 - 7 - min(
+                    cell_len(str(title.renderable)) + 2, int(self.size.width * .3)
+                ) - 3
+                hidden = False
+                for button in header.query(Button):
+                    if button.id in {f"{section}-toggle", f"{section}-actions"}:
+                        continue
+                    useful = not button.disabled or button.id in {
+                        "files-add", "queue-remove", "queue-up", "queue-down"
+                    }
+                    width = max(5, cell_len(str(button.label)) + 4)
+                    visible = useful and width <= available
+                    button.display = visible
+                    if visible:
+                        available -= width
+                    elif useful:
+                        hidden = True
+                self.query_one(f"#{section}-actions", Button).display = hidden or section == "queue"
+            except NoMatches:
+                pass
 
     @staticmethod
     def _subtitle_ancestor(widget: Widget | None) -> SubtitleSubitem | None:
@@ -1217,25 +1245,25 @@ class VLCQApp(App[None], inherit_bindings=False):
             )
             for entry in self.queue.entries()
         )
-        medium = self.size.width >= 100
-        wide = self.size.width >= 140
         files_add.disabled = not bool(self._paths_for_add())
-        files_up.display = medium and self.browser_path != self.root
         files_up.disabled = self.browser_path == self.root
-        files_clear_selection.display = wide and bool(self.selected_paths)
         files_clear_selection.disabled = not self.selected_paths
         selected_index = self._queue_index()
         queue_remove.disabled = selected_index is None
         queue_up.disabled = selected_index is None or selected_index == 0
         queue_down.disabled = selected_index is None or selected_index >= len(self.queue.entries()) - 1
-        queue_clear.display = clearable
         queue_clear.disabled = not clearable
-        queue_sort.display = medium and len(self.queue.entries()) > 1
-        queue_sort.disabled = not self.queue.entries()
-        queue_undo.display = medium and self.queue.undo_available
+        queue_sort.disabled = len(self.queue.entries()) < 2
         queue_undo.disabled = not self.queue.undo_available
-        queue_clear_all.display = wide and bool(self.queue.entries())
         queue_clear_all.disabled = not self.queue.entries()
+        self.query_one("#queue-extra-reconnect", Button).disabled = self.no_vlc
+        self.query_one("#queue-extra-toggle-remember", Button).label = (
+            "☑ " if self.database.remember_subtitles_by_show() else "☐ "
+        ) + "Remember subtitles"
+        self.query_one("#queue-extra-toggle-prefer-english", Button).label = (
+            "☑ " if self.database.prefer_english_subtitles() else "☐ "
+        ) + "Prefer English"
+        self._refresh_responsive_controls()
 
     def _refresh_headers(self) -> None:
         self._render_headers()
@@ -3099,15 +3127,20 @@ class VLCQApp(App[None], inherit_bindings=False):
 
     def _context_actions_for_files_section(self, target: SectionTarget) -> list[ContextAction]:
         """Return only useful Files actions that are not already visible."""
-        medium = self.size.width >= 100
-        wide = self.size.width >= 140
         actions: list[ContextAction] = []
-        if not medium:
-            if self.browser_path != self.root:
-                actions.append(ContextAction("parent", "Up", target))
-            actions.append(ContextAction("sort-files", "Reverse filename order", target))
-        if not wide and self.selected_paths:
-            actions.append(ContextAction("clear-selection", "Clear selection", target))
+        for button_id, key, label in (
+            ("files-open", "open-root", "Open"),
+            ("files-search", "search-filter", "Search"),
+            ("files-refresh", "refresh-files", "Refresh"),
+            ("files-add", "add", "Add"),
+            ("files-up", "parent", "Up"),
+            ("files-sort", "sort-files", "Reverse filename order"),
+            ("files-clear-selection", "clear-selection", "Clear selection"),
+            ("files-delete-watched", "delete-watched", "Delete watched"),
+        ):
+            button = self.query_one(f"#{button_id}", Button)
+            if not button.display and not button.disabled:
+                actions.append(ContextAction(key, label, target))
         return actions
 
     def _batch_label(self, verb: str) -> str:
@@ -3132,17 +3165,17 @@ class VLCQApp(App[None], inherit_bindings=False):
 
     def _context_actions_for_queue_section(self, target: SectionTarget) -> list[ContextAction]:
         """Return queue overflow plus selection-independent application actions."""
-        medium = self.size.width >= 100
-        wide = self.size.width >= 140
         actions: list[ContextAction] = []
         selected = self._context_queue_target()
         if selected is not None:
             actions.append(ContextAction("details-queue", "Details", selected))
-        if not medium and len(self.queue.entries()) > 1:
+        if not self.query_one("#queue-clear", Button).display and self._queue_has_clearable():
+            actions.append(ContextAction("clear-completed", "Clear watched", target))
+        if not self.query_one("#queue-sort", Button).display and len(self.queue.entries()) > 1:
             actions.append(ContextAction("sort-queue", "Sort naturally", target))
-        if not medium and self.queue.undo_available:
+        if not self.query_one("#queue-undo", Button).display and self.queue.undo_available:
             actions.append(ContextAction("undo", "Undo latest removal", target))
-        if not wide and self.queue.entries():
+        if not self.query_one("#queue-clear-all", Button).display and self.queue.entries():
             actions.append(ContextAction("clear-all", "Clear queue", target))
         remember = self.database.remember_subtitles_by_show()
         english = self.database.prefer_english_subtitles()
@@ -3165,7 +3198,9 @@ class VLCQApp(App[None], inherit_bindings=False):
         )
         if self._notice:
             actions.append(ContextAction("notice-details", "Last notice details", target))
-        return actions
+        return [action for action in actions if not (
+            (buttons := list(self.query(f"#queue-extra-{action.key}"))) and buttons[0].display
+        )]
 
     def _context_queue_target(self) -> QueueTarget | None:
         index = self._queue_index()
@@ -3404,6 +3439,12 @@ class VLCQApp(App[None], inherit_bindings=False):
             self._toggle_section("queue")
         elif key == "open-root":
             self.action_open_root()
+        elif key == "delete-watched":
+            self.action_delete_watched()
+        elif key == "refresh-files":
+            await self.action_refresh_files()
+        elif key == "add":
+            await self.action_add_selected()
         elif key == "parent":
             await self.action_parent()
         elif key == "search-filter":
@@ -3740,6 +3781,12 @@ class VLCQApp(App[None], inherit_bindings=False):
         event.stop()
         button = event.button
         button_id = button.id
+        if button_id and button_id.startswith("queue-extra-"):
+            await self._dispatch_context_action(ContextAction(
+                button_id.removeprefix("queue-extra-"), str(button.label),
+                SectionTarget("queue", self._root_generation),
+            ))
+            return
         if button.has_class("browser-check"):
             row = self._row_ancestor(button)
             if isinstance(row, BrowserListItem):

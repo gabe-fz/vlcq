@@ -300,10 +300,7 @@ async def test_tui_browse_select_add_and_parent_without_auto_enqueue(tmp_path: P
         assert app.browser_path == root.resolve()
         await pilot.click("#files-sort")
         assert app.browser_reverse is True
-        await pilot.click("#queue-actions")
-        await pilot.pause()
-        clear = next(button for button in app.screen.query(Button) if str(button.label) == "Clear queue")
-        await pilot.click(clear)
+        await pilot.click("#queue-clear-all")
         await pilot.press("y")
         assert app.queue.entries() == []
     db.close()

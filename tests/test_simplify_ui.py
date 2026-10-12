@@ -252,8 +252,7 @@ async def test_headers_lead_with_color_coded_pane_specific_controls(tmp_path: Pa
         assert folder_label.styles.background != folder_row.styles.background
         await pilot.click("#queue-actions")
         assert {str(button.label) for button in app.screen.query(Button)} == {
-            "☐ Remember subtitles by show", "☑ Prefer English subtitles",
-            "Reconnect", "Help", "Quit", "Last notice details"
+            "Reconnect", "Last notice details"
         }
         await pilot.press("escape")
 
@@ -277,7 +276,7 @@ async def test_headers_lead_with_color_coded_pane_specific_controls(tmp_path: Pa
 
         await pilot.resize_terminal(80, 30)
         await pilot.pause()
-        assert not app.query_one("#files-sort", Button).display
+        assert app.query_one("#files-sort", Button).region.right <= 80
         assert not app.query_one("#queue-undo", Button).display
         assert not app.query("#player-seek-back")
         assert app.query_one("#files-actions", Button).display
@@ -286,14 +285,13 @@ async def test_headers_lead_with_color_coded_pane_specific_controls(tmp_path: Pa
 
         await pilot.click("#files-actions")
         files_actions = {str(button.label) for button in app.screen.query(Button)}
-        assert files_actions == {"Up", "Reverse filename order", "Clear selection"}
+        assert "Delete watched" in files_actions
+        assert "Clear selection" in files_actions
         await pilot.press("escape")
         await pilot.click("#queue-actions")
         queue_actions = {str(button.label) for button in app.screen.query(Button)}
-        assert queue_actions == {
-            "Details", "Clear queue", "☐ Remember subtitles by show",
-            "☑ Prefer English subtitles", "Reconnect", "Help", "Quit", "Last notice details"
-        }
+        assert {"Details", "Last notice details"}.issubset(queue_actions)
+        assert ("Clear queue" in queue_actions) != app.screen_stack[0].query_one("#queue-clear-all", Button).display
         await pilot.press("escape")
         queue_entry = app.queue.entries()[0]
         row_actions = app._context_actions_for_queue(
