@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import re
 import secrets
 import shutil
 import socket
+import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -518,12 +520,26 @@ class VLCProcess:
         if not Path(self.executable).is_file():
             raise VLCError("VLC executable not found; install VLC 3 or configure its path")
         try:
-            lock_fd = self._acquire_instance_lock()
+            # A crashed controller's supervisor may still be reaping VLC.
+            deadline = asyncio.get_running_loop().time() + 2
+            while True:
+                try:
+                    lock_fd = self._acquire_instance_lock()
+                    break
+                except VLCError:
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise
+                    await asyncio.sleep(0.1)
             await self._validate_version()
             self.port = self._free_port()
             self.password = secrets.token_urlsafe(32)
             self.process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                str(Path(__file__).with_name("supervisor.py")),
+                str(os.getpid()),
+                str(lock_fd),
                 *self.launch_arguments(),
+                start_new_session=True,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
                 pass_fds=(lock_fd,),

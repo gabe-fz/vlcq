@@ -5,6 +5,13 @@ dedicated VLC 3 process. It browses a root-confined library without modifying me
 keeps VLC's ephemeral playlist to the current item plus at most one authorized
 successor, and stores private queue and playback state in SQLite.
 
+VLC runs under a private lifetime supervisor. If vlcq crashes or is forcibly
+terminated, the supervisor stops its own VLC child (forcefully after one second
+if necessary). Startup allows two seconds for this cleanup to release the
+instance lock. Unrelated VLC players are never targeted. This protection applies
+to newly launched players; it cannot recover an orphan from an older installation
+or a supervisor that was itself forcibly killed. Do not delete a held lock file.
+
 ## Install and run
 
 Requires Python 3.12+, FFmpeg `ffprobe`, and VLC 3 at `/Applications/VLC.app` or as `vlc` on `PATH`.
