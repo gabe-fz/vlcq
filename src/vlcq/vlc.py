@@ -398,9 +398,13 @@ class VLCClient:
     async def remove(self, playlist_id: str | int) -> VLCStatus:
         return await self.command("pl_delete", id=self._validated_playlist_id(playlist_id))
 
+    async def clear_playlist(self) -> VLCStatus:
+        """Clear VLC's ephemeral playlist in one operation."""
+        return await self.command("pl_empty")
+
     async def replace_playlist(self, path: Path) -> VLCStatus:
         """Clear VLC's ephemeral playlist and start one validated local item."""
-        await self.command("pl_empty")
+        await self.clear_playlist()
         return await self.play(path)
 
     # Short aliases make the typed operations convenient for small controller

@@ -48,6 +48,7 @@ class PlaylistFakeClient(FakeClient):
         self._next_id = 100
         self.removed: list[str] = []
         self.enqueued: list[Path] = []
+        self.cleared = 0
 
     async def replace_playlist(self, path: Path) -> VLCStatus:
         self.playlist_items = [VLCPlaylistItem(str(self._next_id), path.resolve())]
@@ -57,6 +58,11 @@ class PlaylistFakeClient(FakeClient):
 
     async def playlist(self) -> list[VLCPlaylistItem]:
         return list(self.playlist_items)
+
+    async def clear_playlist(self) -> VLCStatus:
+        self.cleared += 1
+        self.playlist_items.clear()
+        return VLCStatus("stopped")
 
     async def enqueue(self, path: Path) -> VLCStatus:
         item = VLCPlaylistItem(str(self._next_id), path.resolve())
@@ -253,6 +259,14 @@ async def test_playlist_window_is_bounded_and_refreshes_successor_without_replay
     await controller.synchronize_playlist()
     assert [item.path for item in client.playlist_items] == [videos[0].resolve()]
     assert controller.staged_vlc_id is None
+
+    removed_before_clear = list(client.removed)
+    queue.clear_all(stop_confirmed=True)
+    await controller.synchronize_playlist()
+    assert client.playlist_items == []
+    assert client.cleared == 1
+    assert client.removed == removed_before_clear
+    assert controller.status.state == "stopped"
     db.close()
 
 

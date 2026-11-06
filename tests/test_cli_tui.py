@@ -307,6 +307,30 @@ async def test_tui_browse_select_add_and_parent_without_auto_enqueue(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_tui_clear_all_reports_vlc_playlist_cleanup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "show"
+    root.mkdir()
+    video = root / "episode.mkv"
+    video.write_bytes(b"video")
+    db = Database(tmp_path / "db.sqlite3")
+    app = VLCQApp(root=root, database=db, no_vlc=True)
+    app.queue.add([video])
+
+    async def failed_sync() -> bool:
+        return False
+
+    monkeypatch.setattr(app, "_notify_queue_mutation", failed_sync)
+    async with app.run_test(size=(100, 30)):
+        await app._perform_clear_all()
+        assert app.queue.entries() == []
+        assert "VLC could not clear its playlist" in app._notice
+        assert "Queue cleared" in app._notice
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_tui_queue_mutation_routes_notify_playlist_synchronization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

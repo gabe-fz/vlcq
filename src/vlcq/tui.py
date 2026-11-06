@@ -2943,12 +2943,17 @@ class VLCQApp(App[None], inherit_bindings=False):
                 self.update_status("Clear blocked: VLC stop could not be confirmed")
                 return
             await self._run_database_operation(lambda: self.queue.clear_all(stop_confirmed=True))
-            await self._notify_queue_mutation()
+            synchronized = await self._notify_queue_mutation()
         except (OSError, RuntimeError, ValueError) as exc:
             self.update_status(f"Clear failed: {exc}")
             return
         self.refresh_queue()
-        self.update_status("Queue cleared; media files were not changed · Undo available")
+        if synchronized:
+            self.update_status("Queue cleared; media files were not changed · Undo available")
+        else:
+            self.update_status(
+                "Queue cleared, but VLC could not clear its playlist — press r to retry"
+            )
 
     def action_clear_all(self) -> None:
         if not self.queue.entries():

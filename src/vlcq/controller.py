@@ -287,24 +287,52 @@ class PlaybackController:
             and signature == self._window_signature
         ):
             return
+        client = self.client
+        if client is None:
+            raise VLCError("VLC is not connected")
+        if current is None:
+            clear_playlist = getattr(client, "clear_playlist", None)
+            if callable(clear_playlist):
+                cleared = await clear_playlist()
+            else:
+                command = getattr(client, "command", None)
+                if callable(command):
+                    cleared = await command("pl_empty")
+                else:
+                    items = await self._playlist_items()
+                    remove = getattr(client, "remove", None)
+                    if items is None or not callable(remove):
+                        raise VLCError("VLC playlist controls are unavailable")
+                    for item in items:
+                        await remove(item.playlist_id)
+                    cleared = None
+            self._invalidate_playlist_window()
+            if isinstance(cleared, VLCStatus):
+                self.status = VLCStatus(
+                    "stopped", cleared.position_ms, cleared.duration_ms
+                )
+            else:
+                self.status = VLCStatus("stopped")
+            self._last_valid_status = self.status
+            self._window_signature = signature
+            self._playlist_sync_invalidated = False
+            self.last_error = None
+            return
+
         items = await self._playlist_items()
         if items is None:
             self._window_signature = signature
             self._playlist_sync_invalidated = False
             self.last_error = None
             self.active_vlc_id = self.status.playlist_id
-            self._active_queue_id = current.id if current is not None else None
+            self._active_queue_id = current.id
             self.staged_queue_id = successor.id if successor is not None else None
             self.staged_path = successor.path if successor is not None else None
             self.staged_vlc_id = None
             return
 
-        client = self.client
-        if client is None:
-            raise VLCError("VLC is not connected")
         if (
-            current is not None
-            and not items
+            not items
             and self.active_vlc_id is None
             and self.status.state == "stopped"
             and self.status.path is None
