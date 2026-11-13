@@ -3138,14 +3138,7 @@ class VLCQApp(App[None], inherit_bindings=False):
         return verb + suffix + ")"
 
     def _queue_has_clearable(self) -> bool:
-        return any(
-            entry.state == "completed"
-            or (
-                (history := self.history.get(entry.path)) is not None
-                and history.coverage_watched(self.watched_percent)
-            )
-            for entry in self.queue.entries()
-        )
+        return bool(self.queue.clearable_entries())
 
     def _context_actions_for_queue_section(self, target: SectionTarget) -> list[ContextAction]:
         """Return queue overflow plus selection-independent application actions."""
@@ -3737,8 +3730,10 @@ class VLCQApp(App[None], inherit_bindings=False):
             async def clear() -> None:
                 try:
                     current = self.queue.current()
+                    clearable_ids = {entry.id for entry in self.queue.clearable_entries()}
                     if (
                         current is not None
+                        and current.id in clearable_ids
                         and current.state in {"playing", "paused"}
                         and not self.no_vlc
                         and not await self.controller.stop_playback()
@@ -3751,9 +3746,14 @@ class VLCQApp(App[None], inherit_bindings=False):
                 except (OSError, RuntimeError, ValueError) as exc:
                     self.update_status(f"Clear failed: {exc}")
                     return
-                await self._notify_queue_mutation()
+                synchronized = await self._notify_queue_mutation()
                 self.refresh_queue()
-                self.update_status("Completed queue entries cleared · Undo available")
+                if synchronized:
+                    self.update_status("Watched/completed queue entries cleared · Undo available")
+                else:
+                    self.update_status(
+                        "Watched/completed entries cleared, but VLC playlist synchronization failed — press r to retry"
+                    )
 
             self.run_worker(clear(), exclusive=True)
 

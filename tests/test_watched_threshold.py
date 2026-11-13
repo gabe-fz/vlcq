@@ -1,4 +1,5 @@
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from textual.widgets import Button
@@ -33,4 +34,37 @@ async def test_clear_watched_button_uses_eighty_percent_boundary(tmp_path: Path)
         assert [entry.path for entry in app.queue.entries()] == [paths[0], paths[3]]
         assert all(path.exists() for path in paths)
         assert database.history_for(paths[1], root=root).coverage_watched()
+    database.close()
+
+
+@pytest.mark.asyncio
+async def test_clear_watched_keeps_unwatched_playback_running(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    watched = root / "watched.mkv"
+    playing = root / "playing.mkv"
+    for path in (watched, playing):
+        path.write_bytes(b"video")
+    database = Database(tmp_path / "state.sqlite3")
+    database.merge_coverage(watched, [(0, 80_000)], 100_000)
+    app = VLCQApp(database=database, root=root, no_vlc=True)
+    app.queue.add([watched, playing])
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        index = next(i for i, entry in enumerate(app.queue.entries()) if entry.path == playing)
+        current = app.queue.play_now(index)
+        app.no_vlc = False
+        stop = AsyncMock(return_value=False)
+        app.controller.stop_playback = stop
+        await pilot.click("#queue-clear")
+        await pilot.click("#clear-confirm")
+        await pilot.pause()
+        stop.assert_not_awaited()
+        assert [entry.path for entry in app.queue.entries()] == [playing]
+        assert app.queue.current().id == current.id
+        assert app.queue.current().state == "playing"
+        assert watched.exists()
+        assert app.queue.undo()
+        assert {entry.path for entry in app.queue.entries()} == {watched, playing}
+        app.no_vlc = True
     database.close()

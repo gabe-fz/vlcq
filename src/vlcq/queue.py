@@ -266,7 +266,8 @@ class QueueService:
         self._replace_undo(self._snapshot([entry]))
         self.database.remove_entries([entry.id])
 
-    def clear_completed(self, *, stop_confirmed: bool = False) -> None:
+    def clearable_entries(self) -> list[QueueEntry]:
+        """Resolve clear candidates from persisted coverage, not a UI snapshot."""
         selected = []
         for entry in self.entries():
             if entry.state == "completed":
@@ -275,6 +276,10 @@ class QueueService:
             history = self.database.history_for(entry.path, root=self.root)
             if history is not None and history.coverage_watched(self.watched_percent):
                 selected.append(entry)
+        return selected
+
+    def clear_completed(self, *, stop_confirmed: bool = False) -> None:
+        selected = self.clearable_entries()
         if not selected:
             return
         current = self.current()
