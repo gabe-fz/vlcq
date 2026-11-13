@@ -912,6 +912,7 @@ class VLCQApp(App[None], inherit_bindings=False):
         self._recursive_cancel: threading.Event | None = None
         self._search_loading = False
         self.selected_paths: set[Path] = set()
+        self._browser_selection_anchor: Path | None = None
         self._browser_highlight_path: Path | None = None
         self.history: dict[Path, HistoryProjection] = {}
         self._history_cache: dict[
@@ -1120,6 +1121,22 @@ class VLCQApp(App[None], inherit_bindings=False):
                     return
                 if row in browser.children:
                     browser.index = list(browser.children).index(row)
+                if (
+                    event.button == 1
+                    and not row.is_dir
+                    and not (isinstance(widget, Button) and widget.has_class("browser-check"))
+                    and (event.shift or event.ctrl or event.meta)
+                ):
+                    event.stop()
+                    if event.shift:
+                        self._select_browser_range(row.path)
+                    else:
+                        self._toggle_browser_selection(row.path)
+                    return
+                if event.button == 1 and not row.is_dir:
+                    # A plain click remains highlight-only but establishes the
+                    # anchor used by a subsequent Shift-click range selection.
+                    self._browser_selection_anchor = row.path
                 if event.button == 3:
                     event.stop()
                     self._open_row_menu(row, event.screen_x, event.screen_y)
@@ -2596,6 +2613,36 @@ class VLCQApp(App[None], inherit_bindings=False):
             return
         self.update_status("At root" if self.browser_path == self.root else "Browsing")
 
+    def _toggle_browser_selection(self, path: Path) -> None:
+        """Toggle one visible video and make it the next mouse-range anchor."""
+        self._browser_selection_anchor = path
+        if path in self.selected_paths:
+            self.selected_paths.remove(path)
+            self.update_status(f"Deselected {path.name}")
+        else:
+            self.selected_paths.add(path)
+            self.update_status(f"Selected {path.name} ({len(self.selected_paths)} total)")
+        self._render_browser_rows()
+
+    def _select_browser_range(self, path: Path) -> None:
+        """Add the visible video rows between the selection anchor and target."""
+        visible_paths = [
+            entry.path
+            for entry in self.browser_entries
+            if entry.supported and not entry.is_dir
+        ]
+        anchor = self._browser_selection_anchor
+        if anchor not in visible_paths or path not in visible_paths:
+            self._browser_selection_anchor = path
+            self.selected_paths.add(path)
+            self._render_browser_rows()
+            self.update_status(f"Selected {path.name} ({len(self.selected_paths)} total)")
+            return
+        first, last = sorted((visible_paths.index(anchor), visible_paths.index(path)))
+        self.selected_paths.update(visible_paths[first : last + 1])
+        self._render_browser_rows()
+        self.update_status(f"Selected range ({len(self.selected_paths)} total)")
+
     async def action_select(self) -> None:
         if not self._browser_has_focus():
             self.update_status("Select is available in the Files section")
@@ -2604,6 +2651,7 @@ class VLCQApp(App[None], inherit_bindings=False):
         if entry is None:
             self.update_status("Nothing is highlighted to select")
         elif entry.supported:
+            self._browser_selection_anchor = entry.path
             if entry.path in self.selected_paths:
                 self.selected_paths.remove(entry.path)
                 self.update_status(f"Deselected {entry.path.name}")
@@ -2624,6 +2672,7 @@ class VLCQApp(App[None], inherit_bindings=False):
                 None,
             )
             if child is not None:
+                self._browser_selection_anchor = child.path
                 if child.path in self.selected_paths:
                     self.selected_paths.remove(child.path)
                     self.update_status(f"Deselected {child.name}")
@@ -2648,6 +2697,7 @@ class VLCQApp(App[None], inherit_bindings=False):
             return
         await self._notify_queue_mutation()
         self.selected_paths.clear()
+        self._browser_selection_anchor = None
         await self.refresh_browser()
         self.refresh_queue()
         self.update_status(f"Added {len(paths)} video{'s' if len(paths) != 1 else ''} to queue")
@@ -2664,12 +2714,14 @@ class VLCQApp(App[None], inherit_bindings=False):
             return
         await self._notify_queue_mutation()
         self.selected_paths.clear()
+        self._browser_selection_anchor = None
         await self.refresh_browser()
         self.refresh_queue()
         self.update_status(f"Placed {len(paths)} video{'s' if len(paths) != 1 else ''} next")
 
     async def action_clear_selection(self) -> None:
         self.selected_paths.clear()
+        self._browser_selection_anchor = None
         self._render_browser_rows()
         self.update_status("Selection cleared")
 
@@ -2700,6 +2752,7 @@ class VLCQApp(App[None], inherit_bindings=False):
             self.refresh_queue()
             return
         self.selected_paths.clear()
+        self._browser_selection_anchor = None
         await self.refresh_browser()
         self.refresh_queue()
         self.update_status(f"Playing {target.name}")
@@ -2749,6 +2802,7 @@ class VLCQApp(App[None], inherit_bindings=False):
                 self._recursive_cancel.set()
             self._recursive_task.cancel()
         self.selected_paths.clear()
+        self._browser_selection_anchor = None
         self._browser_highlight_path = None
         try:
             self.query_one("#browser", ListView).index = None
@@ -3456,11 +3510,7 @@ class VLCQApp(App[None], inherit_bindings=False):
             else:
                 await self._activate_browser_video(browser_entry, choice=choice)
         elif key == "select-file" and isinstance(target, FileTarget):
-            if target.path in self.selected_paths:
-                self.selected_paths.remove(target.path)
-            else:
-                self.selected_paths.add(target.path)
-            self._render_browser_rows()
+            self._toggle_browser_selection(target.path)
         elif key == "clear-selection":
             await self.action_clear_selection()
         elif key == "subtitle-file" and isinstance(target, FileTarget):

@@ -758,6 +758,49 @@ async def test_tui_video_and_queue_row_clicks_only_highlight(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_tui_mouse_modifier_clicks_select_video_ranges_without_playback(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "show"
+    root.mkdir()
+    for index in range(1, 5):
+        (root / f"episode{index}.mkv").write_bytes(str(index).encode())
+    db = Database(tmp_path / "db.sqlite3")
+    app = VLCQApp(root=root, database=db, no_vlc=True)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        browser = app.query_one("#browser", ListView)
+        rows = {row.path: row for row in browser.children}
+        paths = list(rows)
+        first_label = rows[paths[0]].query_one(".row-label", Label)
+        last_label = rows[paths[-1]].query_one(".row-label", Label)
+
+        # A regular row click is highlight-only, but it anchors Shift selection.
+        await pilot.click(first_label)
+        assert not app.selected_paths
+        await pilot.click(last_label, shift=True)
+        await pilot.pause()
+        assert app.selected_paths == set(paths)
+        assert app.queue.current() is None
+
+        # Control/Command-click toggles one row without clearing the range.
+        second_label = rows[paths[1]].query_one(".row-label", Label)
+        await pilot.click(second_label, control=True)
+        assert app.selected_paths == set(paths) - {paths[1]}
+        await pilot.click(second_label, meta=True)
+        assert app.selected_paths == set(paths)
+
+        # A hidden anchor falls back to adding just the clicked row, not toggling it off.
+        app._browser_selection_anchor = root / "filtered-out.mkv"
+        app.selected_paths = {paths[-1]}
+        await pilot.click(last_label, shift=True)
+        assert app.selected_paths == {paths[-1]}
+        assert "1 selected" in str(app.query_one("#files-title", Static).renderable)
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_tui_queue_highlight_persists_by_entry_identity_and_clears_on_removal(
     tmp_path: Path,
 ) -> None:
