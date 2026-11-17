@@ -356,7 +356,7 @@ async def test_tui_queue_mutation_routes_notify_playlist_synchronization(
         queue_view.focus()
         queue_view.index = 0
         monkeypatch.setattr(app, "_queue_has_focus", lambda: True)
-        monkeypatch.setattr(app, "_queue_index", lambda: 0)
+        monkeypatch.setattr(app, "_queue_index", lambda entries=None: 0)
         await app.action_move_down()
         await app.action_remove()
         await app.action_undo()

@@ -185,6 +185,11 @@ below the lists.
 | Right / Enter | Expand folder or play highlighted video |
 | Left / Backspace | Collapse/go to parent; Left seeks backward outside Files |
 | `v` | Toggle explicit video selection |
+| `Esc` | Clear the explicit selection (otherwise dismiss the notice) |
+| `/` | Search/filter Files |
+| `F5` | Refresh Files from disk |
+| `u` | Undo the last queue removal |
+| `R` / `S` | Resume / start over the highlighted video |
 | `a` / `A` | Add / add and play highlighted or explicitly selected videos |
 | `Space` | Play/pause |
 | `n` / `p` | Next/previous |

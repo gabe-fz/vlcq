@@ -291,7 +291,7 @@ class QueueListItem(ListItem):
             )
         )
         del current_id
-        self.set_classes("queue-selected" if selected_id == entry.id else "")
+        self.set_class(selected_id == entry.id, "queue-selected")
 
 
 class RootPrompt(ModalScreen[str | None]):
@@ -765,20 +765,26 @@ class NoticeDetailsPrompt(ModalScreen[None]):
             self.dismiss(None)
 
 
+HELP_TEXT = """\
+Browse   o open folder · ←/→ or Backspace collapse/expand · Enter play/open
+         / search & filter · F5 refresh files
+Select   v toggle · Cmd/Ctrl-click toggle · Shift-click range · Esc clear selection
+Queue    a add · A add & play · d remove · J/K move · u undo · r retry · c clear watched
+Play     Space pause · n/p next/previous · [ ] seek 10s · R resume · S start over
+Other    Shift+F10 actions menu · ? help · q or Ctrl+C quit
+
+VLC's own controls also work. Native Next is supported; native Previous and \
+arbitrary VLC playlist navigation are not.
+Click a row's subtitle badge to inspect or pick subtitles. Queue … holds \
+Reconnect, Help, Quit, and the Remember subtitles / Prefer English toggles."""
+
+
 class HelpPrompt(ModalScreen[None]):
     BINDINGS: ClassVar = [Binding("escape", "cancel", "Close")]
 
     def compose(self) -> ComposeResult:
         yield Static(
-            "Keys: o open · arrows/backspace browse · Enter play/open · v select · "
-            "a add · A add & play · Space pause · n/p next/previous · [ ] seek · "
-            "d remove · J/K reorder · r retry · c clear watched · ? help · Ctrl+C quit · Shift+F10 menu. "
-            "Use VLC's visible controls for ordinary transport, or vlcq keyboard shortcuts. "
-            "Native Next is supported; native Previous and arbitrary VLC playlist navigation are not. "
-            "Subtitles… is available on supported Files and Queue rows; inactive rows use bounded "
-            "offline ffprobe inspection, while current rows reconcile with VLC. Queue … contains the "
-            "Remember subtitles by show and Prefer English subtitles toggles. "
-            "Files and Queue headers expose frequent mouse actions; use Queue … for Help, reconnect, and Quit.",
+            HELP_TEXT,
             classes="help-content",
             markup=False,
         )
@@ -845,6 +851,7 @@ class VLCQApp(App[None], inherit_bindings=False):
     }
     .dialog-title, .details-content, .help-content { width: 80%; max-height: 12; padding: 1; background: $surface; border: solid $accent; }
     .details-content, .help-content { height: auto; overflow-y: auto; }
+    .help-content { max-height: 80%; }
     #subtitle-picker-list { width: 80%; max-height: 12; padding: 0; background: $surface; border: solid $accent; overflow-y: auto; }
     .subtitle-choice { width: 1fr; min-width: 20; height: 1; min-height: 1; margin: 0; padding: 0 1; border: none; content-align: left middle; }
     SubtitlePicker, SubtitleLoading { align: center middle; }
@@ -874,6 +881,9 @@ class VLCQApp(App[None], inherit_bindings=False):
         Binding("S", "start_over_highlighted", "Start over", show=False),
         Binding("c", "clear_completed", "Clear watched"),
         Binding("shift+f10", "context_menu", "Actions"),
+        Binding("slash", "search_filter", "Search", show=False),
+        Binding("f5", "refresh_files", "Refresh", show=False),
+        Binding("escape", "escape", "Clear selection", show=False),
         Binding("?", "help", "Help"),
         Binding("ctrl+c", "quit_app", "Quit"),
         Binding("q", "quit_app", "Quit"),
@@ -1210,8 +1220,9 @@ class VLCQApp(App[None], inherit_bindings=False):
                     self.database.set_selected(None)
         self._refresh_headers()
 
-    def _render_headers(self) -> None:
-        self._refresh_responsive_controls()
+    def _render_headers(self, queue_entries: list[QueueEntry] | None = None) -> None:
+        if queue_entries is None:
+            queue_entries = self.queue.entries()
         visible_selected = sum(1 for entry in self.browser_entries if entry.path in self.selected_paths)
         hidden_selected = len(self.selected_paths) - visible_selected
         selection = ""
@@ -1230,16 +1241,16 @@ class VLCQApp(App[None], inherit_bindings=False):
         # header width repeating it. The root and selection/filter metadata
         # follow the Files controls, where they can yield space first.
         title = f"{self.root.name}{selection}"
-        queue_count = len(self.queue.entries())
+        queue_count = len(queue_entries)
         queue_title = f"{queue_count} entr{'y' if queue_count == 1 else 'ies'}"
         try:
             _update_if_changed(self.query_one("#files-title", Static), title)
             _update_if_changed(self.query_one("#queue-title", Static), queue_title)
-            self._refresh_action_buttons()
+            self._refresh_action_buttons(queue_entries)
         except NoMatches:
             pass
 
-    def _refresh_action_buttons(self) -> None:
+    def _refresh_action_buttons(self, queue_entries: list[QueueEntry] | None = None) -> None:
         """Keep direct controls aligned with the same targeting predicates."""
         try:
             files_add = self.query_one("#files-add", Button)
@@ -1254,25 +1265,26 @@ class VLCQApp(App[None], inherit_bindings=False):
             queue_clear_all = self.query_one("#queue-clear-all", Button)
         except NoMatches:
             return
+        entries = self.queue.entries() if queue_entries is None else queue_entries
         clearable = any(
             entry.state == "completed"
             or (
                 (history := self.history.get(entry.path)) is not None
                 and history.coverage_watched(self.watched_percent)
             )
-            for entry in self.queue.entries()
+            for entry in entries
         )
         files_add.disabled = not bool(self._paths_for_add())
         files_up.disabled = self.browser_path == self.root
         files_clear_selection.disabled = not self.selected_paths
-        selected_index = self._queue_index()
+        selected_index = self._queue_index(entries)
         queue_remove.disabled = selected_index is None
         queue_up.disabled = selected_index is None or selected_index == 0
-        queue_down.disabled = selected_index is None or selected_index >= len(self.queue.entries()) - 1
+        queue_down.disabled = selected_index is None or selected_index >= len(entries) - 1
         queue_clear.disabled = not clearable
-        queue_sort.disabled = len(self.queue.entries()) < 2
+        queue_sort.disabled = len(entries) < 2
         queue_undo.disabled = not self.queue.undo_available
-        queue_clear_all.disabled = not self.queue.entries()
+        queue_clear_all.disabled = not entries
         self.query_one("#queue-extra-reconnect", Button).disabled = self.no_vlc
         self.query_one("#queue-extra-toggle-remember", Button).label = (
             "☑ " if self.database.remember_subtitles_by_show() else "☐ "
@@ -2147,7 +2159,9 @@ class VLCQApp(App[None], inherit_bindings=False):
         current_id: int | None,
         selected_id: int | None,
     ) -> None:
-        row.set_classes("queue-selected" if selected_id == entry.id else "")
+        # ``set_class`` is a no-op when nothing changed, and unlike
+        # ``set_classes`` it preserves ListView's own ``-highlight`` class.
+        row.set_class(selected_id == entry.id, "queue-selected")
         try:
             _update_if_changed(
                 row.query_one(".row-label", Label),
@@ -2163,14 +2177,21 @@ class VLCQApp(App[None], inherit_bindings=False):
         except NoMatches:
             pass
 
-    def _apply_queue_selection(self, selected_id: int | None) -> None:
+    def _apply_queue_selection(
+        self,
+        selected_id: int | None,
+        entries_list: list[QueueEntry] | None = None,
+        current_id: int | None = None,
+    ) -> None:
         """Keep the durable queue highlight visible even while Files has focus."""
         try:
             view = self.query_one("#queue", ListView)
         except NoMatches:
             return
-        entries = {entry.id: entry for entry in self.queue.entries()}
-        current_id = self.database.get_current_id()
+        if entries_list is None:
+            entries_list = self.queue.entries()
+            current_id = self.database.get_current_id()
+        entries = {entry.id: entry for entry in entries_list}
         for row in view.children:
             if isinstance(row, QueueListItem) and (entry := entries.get(row.entry_id)) is not None:
                 self._update_queue_row(row, entry, current_id, selected_id)
@@ -2224,8 +2245,9 @@ class VLCQApp(App[None], inherit_bindings=False):
             expected_queue_ids=tuple(entry.id for entry in entries),
             force=True,
         )
-        current = self.queue.current()
-        current_id = current.id if current is not None else None
+        current_id = self.database.get_current_id()
+        if current_id not in entry_ids:
+            current_id = None
         empty = self.query_one("#queue-empty", Static)
         empty.display = not bool(entries)
         if not entries:
@@ -2238,15 +2260,12 @@ class VLCQApp(App[None], inherit_bindings=False):
         )
         self._restoring_queue_selection = True
         try:
-            if reuse_rows:
-                for row, entry in zip(rows, entries, strict=True):
-                    assert isinstance(row, QueueListItem)
-                    self._update_queue_row(
-                        row, entry, current_id, target_id if target_present else None
-                    )
-            else:
+            # Reused rows are refreshed once below, after the final selection
+            # identity is known.
+            if not reuse_rows:
                 view.clear()
                 for entry in entries:
+                    position_ms, duration_ms = self._queue_current_position(entry, current_id)
                     view.append(
                         QueueListItem(
                             entry,
@@ -2258,8 +2277,8 @@ class VLCQApp(App[None], inherit_bindings=False):
                             history_percentage=self._history_percentage(entry.path),
                             history_watched=self._history_watched(entry.path),
                             history_visible=self._history_visible(entry.path),
-                            current_position_ms=self._queue_current_position(entry, current_id)[0],
-                            current_duration_ms=self._queue_current_position(entry, current_id)[1],
+                            current_position_ms=position_ms,
+                            current_duration_ms=duration_ms,
                             subtitle_renderable=self._subtitle_renderable(entry.path),
                         )
                     )
@@ -2280,8 +2299,8 @@ class VLCQApp(App[None], inherit_bindings=False):
         finally:
             self._restoring_queue_selection = False
             self._queue_selection_invalidated = False
-        self._apply_queue_selection(self.database.get_selected_id())
-        self._render_headers()
+        self._apply_queue_selection(self.database.get_selected_id(), entries, current_id)
+        self._render_headers(entries)
 
     def refresh_playback(self) -> None:
         self._schedule_visible_subtitle_inspections()
@@ -2300,12 +2319,13 @@ class VLCQApp(App[None], inherit_bindings=False):
             return None
         return self.browser_entries[view.index]
 
-    def _queue_index(self) -> int | None:
+    def _queue_index(self, entries: list[QueueEntry] | None = None) -> int | None:
         try:
             view = self.query_one("#queue", ListView)
         except NoMatches:
             return None
-        entries = self.queue.entries()
+        if entries is None:
+            entries = self.queue.entries()
         if view.index is None or not 0 <= view.index < len(entries):
             return None
         return view.index
@@ -2724,6 +2744,13 @@ class VLCQApp(App[None], inherit_bindings=False):
         self._browser_selection_anchor = None
         self._render_browser_rows()
         self.update_status("Selection cleared")
+
+    async def action_escape(self) -> None:
+        """Esc clears a file selection first, then dismisses any notice."""
+        if self.selected_paths:
+            await self.action_clear_selection()
+        else:
+            self.dismiss_notice()
 
     async def action_undo(self) -> None:
         try:

@@ -54,3 +54,18 @@ Regression tests cover unchanged rows, sub-second progress, real progress
 changes, watched styling, base-style-only changes, and transient action
 visibility. The full suite passed (183 tests; four opt-in VLC integrations
 skipped), along with targeted Ruff and mypy checks.
+
+## Follow-up: queue rows (2026-11-17)
+
+With 30 queue entries and 100 files, the same harness measured 1.83 s of
+process CPU per 6 s idle. Each tick replaced every queue row's classes with
+`set_classes`, which re-applied the stylesheet to all rows even when nothing
+changed, refreshed each row twice, and called `QueueService.entries()` (one
+SQLite query plus a resolve/stat per entry) about 26 times.
+
+Rows now use `set_class`, which is a no-op when unchanged, are refreshed once,
+and a single `entries()` result is threaded through header and button updates.
+The same scenario measured 0.67 s (about 63% less), with 8 `entries()` calls
+per tick instead of 26. `set_classes` also stripped ListView's own `-highlight`
+class every second, so the focused Queue row lost its focus highlight; that is
+now preserved.
