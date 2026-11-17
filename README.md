@@ -134,7 +134,12 @@ and makes up to three attempts on failure, checking the connection before retryi
 restarting the owned process for the final attempt. Resume/start-over choices and the
 validated successor window are retained across retries. Quitting VLC manually leaves it
 closed until another playback action or Reconnect; playing again relaunches it without
-requiring Reconnect first. Unrelated VLC instances are never stopped. Quitting vlcq
+requiring Reconnect first. While the owned VLC process is still running, background
+status polling tolerates up to two consecutive missed replies (each bounded to two
+seconds), so a briefly busy or just-woken player is not dropped; if the process has
+exited, the loss is reported on the next poll. Errors unrelated to VLC while recording
+progress are shown as a notice and polling continues. A slow reply when pressing Space
+no longer reloads the current video. Unrelated VLC instances are never stopped. Quitting vlcq
 always stops its owned instance and never leaves it running.
 
 ### Subtitle selection and preferences

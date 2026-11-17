@@ -55,6 +55,17 @@ def _update_if_changed(widget: Static, content: str | Text) -> None:
     widget.update(content)
 
 
+# Errors a playback key can surface. Reporting them keeps the TUI (and the VLC
+# it supervises) alive; VLCError and PathError are Runtime/ValueError subclasses.
+_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
+    OSError,
+    RuntimeError,
+    IndexError,
+    ValueError,
+    sqlite3.Error,
+)
+
+
 def _file_identities(
     paths: list[Path], root: Path
 ) -> list[tuple[Path, FileIdentity | None]]:
@@ -2395,7 +2406,11 @@ class VLCQApp(App[None], inherit_bindings=False):
         # Symlinks can change between ticks; never reuse a resolution longer.
         self._canonical_memo.clear()
         self._schedule_visible_subtitle_inspections()
-        notice = self.controller.last_error or self.controller.subtitle_error
+        notice = (
+            self.controller.last_error
+            or self.controller.observation_error
+            or self.controller.subtitle_error
+        )
         if notice is not None and self._notice != notice:
             self.update_status(notice)
         self._refresh_browser_history()
@@ -2953,7 +2968,7 @@ class VLCQApp(App[None], inherit_bindings=False):
             else:
                 await self.controller.toggle_pause()
                 state = self.controller.status.state
-        except (OSError, VLCError) as exc:
+        except _TRANSPORT_ERRORS as exc:
             self.update_status(f"Pause/resume failed: {exc}")
         else:
             self.update_status("Paused" if state == "paused" else "Playing")
@@ -2966,7 +2981,7 @@ class VLCQApp(App[None], inherit_bindings=False):
             else:
                 await self.controller.next()
                 entry = self.queue.current()
-        except (IndexError, OSError, VLCError) as exc:
+        except _TRANSPORT_ERRORS as exc:
             self.update_status(f"Next failed: {exc}")
         else:
             self.update_status(f"Playing {entry.path.name}" if entry else "No next queue item")
@@ -2979,7 +2994,7 @@ class VLCQApp(App[None], inherit_bindings=False):
             else:
                 await self.controller.previous()
                 entry = self.queue.current()
-        except (IndexError, OSError, VLCError) as exc:
+        except _TRANSPORT_ERRORS as exc:
             self.update_status(f"Previous failed: {exc}")
         else:
             self.update_status(f"Playing {entry.path.name}" if entry else "Queue is empty")
@@ -3013,7 +3028,7 @@ class VLCQApp(App[None], inherit_bindings=False):
             return
         try:
             await self.controller.seek(seconds)
-        except (OSError, VLCError) as exc:
+        except _TRANSPORT_ERRORS as exc:
             self.update_status(f"Seek failed: {exc}")
 
     async def action_remove(self) -> None:

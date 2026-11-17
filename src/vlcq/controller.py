@@ -123,6 +123,14 @@ class PlaybackController:
         self.subtitle_retry_limit = 3
         self.observation_timeout = 0.75
         self.readiness_timeout = 3.0
+        # A live, owned VLC can miss a status reply while it opens media or is
+        # briefly busy; only consecutive failures retire the connection.
+        self.poll_timeout = 2.0
+        self.poll_failure_limit = 3
+        self.poll_retry_delay = 0.5
+        # Non-VLC failures while recording an observation (for example a
+        # briefly locked database) are reported without dropping VLC.
+        self.observation_error: str | None = None
 
     @property
     def playback_generation(self) -> int:
@@ -178,6 +186,11 @@ class PlaybackController:
         if self._poll_task is None or self._poll_task.done():
             self._poll_task = asyncio.create_task(self._poll())
 
+    def _owned_process_alive(self) -> bool:
+        """Whether the supervised VLC process is known to still be running."""
+        process = getattr(self.process, "process", None)
+        return process is not None and getattr(process, "returncode", 0) is None
+
     async def _current_is_loaded_locked(self, entry: QueueEntry) -> bool:
         """Persisted playing/paused state alone does not prove VLC is still alive."""
         client = self.client
@@ -188,7 +201,16 @@ class PlaybackController:
             return self.status.state in {"playing", "paused"}
         try:
             status = await asyncio.wait_for(method(), self.observation_timeout)
-        except (VLCError, OSError, RuntimeError, TimeoutError):
+        except TimeoutError:
+            # A slow reply from a live player is not proof the media is gone;
+            # concluding so would reload (and visibly restart) the video.
+            if not self._owned_process_alive():
+                return False
+            try:
+                status = await asyncio.wait_for(method(), self.readiness_timeout)
+            except (VLCError, OSError, RuntimeError):
+                return False
+        except (VLCError, OSError, RuntimeError):
             return False
         if status.state not in {"playing", "paused"} or not self._same_path(status.path, entry.path):
             return False
@@ -1754,6 +1776,7 @@ class PlaybackController:
 
     async def _poll(self) -> None:
         delay = 1.0
+        failures = 0
         while self._running and self.client:
             client = self.client
             try:
@@ -1767,7 +1790,7 @@ class PlaybackController:
                         continue
                     generation = self._generation
                     expected_path = self._current_expected_path()
-                    status = await client.status()
+                    status = await asyncio.wait_for(client.status(), self.poll_timeout)
                     await self._observe_locked(
                         status, generation=generation, expected_path=expected_path
                     )
@@ -1782,6 +1805,8 @@ class PlaybackController:
                         self.client = None
                         await client.close()
                         break
+                failures = 0
+                self.observation_error = None
                 delay = (
                     1.0
                     if status.state == "playing"
@@ -1790,6 +1815,11 @@ class PlaybackController:
                     else min(5.0, delay * 1.5)
                 )
             except (VLCError, OSError, RuntimeError, AttributeError):
+                failures += 1
+                if failures < self.poll_failure_limit and self._owned_process_alive():
+                    # Transient: keep the connection and try again shortly.
+                    await asyncio.sleep(self.poll_retry_delay)
+                    continue
                 async with self._transition_lock:
                     # A play/reconnect may have recovered while this failed
                     # poll was waiting to reacquire the transition lock.
@@ -1805,6 +1835,14 @@ class PlaybackController:
                     except (VLCError, OSError, RuntimeError):
                         pass
                 break
+            except Exception as exc:  # noqa: BLE001 - the poll task must survive
+                # Anything else (database contention, an unexpected value) is
+                # not a VLC failure. Losing the poll task here would silently
+                # stop progress tracking and auto-advance, so report and retry.
+                self.observation_error = (
+                    f"Playback tracking hiccup ({type(exc).__name__}); retrying"
+                )
+                delay = min(5.0, max(delay, 1.0) * 1.5)
             await asyncio.sleep(delay)
 
     async def stop_playback(self) -> bool:
