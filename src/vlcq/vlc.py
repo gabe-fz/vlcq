@@ -13,12 +13,13 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
+from urllib.parse import urlsplit
 
 import httpx
 
 from .ipc import ControllerBusy, ControllerLock
 from .models import VLCStatus
-from .paths import PathError, canonical_root, file_uri_to_path, is_beneath
+from .paths import MissingMediaError, PathError, canonical_root, file_uri_to_path, is_beneath
 from .subtitles import SIDECAR_EXTENSIONS, SubtitleError, SubtitleTrack
 from .subtitles import parse_subtitle_tracks as _parse_subtitle_tracks
 
@@ -122,8 +123,17 @@ def parse_playlist(payload: object) -> list[VLCPlaylistItem]:
         uri = node.get("uri")
         if not isinstance(uri, str) or not uri:
             raise VLCError("VLC returned malformed playlist entry")
+        if urlsplit(uri).scheme != "file":
+            # Streams and other non-file inputs the user opened in VLC can
+            # never be queue media; they surface as unidentified (foreign)
+            # playlist ids rather than making the whole playlist unreadable.
+            continue
         try:
             path = file_uri_to_path(uri)
+        except MissingMediaError:
+            # A deleted file is treated like any other item without a local
+            # identity; a deleted *current* item is then marked missing.
+            continue
         except PathError as exc:
             raise VLCError("VLC playlist contains unsafe media") from exc
         previous_path = by_id.get(playlist_id)

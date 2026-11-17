@@ -41,6 +41,10 @@ class PathError(ValueError):
     pass
 
 
+class MissingMediaError(PathError):
+    """A well-formed local file URI whose target no longer exists."""
+
+
 def natural_key(value: str) -> tuple[object, ...]:
     return tuple(int(part) if part.isdigit() else part.casefold() for part in _NUMBERS.split(value))
 
@@ -204,4 +208,4 @@ def file_uri_to_path(uri: str) -> Path:
     try:
         return Path(decoded).resolve(strict=True)
     except (OSError, RuntimeError) as exc:
-        raise PathError("file URI target does not exist") from exc
+        raise MissingMediaError("file URI target does not exist") from exc

@@ -2408,6 +2408,7 @@ class VLCQApp(App[None], inherit_bindings=False):
         self._schedule_visible_subtitle_inspections()
         notice = (
             self.controller.last_error
+            or self.controller.foreign_notice
             or self.controller.observation_error
             or self.controller.subtitle_error
         )

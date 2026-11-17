@@ -125,7 +125,13 @@ or clickable seek track. Queue progress is read-only.
 
 VLC's native **Next** is supported because vlcq stages and validates one authorized
 successor. Native Previous and arbitrary VLC playlist navigation are not supported;
-unexpected media fails closed instead of inheriting history. Reconnect creates no
+unexpected media fails closed instead of inheriting history: if VLC plays something
+outside the queue (a file or stream opened in VLC itself), vlcq keeps its connection,
+marks the queue item stopped, and pauses tracking and auto-advance without recording
+that media or removing it from VLC. Tracking resumes automatically when VLC returns to
+the queue item, or when you play a queue item from vlcq (Space resumes it at its saved
+position). Pressing Stop or clearing the playlist in VLC is an ordinary stop, not
+unexpected media; a stop at the natural end still completes the item and advances. Reconnect creates no
 duplicate process/poll loop and never selects, loads, or autoplays media. Only one
 vlcq-owned VLC instance can run per macOS user at a time, even with separate database
 paths or `VLCQ_HOME` overrides. Healthy instances are reused, and replacement waits

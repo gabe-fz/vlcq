@@ -131,6 +131,11 @@ class PlaybackController:
         # Non-VLC failures while recording an observation (for example a
         # briefly locked database) are reported without dropping VLC.
         self.observation_error: str | None = None
+        # Set while VLC plays something outside the vlcq window (for example
+        # a file the user opened in VLC). The connection is kept; tracking,
+        # history and auto-advance pause until a queue item plays again.
+        self.foreign_media = False
+        self.foreign_notice: str | None = None
 
     @property
     def playback_generation(self) -> int:
@@ -355,15 +360,16 @@ class PlaybackController:
 
         if (
             not items
-            and self.active_vlc_id is None
             and self.status.state == "stopped"
             and self.status.path is None
             and self.status.playlist_id is None
         ):
-            # A newly connected VLC instance is intentionally idle even when
-            # the database retains a current queue identity. Reconnect must not
-            # load or autoplay that item; an explicit play action will replace
-            # the empty playlist and establish fresh ephemeral identities.
+            # A newly connected VLC instance (or one whose playlist the user
+            # cleared) is intentionally idle even when the database retains a
+            # current queue identity. Reconnect must not load or autoplay that
+            # item; an explicit play action will replace the empty playlist and
+            # establish fresh ephemeral identities.
+            self.active_vlc_id = None
             self.staged_vlc_id = None
             self.staged_queue_id = None
             self.staged_path = None
@@ -442,6 +448,11 @@ class PlaybackController:
 
     async def synchronize_playlist(self, *, force: bool = False) -> None:
         async with self._transition_lock:
+            if self.foreign_media:
+                # Never remove the user's own VLC item; the window is rebuilt
+                # when a queue item plays again.
+                self._playlist_sync_invalidated = True
+                return
             await self._synchronize_playlist_window_locked(force=force)
 
     # Names used by integrations and mutation boundaries.
@@ -1140,6 +1151,8 @@ class PlaybackController:
                     force_reload=force_reload or attempt > 0,
                 )
                 self.last_error = None
+                self.foreign_media = False
+                self.foreign_notice = None
                 return
             except (VLCError, OSError, TimeoutError):
                 self._generation += 1
@@ -1642,6 +1655,43 @@ class PlaybackController:
             )
         return evidence.qualified
 
+    def _leave_foreign_media(self) -> None:
+        if self.foreign_media:
+            self.foreign_media = False
+            self.foreign_notice = None
+            # Restore the current-plus-successor window on the next sync.
+            self._playlist_sync_invalidated = True
+
+    async def _enter_foreign_media_locked(self, status: VLCStatus, current: QueueEntry) -> None:
+        """Pause tracking for media vlcq does not own, without dropping VLC.
+
+        Nothing about the foreign media is adopted or written to history, and
+        the user's VLC playlist item is left alone. VLC playlist identities are
+        kept so returning to the owned item in VLC resumes tracking.
+        """
+        self._reset_playback_evidence()
+        self._last_valid_status = None
+        self.status = VLCStatus(
+            status.state,
+            status.position_ms,
+            status.duration_ms,
+            None,
+            status.playlist_id,
+            status.rate,
+            status.request_started,
+            status.response_received,
+        )
+        if not self.foreign_media:
+            self.foreign_media = True
+            self.foreign_notice = (
+                "VLC is playing something outside the queue — tracking paused; "
+                "play a queue item (or Space) to resume"
+            )
+        if current.state in {"playing", "paused"}:
+            await self._run_database_operation(
+                lambda: self.queue.set_current_state(current.id, "stopped")
+            )
+
     async def _observe_locked(
         self,
         status: VLCStatus,
@@ -1657,6 +1707,7 @@ class PlaybackController:
         if status.state == "unavailable":
             return
         if self._status_matches_staged(status):
+            self._leave_foreign_media()
             if allow_advance:
                 await self._reconcile_staged_successor_locked(status, generation)
             return
@@ -1680,6 +1731,11 @@ class PlaybackController:
                     lambda: self.queue.set_current_state(current.id, "stopped")
                 )
             return
+        if status.state == "stopped" and status.path is None and status.playlist_id is None:
+            await self._observe_identity_free_stop_locked(
+                status, current, generation=generation, allow_advance=allow_advance
+            )
+            return
         path_matches = status.path is not None and self._same_path(status.path, current.path)
         identity_matches = (
             status.playlist_id is not None
@@ -1693,19 +1749,16 @@ class PlaybackController:
             and not identity_matches
         )
         if not (path_matches or identity_matches) or path_conflicts or identity_conflicts:
-            self.last_error = (
-                "VLC reported unexpected or unidentified media; "
-                "playback advancement is paused — press r to retry"
-            )
-            self._invalidate_playlist_window()
+            await self._enter_foreign_media_locked(status, current)
             return
         observed_path = status.path or expected_path or current.path
         if not self._same_path(observed_path, current.path):
-            self.last_error = (
-                "VLC reported unexpected media; playback advancement is paused — press r to retry"
-            )
-            self._invalidate_playlist_window()
+            await self._enter_foreign_media_locked(status, current)
             return
+        if self.foreign_media:
+            # Back on the owned item: continuity restarts from here.
+            self._leave_foreign_media()
+            self._reset_playback_evidence()
         if not current.path.is_file():
             await self._run_database_operation(
                 lambda: self.queue.set_current_state(current.id, "missing")
@@ -1758,6 +1811,46 @@ class PlaybackController:
             if allow_advance and (generation is None or generation == self._generation):
                 await self._next_locked(completed=True)
 
+    async def _observe_identity_free_stop_locked(
+        self,
+        status: VLCStatus,
+        current: QueueEntry,
+        *,
+        generation: int | None,
+        allow_advance: bool,
+    ) -> None:
+        """VLC stopped with nothing selected: Stop pressed, playlist cleared, or end.
+
+        This is not unexpected media. A stop that matches the natural end of
+        the observed item still completes it and advances; otherwise the item
+        simply becomes stopped and its resume point is kept.
+        """
+        self._leave_foreign_media()
+        previous_status = self._last_valid_status
+        if self._supports_natural_transition(previous_status, status):
+            assert previous_status is not None
+            self._near_end_seen = False
+            self._last_valid_status = None
+            await self._run_database_operation(
+                lambda: self.queue.update_progress(
+                    current.path,
+                    previous_status.position_ms,
+                    previous_status.duration_ms,
+                    completed=True,
+                    trustworthy=False,
+                )
+            )
+            if allow_advance and (generation is None or generation == self._generation):
+                await self._next_locked(completed=True)
+            return
+        self._reset_playback_evidence()
+        self._last_valid_status = None
+        self.status = status
+        if current.state in {"playing", "paused"}:
+            await self._run_database_operation(
+                lambda: self.queue.set_current_state(current.id, "stopped")
+            )
+
     async def _observe(
         self,
         status: VLCStatus,
@@ -1794,7 +1887,7 @@ class PlaybackController:
                     await self._observe_locked(
                         status, generation=generation, expected_path=expected_path
                     )
-                    if self.client is client and self.last_error is None:
+                    if self.client is client and self.last_error is None and not self.foreign_media:
                         await self._synchronize_playlist_window_locked()
                         if self.client is client and self.last_error is None:
                             await self._apply_automatic_subtitles_locked()
@@ -1899,6 +1992,8 @@ class PlaybackController:
                 await self.client.close()
             self.client = None
             self._invalidate_playlist_window()
+            self.foreign_media = False
+            self.foreign_notice = None
             self.queue.invalidate_undo()
             current = self.queue.current()
             if current is not None and current.state in {"playing", "paused"}:

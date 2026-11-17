@@ -340,6 +340,11 @@ The bottom player area SHALL use a bounded, slightly taller layout showing the a
 #### Scenario: Unexpected VLC media transition
 - **WHEN** VLC reports media other than the active item or its staged successor
 - **THEN** `vlcq` pauses automatic advancement, does not adopt that media, and does not write its observations to queue history
+- **AND** `vlcq` keeps the owned VLC connection, leaves the user's VLC item in place, and resumes tracking when VLC returns to the active item or a queue item is played
+
+#### Scenario: Stop or empty playlist in VLC
+- **WHEN** VLC reports a stopped state with no current item or media identity while an active item exists
+- **THEN** `vlcq` treats it as a stop of the active item (or its natural completion when timing matches the item's end), not as unexpected media, and does not drop the connection
 
 #### Scenario: Successor changes while playing
 - **WHEN** a queue mutation changes the item immediately after the active item

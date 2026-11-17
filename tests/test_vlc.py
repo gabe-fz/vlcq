@@ -381,7 +381,7 @@ def test_parse_playlist_validates_nested_leaf_identities(tmp_path: Path) -> None
     for malformed in (
         {"children": [{"type": "leaf", "uri": first.as_uri()}]},
         {"children": [{"id": "42", "type": "leaf"}]},
-        {"children": [{"id": "42", "type": "leaf", "uri": "https://example/video"}]},
+        {"children": [{"id": "42", "type": "leaf", "uri": "file:///tmp/a?q=1"}]},
         {"children": [
             {"id": "42", "uri": first.as_uri()},
             {"id": "42", "uri": second.as_uri()},
@@ -393,6 +393,19 @@ def test_parse_playlist_validates_nested_leaf_identities(tmp_path: Path) -> None
     ):
         with pytest.raises(VLCError):
             parse_playlist(malformed)
+
+
+def test_parse_playlist_skips_streams_and_deleted_files(tmp_path: Path) -> None:
+    kept = tmp_path / "kept.mkv"
+    kept.write_bytes(b"1")
+    payload = {"children": [
+        {"id": "41", "type": "leaf", "uri": "https://example/stream"},
+        {"id": "42", "type": "leaf", "uri": (tmp_path / "deleted.mkv").as_uri()},
+        {"id": "43", "type": "leaf", "uri": kept.as_uri()},
+    ]}
+    assert [(item.playlist_id, item.path) for item in parse_playlist(payload)] == [
+        ("43", kept.resolve())
+    ]
 
 
 @pytest.mark.asyncio

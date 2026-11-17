@@ -448,8 +448,12 @@ async def test_identity_free_observation_fails_closed_without_history_update(
 
     assert dict(db.progress_for(videos[0])) == before
     assert queue.current() is not None and queue.current().path == videos[0].resolve()
-    assert controller.last_error is not None
-    assert controller.active_vlc_id is None
+    # Unidentified media pauses tracking but keeps the connection and the
+    # owned VLC identity, so returning to that item resumes tracking.
+    assert controller.last_error is None
+    assert controller.foreign_media
+    assert controller.active_vlc_id is not None
+    assert queue.current().state == "stopped"
     db.close()
 
 
@@ -467,10 +471,23 @@ async def test_unexpected_media_is_not_adopted_or_written_to_history(tmp_path: P
 
     await controller._observe(VLCStatus("playing", path=unexpected.resolve()))
 
-    assert [(entry.id, entry.state) for entry in queue.entries()] == before
+    # Not adopted: same entries, current becomes stopped, no new media rows.
+    assert [entry.id for entry in queue.entries()] == [entry_id for entry_id, _ in before]
+    assert queue.current() is not None and queue.current().state == "stopped"
     assert db.connection.execute("SELECT COUNT(*) FROM media").fetchone()[0] == media_count
     assert client.played == [videos[0].resolve()]
-    assert controller.last_error is not None
+    assert controller.last_error is None
+    assert controller.foreign_media and controller.foreign_notice
+    assert controller.client is client
+    # Queue mutations must not touch the user's VLC item while it plays.
+    await controller.synchronize_playlist(force=True)
+    assert client.played == [videos[0].resolve()]
+    # VLC returning to the owned item resumes tracking.
+    owned = controller.active_vlc_id
+    await controller._observe(VLCStatus("playing", 2_000, 10_000, videos[0].resolve(), owned))
+    assert not controller.foreign_media and controller.foreign_notice is None
+    assert queue.current().state == "playing"
+    assert db.connection.execute("SELECT COUNT(*) FROM media").fetchone()[0] == media_count
     db.close()
 
 
@@ -968,4 +985,73 @@ def test_queue_reorder_remove_missing_and_clear(tmp_path: Path) -> None:
     queue.add([videos[0]])
     queue.clear_all()
     assert queue.entries() == []
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_pressed_in_vlc_is_a_stop_not_unexpected_media(tmp_path: Path) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    client = PlaylistFakeClient()
+    controller = PlaybackController(queue, process=FakeProcess())  # type: ignore[arg-type]
+    controller.client = client  # type: ignore[assignment]
+    await controller.play_index(0)
+    owned = controller.active_vlc_id
+    assert owned is not None
+    await controller._observe(observed_status("playing", 4_000, 60_000, videos[0], owned, 10.0))
+
+    # VLC's own Stop button: no current playlist id and no media identity.
+    await controller._observe(VLCStatus("stopped", 0, 0, None, None, 1.0, 11.0, 11.05))
+
+    current = queue.current()
+    assert current is not None and current.path == videos[0].resolve()
+    assert current.state == "stopped"
+    assert controller.last_error is None and not controller.foreign_media
+    assert controller.client is client
+    assert db.progress_for(videos[0])["resume_position_ms"] == 4_000
+    # Pressing Play in VLC afterwards resumes tracking on the same item.
+    await controller._observe(observed_status("playing", 4_500, 60_000, videos[0], owned, 12.0))
+    assert queue.current().state == "playing"
+    assert controller.last_error is None
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_at_natural_end_still_completes_and_advances(tmp_path: Path) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    client = PlaylistFakeClient()
+    controller = PlaybackController(queue, process=FakeProcess())  # type: ignore[arg-type]
+    controller.client = client  # type: ignore[assignment]
+    await controller.play_index(0)
+    owned = controller.active_vlc_id
+    assert owned is not None
+    await controller._observe(observed_status("playing", 59_500, 60_000, videos[0], owned, 10.0))
+    controller._near_end_seen = True  # qualification is covered elsewhere
+
+    await controller._observe(VLCStatus("stopped", 0, 0, None, None, 1.0, 10.5, 10.55))
+
+    assert db.progress_for(videos[0])["completion_observed"]
+    current = queue.current()
+    assert current is not None and current.path == videos[1].resolve()
+    assert client.played[-1] == videos[1].resolve()
+    assert controller.last_error is None
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_cleared_vlc_playlist_goes_idle_without_errors(tmp_path: Path) -> None:
+    db, queue, _videos = setup_queue(tmp_path)
+    client = PlaylistFakeClient()
+    controller = PlaybackController(queue, process=FakeProcess())  # type: ignore[arg-type]
+    controller.client = client  # type: ignore[assignment]
+    await controller.play_index(0)
+    played = list(client.played)
+    client.playlist_items.clear()  # user emptied VLC's playlist
+
+    await controller._observe(VLCStatus("stopped", 0, 0, None, None, 1.0, 11.0, 11.05))
+    await controller.synchronize_playlist(force=True)
+
+    assert controller.last_error is None
+    assert controller.active_vlc_id is None
+    assert client.played == played  # nothing was loaded or autoplayed
+    assert queue.current() is not None and queue.current().state == "stopped"
     db.close()
