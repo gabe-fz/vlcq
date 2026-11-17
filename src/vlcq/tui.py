@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any, ClassVar, Literal
 
 from rich.text import Text
@@ -51,6 +53,29 @@ def _update_if_changed(widget: Static, content: str | Text) -> None:
     elif isinstance(previous, str) and isinstance(content, str) and previous == content:
         return
     widget.update(content)
+
+
+def _file_identities(
+    paths: list[Path], root: Path
+) -> list[tuple[Path, FileIdentity | None]]:
+    """Canonicalize and validate a batch of paths in one worker-thread hop."""
+    results: list[tuple[Path, FileIdentity | None]] = []
+    for raw in paths:
+        try:
+            canonical = raw.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError):
+            results.append((raw, None))
+            continue
+        fingerprint: FileIdentity | None = None
+        try:
+            if is_beneath(canonical, root):
+                stat = canonical.stat()
+                if S_ISREG(stat.st_mode):
+                    fingerprint = file_identity(canonical, stat)
+        except (OSError, RuntimeError):
+            fingerprint = None
+        results.append((canonical, fingerprint))
+    return results
 
 
 def _file_identity(
@@ -929,6 +954,13 @@ class VLCQApp(App[None], inherit_bindings=False):
             Path, tuple[FileIdentity | None, HistoryProjection | None]
         ] = {}
         self._history_tasks: dict[str, asyncio.Task[None]] = {}
+        self._history_revision = -1
+        # ``_history_epoch`` advances whenever ``self.history`` changes, from
+        # any loader; each target re-renders only when it has not yet applied
+        # the latest epoch (or, for Files, when queue membership changed).
+        self._history_epoch = 0
+        self._history_applied: dict[str, tuple[int, frozenset[Path] | None]] = {}
+        self._canonical_memo: dict[Path, Path] = {}
         self._browser_mount_task: asyncio.Task[None] | None = None
         self._browser_rows_by_path: dict[Path, BrowserListItem] = {}
         self._browser_scroll_anchor = 0.0
@@ -1350,26 +1382,34 @@ class VLCQApp(App[None], inherit_bindings=False):
     async def _load_history(
         self, paths: list[Path], *, force: bool = False
     ) -> dict[Path, HistoryProjection]:
-        normalized = list(dict.fromkeys(path.expanduser().resolve(strict=False) for path in paths))
-        if not normalized:
-            return {}
+        result, _changed = await self._load_history_changes(paths, force=force)
+        return result
+
+    async def _load_history_changes(
+        self, paths: list[Path], *, force: bool = False
+    ) -> tuple[dict[Path, HistoryProjection], bool]:
+        """Load history for ``paths``; also report whether visible history changed."""
+        unique = list(dict.fromkeys(paths))
+        if not unique:
+            return {}, False
         root = self.root
-        identities: list[tuple[Path, FileIdentity] | None] = []
-        for start in range(0, len(normalized), 100):
+        self._sync_history_changes()
+        # Canonicalization and stat both touch the filesystem, so they run off
+        # the event loop in batches rather than one thread hop per file.
+        identities: list[tuple[Path, FileIdentity | None]] = []
+        for start in range(0, len(unique), 200):
             identities.extend(
-                await asyncio.gather(
-                    *(asyncio.to_thread(_file_identity, path, root) for path in normalized[start : start + 100])
-                )
+                await asyncio.to_thread(_file_identities, unique[start : start + 200], root)
             )
-            await asyncio.sleep(0)
+        normalized = list(dict.fromkeys(path for path, _identity in identities))
+        previous = {path: self.history.get(path) for path in normalized}
         uncached: list[tuple[Path, FileIdentity]] = []
         result: dict[Path, HistoryProjection] = {}
-        for path, identity in zip(normalized, identities, strict=True):
-            if identity is None:
-                self._history_cache[path] = (None, None)
-                self.history.pop(path, None)
+        for canonical, fingerprint in identities:
+            if fingerprint is None:
+                self._history_cache[canonical] = (None, None)
+                self.history.pop(canonical, None)
                 continue
-            canonical, fingerprint = identity
             cached = self._history_cache.get(canonical)
             if not force and cached is not None and cached[0] == fingerprint:
                 if cached[1] is not None:
@@ -1389,11 +1429,32 @@ class VLCQApp(App[None], inherit_bindings=False):
                     result[path] = projection
             await asyncio.sleep(0)
         if root != self.root:
-            return result
+            return result, False
         for path in normalized:
             self.history.pop(path, None)
         self.history.update(result)
-        return result
+        changed = any(previous[path] != result.get(path) for path in normalized)
+        if changed:
+            self._history_epoch += 1
+        return result, changed
+
+    def _sync_history_changes(self) -> None:
+        """Drop cached history for paths whose database rows changed.
+
+        File fingerprints are still revalidated on every load, so the cache can
+        never conceal a replaced file; this only avoids re-reading unchanged
+        SQLite rows once per second.
+        """
+        try:
+            revision, changed = self.database.history_changes_since(self._history_revision)
+        except (OSError, RuntimeError, sqlite3.Error):
+            revision, changed = -1, None
+        if changed is None:
+            self._history_cache.clear()
+        else:
+            for path in changed:
+                self._history_cache.pop(path, None)
+        self._history_revision = revision
 
     def _cancel_history_task(self, target: str) -> None:
         task = self._history_tasks.pop(target, None)
@@ -1424,14 +1485,28 @@ class VLCQApp(App[None], inherit_bindings=False):
                 if target == "browser":
                     if expected_browser_path != self.browser_path:
                         return
+                    applied = (
+                        self._history_epoch,
+                        frozenset(entry.path for entry in self.queue.entries()),
+                    )
+                    if self._history_applied.get(target) == applied:
+                        # Nothing visible changed: selection, folder and
+                        # subtitle changes re-render rows on their own paths.
+                        return
+                    self._history_applied[target] = applied
                     if self.search_query or self.history_filter != "all":
                         self._render_browser_rows()
                     else:
                         self._apply_browser_history_rows()
                 elif target == "queue":
+                    # refresh_queue() already re-renders every queue row each
+                    # tick; only a history change needs an extra pass.
+                    if self._history_applied.get(target) == (self._history_epoch, None):
+                        return
                     current_ids = tuple(entry.id for entry in self.queue.entries())
                     if expected_queue_ids != current_ids:
                         return
+                    self._history_applied[target] = (self._history_epoch, None)
                     self._apply_queue_history_rows()
             except asyncio.CancelledError:
                 raise
@@ -1444,12 +1519,23 @@ class VLCQApp(App[None], inherit_bindings=False):
 
         self._history_tasks[target] = asyncio.create_task(refresh())
 
+    def _history_get(self, path: Path) -> HistoryProjection | None:
+        """Look up history by canonical path, resolving at most once per tick."""
+        history = self.history.get(path)
+        if history is not None:
+            return history
+        canonical = self._canonical_memo.get(path)
+        if canonical is None:
+            canonical = path.expanduser().resolve(strict=False)
+            self._canonical_memo[path] = canonical
+        return self.history.get(canonical)
+
     def _history_watched(self, path: Path) -> bool:
-        history = self.history.get(path.expanduser().resolve(strict=False))
+        history = self._history_get(path)
         return history is not None and history.coverage_watched(self.watched_percent)
 
     def _history_percentage(self, path: Path) -> int | None:
-        history = self.history.get(path.expanduser().resolve(strict=False))
+        history = self._history_get(path)
         return history.coverage_percentage() if history is not None else None
 
     def _history_visible(self, path: Path) -> bool:
@@ -1705,7 +1791,8 @@ class VLCQApp(App[None], inherit_bindings=False):
             return
         if not view.is_attached:
             return
-        queued_paths = {entry.path for entry in self.queue.entries()}
+        queue_entries = self.queue.entries()
+        queued_paths = {entry.path for entry in queue_entries}
         visible = {entry.path: entry for entry in self.browser_entries}
         for row in view.children:
             if not isinstance(row, BrowserListItem) or row.is_dir:
@@ -1725,7 +1812,7 @@ class VLCQApp(App[None], inherit_bindings=False):
                 self._update_subtitle_row(row, entry.path)
             except NoMatches:
                 continue
-        self._render_headers()
+        self._render_headers(queue_entries)
 
     def _apply_queue_history_rows(self) -> None:
         try:
@@ -1734,9 +1821,11 @@ class VLCQApp(App[None], inherit_bindings=False):
             return
         if not view.is_attached:
             return
-        entries = {entry.id: entry for entry in self.queue.entries()}
-        current = self.queue.current()
-        current_id = current.id if current is not None else None
+        entries_list = self.queue.entries()
+        entries = {entry.id: entry for entry in entries_list}
+        current_id = self.database.get_current_id()
+        if current_id not in entries:
+            current_id = None
         selected_id = self.database.get_selected_id()
         for row in view.children:
             if not isinstance(row, QueueListItem):
@@ -1758,7 +1847,7 @@ class VLCQApp(App[None], inherit_bindings=False):
                 self._update_subtitle_row(row, entry.path)
             except NoMatches:
                 continue
-        self._render_headers()
+        self._render_headers(entries_list)
 
     def _refresh_browser_history(self) -> None:
         paths = [entry.path for entry in self.browser_entries if entry.supported]
@@ -1766,7 +1855,7 @@ class VLCQApp(App[None], inherit_bindings=False):
             paths,
             target="browser",
             expected_browser_path=self.browser_path,
-            force=True,
+            force=False,
         )
 
     def _entry_depth(self, path: Path) -> int:
@@ -2243,7 +2332,7 @@ class VLCQApp(App[None], inherit_bindings=False):
             queue_paths,
             target="queue",
             expected_queue_ids=tuple(entry.id for entry in entries),
-            force=True,
+            force=False,
         )
         current_id = self.database.get_current_id()
         if current_id not in entry_ids:
@@ -2303,6 +2392,8 @@ class VLCQApp(App[None], inherit_bindings=False):
         self._render_headers(entries)
 
     def refresh_playback(self) -> None:
+        # Symlinks can change between ticks; never reuse a resolution longer.
+        self._canonical_memo.clear()
         self._schedule_visible_subtitle_inspections()
         notice = self.controller.last_error or self.controller.subtitle_error
         if notice is not None and self._notice != notice:
@@ -2837,6 +2928,7 @@ class VLCQApp(App[None], inherit_bindings=False):
             pass
         self._history_cache.clear()
         self.history.clear()
+        self._history_epoch += 1
         await self.refresh_browser()
         self.refresh_queue()
 

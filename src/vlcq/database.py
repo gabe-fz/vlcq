@@ -88,6 +88,12 @@ class Database:
         self.connection.row_factory = sqlite3.Row
         self._selected_identity_invalidated = False
         self.last_preference_error: str | None = None
+        # Playback-history change tracking lets readers revalidate only the
+        # paths this connection wrote; ``data_version`` exposes commits made
+        # by any other connection (for example a concurrent CLI process).
+        self._history_revision = 0
+        self._history_changes: dict[Path, int] = {}
+        self._history_data_version: int | None = None
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA busy_timeout=5000")
         self.connection.execute("PRAGMA foreign_keys=ON")
@@ -697,6 +703,25 @@ class Database:
         canonical = path.expanduser().resolve(strict=True)
         return canonical, canonical.stat()
 
+    def _mark_history_changed(self, path: Path) -> None:
+        self._history_revision += 1
+        self._history_changes[path.expanduser().resolve(strict=False)] = self._history_revision
+
+    def history_changes_since(self, revision: int) -> tuple[int, set[Path] | None]:
+        """Return the current history revision and paths written after ``revision``.
+
+        ``None`` means changes cannot be attributed to paths (another
+        connection committed), so callers must revalidate all history.
+        """
+        data_version = int(self.connection.execute("PRAGMA data_version").fetchone()[0])
+        external = self._history_data_version is not None and data_version != self._history_data_version
+        self._history_data_version = data_version
+        if external or revision < 0:
+            return self._history_revision, None
+        return self._history_revision, {
+            path for path, changed in self._history_changes.items() if changed > revision
+        }
+
     def ensure_media(self, path: Path) -> int:
         canonical, stat = self._canonical_file(path)
         now = datetime.now(UTC).isoformat()
@@ -707,6 +732,7 @@ class Database:
                 self.connection.execute(
                     "UPDATE media SET volume_uuid=? WHERE id=?", (identity.volume_uuid, row["id"])
                 )
+                self._mark_history_changed(canonical)
             return int(row["id"])
         if identity.volume_uuid is None and self.connection.execute(
             "SELECT 1 FROM media WHERE path=? AND inode=? AND size=? AND mtime_ns=? "
@@ -721,6 +747,7 @@ class Database:
         )
         if cursor.lastrowid is None:
             raise RuntimeError("failed to create media record")
+        self._mark_history_changed(canonical)
         return int(cursor.lastrowid)
 
     def add_entry(self, path: Path) -> int:
@@ -1053,6 +1080,7 @@ class Database:
                 "completion_observed=MAX(completion_observed,?), last_observed=? WHERE id=?",
                 (position, duration, int(completed), now, media_id),
             )
+        self._mark_history_changed(path)
 
     def set_resume_position(
         self,
@@ -1107,6 +1135,7 @@ class Database:
                 (now, max(0, int(duration_ms)), media_id),
             )
             self.connection.execute("COMMIT")
+            self._mark_history_changed(path)
         except BaseException:
             self.connection.execute("ROLLBACK")
             raise

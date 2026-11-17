@@ -69,3 +69,25 @@ The same scenario measured 0.67 s (about 63% less), with 8 `entries()` calls
 per tick instead of 26. `set_classes` also stripped ListView's own `-highlight`
 class every second, so the focused Queue row lost its focus highlight; that is
 now preserved.
+
+## Follow-up: history reloads (2026-11-17)
+
+Every tick previously re-read SQLite history for all visible Files and Queue
+paths (`force=True`), resolved each path on the event loop, used one worker
+thread hop per file, and re-rendered both lists even when nothing changed.
+
+- `Database` records which canonical paths this connection wrote
+  (`ensure_media`, `merge_progress`, `merge_coverage`) and checks
+  `PRAGMA data_version` for commits from other connections (for example a
+  concurrent CLI). `history_changes_since()` returns the changed paths, or
+  `None` when an external commit means everything must be revalidated.
+- The TUI drops only those cache entries. **File fingerprints are still
+  re-stat'ed on every tick**, so replaced files never show stale history.
+- Canonicalization and stat run off the event loop in one batch per 200 paths.
+- A history epoch advances whenever loaded history changes; Files/Queue skip
+  their extra re-render pass when they have already applied the latest epoch
+  (Files also re-renders when queue membership changes).
+
+Same harness (100 files, 30 queued, idle): 0.67 s → about 0.27 s process CPU
+per 6 s, roughly 85% below the original 1.83 s. `tests/test_history_cache.py`
+covers own writes, external commits, and file replacement.
