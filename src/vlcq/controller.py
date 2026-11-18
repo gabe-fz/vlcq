@@ -62,6 +62,15 @@ class ResumeOffer:
             )
             self.duration_ms = history.duration_ms
             self.completed = history.coverage_watched(self.watched_percent)
+            if (
+                history.completion_observed
+                and self.duration_ms > 0
+                and self.position_ms >= self.duration_ms - NATURAL_END_WINDOW_MS
+            ):
+                # A natural end keeps the last pre-end poll as the stored
+                # position (the Queue bar shows it); offering to resume there
+                # would finish the video immediately, so start from zero.
+                self.position_ms = 0
 
     @property
     def usable_resume(self) -> bool:
@@ -131,6 +140,8 @@ class PlaybackController:
         # Non-VLC failures while recording an observation (for example a
         # briefly locked database) are reported without dropping VLC.
         self.observation_error: str | None = None
+        # The most recent history-save failure during the current poll tick.
+        self._history_failure: str | None = None
         # Set while VLC plays something outside the vlcq window (for example
         # a file the user opened in VLC). The connection is kept; tracking,
         # history and auto-advance pause until a queue item plays again.
@@ -170,6 +181,26 @@ class PlaybackController:
 
     async def _run_database_operation[Result](self, operation: Callable[[], Result]) -> Result:
         return await asyncio.to_thread(self.queue.database.run_serialized, operation)
+
+    async def _record_history(self, operation: Callable[[], object], path: Path) -> bool:
+        """Persist playback history; report failure without treating it as VLC loss.
+
+        A file that is genuinely gone still raises ``FileNotFoundError`` so the
+        caller can mark the entry missing. Anything else (including a
+        transient ESTALE while the file is being written) is recorded as a
+        history failure and playback tracking continues on the next poll.
+        """
+        try:
+            await self._run_database_operation(operation)
+        except FileNotFoundError:
+            if not path.is_file():
+                raise
+            self._history_failure = "Playback history not saved: file changed while saving"
+            return False
+        except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+            self._history_failure = f"Playback history not saved: {exc}"
+            return False
+        return True
 
     async def start(self) -> None:
         """Connect exactly once and own exactly one polling task."""
@@ -1648,11 +1679,17 @@ class PlaybackController:
         if not self._coverage.recent_qualified_continuity and status.state != "stopped":
             self._near_end_seen = False
         if evidence.initialized:
-            await self._run_database_operation(
+            saved = await self._record_history(
                 lambda: self.queue.database.merge_coverage(
                     path, evidence.ranges, status.duration_ms
-                )
+                ),
+                path,
             )
+            if not saved:
+                # Unsaved ranges are dropped; continuity restarts so later
+                # evidence is never credited without its qualifying run.
+                self._coverage.reset()
+                return False
         return evidence.qualified
 
     def _leave_foreign_media(self) -> None:
@@ -1770,16 +1807,17 @@ class PlaybackController:
         await self._sync_queue_state(status, observed_path)
         try:
             trustworthy = not (status.state == "stopped" and status.position_ms == 0)
-            await self._run_database_operation(
+            await self._record_history(
                 lambda: self.queue.update_progress(
                     observed_path,
                     status.position_ms,
                     status.duration_ms,
                     trustworthy=trustworthy,
                     resume_position_ms=status.position_ms,
-                )
+                ),
+                observed_path,
             )
-        except OSError:
+        except FileNotFoundError:
             await self._run_database_operation(
                 lambda: self.queue.set_current_state(current.id, "missing")
             )
@@ -1798,16 +1836,23 @@ class PlaybackController:
             previous_status, status
         ):
             self._near_end_seen = False
-            await self._run_database_operation(
-                lambda: self.queue.update_progress(
+            # A failed history save must not stall the queue at a natural end.
+            try:
+                await self._record_history(
+                    lambda: self.queue.update_progress(
+                        observed_path,
+                        status.position_ms,
+                        status.duration_ms,
+                        completed=True,
+                        trustworthy=status.position_ms != 0,
+                        resume_position_ms=(
+                            status.position_ms if status.position_ms > 0 else None
+                        ),
+                    ),
                     observed_path,
-                    status.position_ms,
-                    status.duration_ms,
-                    completed=True,
-                    trustworthy=status.position_ms != 0,
-                    resume_position_ms=(status.position_ms if status.position_ms > 0 else None),
                 )
-            )
+            except FileNotFoundError:
+                pass  # the advance below records the missing file
             if allow_advance and (generation is None or generation == self._generation):
                 await self._next_locked(completed=True)
 
@@ -1831,15 +1876,19 @@ class PlaybackController:
             assert previous_status is not None
             self._near_end_seen = False
             self._last_valid_status = None
-            await self._run_database_operation(
-                lambda: self.queue.update_progress(
+            try:
+                await self._record_history(
+                    lambda: self.queue.update_progress(
+                        current.path,
+                        previous_status.position_ms,
+                        previous_status.duration_ms,
+                        completed=True,
+                        trustworthy=False,
+                    ),
                     current.path,
-                    previous_status.position_ms,
-                    previous_status.duration_ms,
-                    completed=True,
-                    trustworthy=False,
                 )
-            )
+            except FileNotFoundError:
+                pass  # the advance below records the missing file
             if allow_advance and (generation is None or generation == self._generation):
                 await self._next_locked(completed=True)
             return
@@ -1883,6 +1932,7 @@ class PlaybackController:
                         continue
                     generation = self._generation
                     expected_path = self._current_expected_path()
+                    self._history_failure = None
                     status = await asyncio.wait_for(client.status(), self.poll_timeout)
                     await self._observe_locked(
                         status, generation=generation, expected_path=expected_path
@@ -1899,7 +1949,8 @@ class PlaybackController:
                         await client.close()
                         break
                 failures = 0
-                self.observation_error = None
+                # Surface a history-save failure for as long as it persists.
+                self.observation_error = self._history_failure
                 delay = (
                     1.0
                     if status.state == "playing"

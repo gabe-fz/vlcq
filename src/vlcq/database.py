@@ -23,7 +23,34 @@ from .progress import (
 )
 from .subtitles import SubtitleDescriptor, SubtitleError, scoped_show_key
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
+# Version 5 introduced volume UUIDs; version 6 makes media uniqueness follow
+# the same identity rule as ``FileIdentity.matches``.
+_VOLUME_UUID_SCHEMA_VERSION = 5
+_MEDIA_COLUMNS = (
+    "id,path,device,inode,size,mtime_ns,position_ms,duration_ms,completion_observed,"
+    "first_observed,last_observed,resume_position_ms,last_played_at,"
+    "coverage_initialized_at,volume_uuid"
+)
+_CREATE_MEDIA_TABLE = (
+    "CREATE TABLE {name}("
+    "id INTEGER PRIMARY KEY, path TEXT NOT NULL, "
+    "device INTEGER NOT NULL, inode INTEGER NOT NULL, size INTEGER NOT NULL, "
+    "mtime_ns INTEGER NOT NULL, position_ms INTEGER NOT NULL DEFAULT 0, "
+    "duration_ms INTEGER NOT NULL DEFAULT 0, "
+    "completion_observed INTEGER NOT NULL DEFAULT 0, "
+    "first_observed TEXT NOT NULL, last_observed TEXT NOT NULL, "
+    "resume_position_ms INTEGER, last_played_at TEXT, "
+    "coverage_initialized_at TEXT, volume_uuid TEXT)"
+)
+# A UUID-pinned row is identified by its volume regardless of the (mount-local)
+# device number; an unpinned row keeps strict device-based identity.  The old
+# UNIQUE(path,device,inode,size,mtime_ns) rejected a different volume that
+# happened to reuse a device number with identical file metadata.
+_CREATE_MEDIA_IDENTITY_INDEX = (
+    "CREATE UNIQUE INDEX media_identity ON media("
+    "path, inode, size, mtime_ns, COALESCE(volume_uuid, 'device:' || device))"
+)
 SUBTITLE_REMEMBER_SETTING = "remember_subtitles_by_show"
 SUBTITLE_ENGLISH_SETTING = "prefer_english_subtitles"
 
@@ -136,7 +163,7 @@ class Database:
             for statement in statements:
                 self.connection.execute(statement)
             columns = {row[1] for row in self.connection.execute("PRAGMA table_info(media)")}
-            if version >= 5 and "volume_uuid" not in columns:
+            if version >= _VOLUME_UUID_SCHEMA_VERSION and "volume_uuid" not in columns:
                 self.connection.execute("ALTER TABLE media ADD COLUMN volume_uuid TEXT")
                 self._pin_legacy_volumes()
             self.connection.execute(f"PRAGMA user_version={version}")
@@ -157,18 +184,8 @@ class Database:
                     "id INTEGER PRIMARY KEY, root TEXT NOT NULL, "
                     "created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
                 ),
-                (
-                    "CREATE TABLE media("
-                    "id INTEGER PRIMARY KEY, path TEXT NOT NULL, "
-                    "device INTEGER NOT NULL, inode INTEGER NOT NULL, size INTEGER NOT NULL, "
-                    "mtime_ns INTEGER NOT NULL, position_ms INTEGER NOT NULL DEFAULT 0, "
-                    "duration_ms INTEGER NOT NULL DEFAULT 0, "
-                    "completion_observed INTEGER NOT NULL DEFAULT 0, "
-                    "first_observed TEXT NOT NULL, last_observed TEXT NOT NULL, "
-                    "resume_position_ms INTEGER, last_played_at TEXT, "
-                    "coverage_initialized_at TEXT, "
-                    "UNIQUE(path, device, inode, size, mtime_ns))"
-                ),
+                _CREATE_MEDIA_TABLE.format(name="media"),
+                _CREATE_MEDIA_IDENTITY_INDEX,
                 (
                     "CREATE TABLE coverage_ranges("
                     "media_id INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE, "
@@ -250,7 +267,7 @@ class Database:
                         "INSERT INTO settings(key,value) VALUES('remember_subtitles_by_show','0')",
                         "INSERT INTO settings(key,value) VALUES('prefer_english_subtitles','1')",
                     ),
-                    SCHEMA_VERSION,
+                    _VOLUME_UUID_SCHEMA_VERSION,
                 )
             elif version == 2:
                 self._transactional_schema_change(
@@ -272,7 +289,7 @@ class Database:
                         "INSERT INTO settings(key,value) VALUES('remember_subtitles_by_show','0')",
                         "INSERT INTO settings(key,value) VALUES('prefer_english_subtitles','1')",
                     ),
-                    SCHEMA_VERSION,
+                    _VOLUME_UUID_SCHEMA_VERSION,
                 )
             elif version == 3:
                 self._transactional_schema_change(
@@ -286,14 +303,49 @@ class Database:
                         "INSERT INTO settings(key,value) VALUES('remember_subtitles_by_show','0')",
                         "INSERT INTO settings(key,value) VALUES('prefer_english_subtitles','1')",
                     ),
-                    SCHEMA_VERSION,
+                    _VOLUME_UUID_SCHEMA_VERSION,
                 )
-            elif version in (4, SCHEMA_VERSION):
+            elif version in (4, 5, SCHEMA_VERSION):
                 self._upgrade_subtitle_descriptor_constraint()
                 if version == 4:
-                    self._transactional_schema_change((), SCHEMA_VERSION)
+                    self._transactional_schema_change((), _VOLUME_UUID_SCHEMA_VERSION)
+            if 0 < version < SCHEMA_VERSION:
+                self._rebuild_media_identity_constraint()
         except Exception as exc:
             raise DatabaseMigrationError(self.path, exc) from exc
+
+    def _rebuild_media_identity_constraint(self) -> None:
+        """Replace the device-based UNIQUE constraint with the v6 identity index.
+
+        SQLite cannot drop a table constraint, so the table is rebuilt with
+        every row, id, and history column copied verbatim. Foreign keys are
+        disabled for the rebuild, as SQLite's documented procedure requires, so
+        dropping the old table cannot cascade into coverage ranges; integrity
+        is checked before committing.
+        """
+        self.connection.execute("PRAGMA foreign_keys=OFF")
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                self.connection.execute(_CREATE_MEDIA_TABLE.format(name="media_v6"))
+                self.connection.execute(
+                    f"INSERT INTO media_v6({_MEDIA_COLUMNS}) SELECT {_MEDIA_COLUMNS} FROM media"
+                )
+                self.connection.execute("DROP TABLE media")
+                self.connection.execute("ALTER TABLE media_v6 RENAME TO media")
+                self.connection.execute(_CREATE_MEDIA_IDENTITY_INDEX)
+                if self.connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                    raise RuntimeError("foreign key check failed while rebuilding media")
+                self.connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                self.connection.execute("COMMIT")
+            except BaseException:
+                try:
+                    self.connection.execute("ROLLBACK")
+                except sqlite3.DatabaseError:
+                    pass
+                raise
+        finally:
+            self.connection.execute("PRAGMA foreign_keys=ON")
 
     def _pin_legacy_volumes(self) -> None:
         """Upgrade only exact legacy matches; never guess across device changes."""
@@ -740,7 +792,19 @@ class Database:
             (str(canonical), identity.inode, identity.size, identity.mtime_ns),
         ).fetchone():
             raise RuntimeError("cannot validate saved media volume UUID; history was preserved")
-        cursor = self.connection.execute(
+        if identity.volume_uuid is not None and self.connection.execute(
+            "SELECT 1 FROM media WHERE path=? AND inode=? AND size=? AND mtime_ns=? "
+            "AND volume_uuid IS NULL AND device<>? LIMIT 1",
+            (str(canonical), identity.inode, identity.size, identity.mtime_ns, identity.device),
+        ).fetchone():
+            # Pre-UUID history whose device number has since changed. Creating
+            # a fresh row would hide that history and make it a duplicate that
+            # explicit recovery must refuse, so fail closed instead.
+            raise RuntimeError(
+                "saved history predates volume tracking and the disk was renumbered; "
+                "run `vlcq recover-history --root <library>` to keep it"
+            )
+        cursor =self.connection.execute(
             "INSERT INTO media(path,device,inode,size,mtime_ns,volume_uuid,first_observed,last_observed) "
             "VALUES(?,?,?,?,?,?,?,?)",
             (str(canonical), *identity, now, now),
@@ -974,6 +1038,17 @@ class Database:
             (str(path), identity.inode, identity.size, identity.mtime_ns),
         ).fetchall()
         matches = [row for row in rows if self._row_identity(row).matches(identity)]
+        if len(matches) > 1 and identity.volume_uuid is not None:
+            # A matching volume UUID is stronger evidence than a legacy
+            # device-number match (device numbers are reused across mounts).
+            # Older versions could leave both for one file; always resolving
+            # to the pinned row keeps the choice stable instead of failing
+            # every later write.
+            pinned: list[sqlite3.Row] = [
+                row for row in matches if row["volume_uuid"] == identity.volume_uuid
+            ]
+            if len(pinned) == 1:
+                return pinned[0]
         # Ambiguous identities must not silently choose or combine histories.
         if len(matches) > 1:
             raise RuntimeError("ambiguous media identity; preserve the database and recover explicitly")
@@ -1045,6 +1120,9 @@ class Database:
         The default remains compatible with the v1 API: the supplied position
         increases the historical maximum.  A zero observation never erases a
         known resume point unless the caller explicitly authorizes a reset.
+        Duration is the latest positive reading, not the maximum: VLC refines
+        its length estimate for unindexed media, and a single inflated
+        estimate must not permanently depress coverage percentages.
         """
         media_id = self.ensure_media(path)
         now = played_at or datetime.now(UTC).isoformat()
@@ -1062,23 +1140,23 @@ class Database:
             update_resume = True
         if update_resume:
             self.connection.execute(
-                "UPDATE media SET position_ms=MAX(position_ms,?), duration_ms=MAX(duration_ms,?), "
+                "UPDATE media SET position_ms=MAX(position_ms,?), duration_ms=CASE WHEN ?>0 THEN ? ELSE duration_ms END, "
                 "completion_observed=MAX(completion_observed,?), last_observed=?, "
                 "resume_position_ms=?, last_played_at=? WHERE id=?",
-                (position, duration, int(completed), now, resume_update, now, media_id),
+                (position, duration, duration, int(completed), now, resume_update, now, media_id),
             )
         elif trustworthy:
             self.connection.execute(
-                "UPDATE media SET position_ms=MAX(position_ms,?), duration_ms=MAX(duration_ms,?), "
+                "UPDATE media SET position_ms=MAX(position_ms,?), duration_ms=CASE WHEN ?>0 THEN ? ELSE duration_ms END, "
                 "completion_observed=MAX(completion_observed,?), last_observed=?, "
                 "last_played_at=? WHERE id=?",
-                (position, duration, int(completed), now, now, media_id),
+                (position, duration, duration, int(completed), now, now, media_id),
             )
         else:
             self.connection.execute(
-                "UPDATE media SET position_ms=MAX(position_ms,?), duration_ms=MAX(duration_ms,?), "
+                "UPDATE media SET position_ms=MAX(position_ms,?), duration_ms=CASE WHEN ?>0 THEN ? ELSE duration_ms END, "
                 "completion_observed=MAX(completion_observed,?), last_observed=? WHERE id=?",
-                (position, duration, int(completed), now, media_id),
+                (position, duration, duration, int(completed), now, media_id),
             )
         self._mark_history_changed(path)
 
@@ -1131,8 +1209,8 @@ class Database:
             )
             self.connection.execute(
                 "UPDATE media SET coverage_initialized_at=COALESCE(coverage_initialized_at,?), "
-                "duration_ms=MAX(duration_ms,?) WHERE id=?",
-                (now, max(0, int(duration_ms)), media_id),
+                "duration_ms=CASE WHEN ?>0 THEN ? ELSE duration_ms END WHERE id=?",
+                (now, max(0, int(duration_ms)), max(0, int(duration_ms)), media_id),
             )
             self.connection.execute("COMMIT")
             self._mark_history_changed(path)
@@ -1278,6 +1356,13 @@ class Database:
                 canonical != path or not canonical.is_file() or not is_beneath(canonical, base)
                 or not self._row_identity(row).matches(fingerprint)
             ):
+                continue
+            try:
+                # Export the same row every other reader resolves to.
+                chosen = self._matching_media(canonical, fingerprint)
+            except RuntimeError:
+                continue
+            if chosen is None or int(chosen["id"]) != int(row["id"]):
                 continue
             relative = canonical.relative_to(base).as_posix()
             duration = int(row["duration_ms"])

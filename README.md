@@ -95,7 +95,10 @@ furthest reached position and not elapsed wall time. Replaying an overlap adds n
 and disjoint playback never fills the gap. Percentages use floor rounding, so incomplete
 99.x% evidence never displays as 100%. `—` means coverage is absent/uninitialized;
 initialized tracking with known duration but no qualified ranges displays 0%. Unknown or
-nonpositive duration produces an unknown percentage.
+nonpositive duration produces an unknown percentage. The stored duration is VLC's latest
+positive length reading, so an early overestimate for unindexed media does not linger.
+A video that ended naturally is never offered for resume at its last seconds; playing it
+again starts from the beginning.
 
 Coverage requires at least five seconds of coherent, advancing `playing` observations
 for the same validated media/generation/playlist identity at a finite positive VLC rate.
@@ -263,8 +266,16 @@ files is not supported. On filesystems without UUID support, the old strict devi
 identity remains; previously UUID-pinned records fail closed if UUID discovery fails.
 No sidecars or media metadata are written.
 
+Schema version 6 makes media uniqueness follow the same rule, so a different volume that
+reuses a device number with identical file metadata gets its own history instead of an
+error. If an older database holds both a legacy device-only record and a UUID-pinned
+record for one file, the UUID-pinned record is used consistently.
+
 Migration pins existing records only when their complete old identity still matches.
-A device change that already happened before upgrading needs explicit recovery (below).
+A device change that already happened before upgrading needs explicit recovery (below);
+until then vlcq refuses to record new history for that file (and reports
+`vlcq recover-history`) rather than starting a fresh record that would hide the old one
+and block recovery.
 Version 1/2/3/4 queue order, current/selected identities, resume position, legacy maximum,
 completion, fingerprints, timestamps, and coverage ranges are retained. Subtitle toggles
 and show preferences are unchanged; English defaults on and show remembering defaults off. Migration deliberately

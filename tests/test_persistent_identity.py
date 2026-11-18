@@ -9,7 +9,7 @@ import pytest
 
 from vlcq import identity
 from vlcq.cli import main
-from vlcq.database import Database, DatabaseMigrationError
+from vlcq.database import SCHEMA_VERSION, Database, DatabaseMigrationError
 from vlcq.identity import FileIdentity, file_identity
 from vlcq.ipc import ControllerBusy, ControllerLock
 from vlcq.queue import QueueService
@@ -42,6 +42,7 @@ def seed(root: Path, video: Path, path: Path) -> tuple[int, int]:
 
 def legacy(path: Path, *, renumber: bool = True) -> None:
     with sqlite3.connect(path) as connection:
+        connection.execute("DROP INDEX IF EXISTS media_identity")
         connection.execute("ALTER TABLE media DROP COLUMN volume_uuid")
         connection.execute("PRAGMA user_version=4")
         if renumber:
@@ -121,7 +122,7 @@ def test_v4_migration_pins_only_exact_legacy_identity(library) -> None:
     seed(*library)
     legacy(path, renumber=False)
     db = Database(path)
-    assert db.connection.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert db.connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert db.media_fingerprint(1).volume_uuid == "volume-a"
     assert db.history_for(video, root).coverage_ms == 80_000
     db.close()
