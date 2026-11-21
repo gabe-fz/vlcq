@@ -3894,7 +3894,9 @@ class VLCQApp(App[None], inherit_bindings=False):
                     deleted += 1
                 except OSError as exc:
                     failures.append(f"{path}: {exc}")
-            await self.refresh_browser()
+            # The tree caches directory listings, so a plain re-render would
+            # keep showing the files that were just removed from disk.
+            await self.action_refresh_files()
             self.refresh_queue()
             self.update_status(f"Deleted {deleted} watched files; {len(failures)} skipped or failed")
             if failures:

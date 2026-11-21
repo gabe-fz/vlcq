@@ -34,6 +34,9 @@ async def test_delete_watched_confirmation(tmp_path: Path) -> None:
         await pilot.click("#delete-watched-confirm")
         await pilot.pause()
         assert not watched.exists()
+        listed = {entry.path for entry in app._tree_children[root]}
+        assert watched not in listed
+        assert unwatched in listed
         assert unwatched.exists()
         assert subtitle.exists()
     database.close()
