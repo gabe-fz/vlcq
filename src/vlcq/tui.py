@@ -89,6 +89,9 @@ def _file_identities(
     return results
 
 
+_QUEUE_ONLY_ACTIONS = frozenset({"move-up", "move-down", "remove-queue", "details-queue"})
+
+
 def _file_identity(
     raw_path: Path, root: Path
 ) -> tuple[Path, FileIdentity] | None:
@@ -3479,7 +3482,9 @@ class VLCQApp(App[None], inherit_bindings=False):
             return False
         return True
 
-    def _valid_queue_target(self, target: QueueTarget) -> QueueEntry | None:
+    def _valid_queue_target(
+        self, target: QueueTarget, *, require_media: bool = True
+    ) -> QueueEntry | None:
         if target.root_generation != self._root_generation:
             self.update_status("Action expired after the library root changed")
             return None
@@ -3488,15 +3493,29 @@ class VLCQApp(App[None], inherit_bindings=False):
             self.update_status("Queue action expired because that entry was removed")
             return None
         try:
-            stat = entry.path.stat()
-            fingerprint = file_identity(entry.path, stat)
-            if not self.database.media_fingerprint(entry.media_id).matches(fingerprint):
-                self.update_status("Queue action refused a replaced media file")
-                return None
+            outside = not is_beneath(entry.path.resolve(strict=False), self.root)
         except (OSError, RuntimeError):
+            outside = True
+        if outside:
+            if require_media:
+                self.update_status("Action refused a path outside the library root")
+                return None
+            return entry
+        try:
+            # The queued path may have changed identity since it was queued
+            # (e.g. a download finished); follow it like playback does.
+            return self.database.refresh_entry_media(entry.id)
+        except OSError:
             self.database.set_state(entry.id, "missing")
-            self.update_status("Queue action refused missing media")
-            return None
+            if require_media:
+                self.update_status("Queue action refused missing media")
+                return None
+        except RuntimeError as exc:
+            if require_media:
+                self.update_status(f"Queue action refused: {exc}")
+                return None
+        # Queue-only actions (remove, reorder, details) never touch media, so
+        # they stay available for missing or unverifiable entries.
         return entry
 
     async def _finish_subtitle_choice(
@@ -3580,7 +3599,9 @@ class VLCQApp(App[None], inherit_bindings=False):
             return
         queue_entry: QueueEntry | None = None
         if isinstance(target, QueueTarget):
-            queue_entry = self._valid_queue_target(target)
+            queue_entry = self._valid_queue_target(
+                target, require_media=action.key not in _QUEUE_ONLY_ACTIONS
+            )
             if queue_entry is None:
                 return
         if isinstance(target, SectionTarget) and target.root_generation != self._root_generation:

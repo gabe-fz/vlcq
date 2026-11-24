@@ -226,8 +226,15 @@ class QueueService:
         self._invalidate_undo()
 
     def _snapshot(self, selected: list[QueueEntry]) -> QueueUndoSnapshot:
-        all_entries = self.entries()
         selected_ids = {entry.id for entry in selected}
+        for entry_id in selected_ids:
+            # Fingerprint what is on disk now, so undo is refused only if the
+            # file changes after removal, not because the binding was stale.
+            try:
+                self.database.refresh_entry_media(entry_id)
+            except (OSError, RuntimeError):
+                pass
+        all_entries = self.entries()
         selected = [entry for entry in all_entries if entry.id in selected_ids]
         rows: list[dict[str, int | str]] = []
         fingerprints: dict[int, FileIdentity] = {}

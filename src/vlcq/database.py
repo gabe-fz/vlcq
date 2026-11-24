@@ -1062,6 +1062,37 @@ class Database:
             raise RuntimeError("media record not found")
         return self._row_identity(row)
 
+    def refresh_entry_media(self, entry_id: int) -> QueueEntry:
+        """Rebind a queue entry to the current identity of its queued path.
+
+        A queued path can legitimately change identity while it waits: a
+        download finishes (size/mtime grow), or the file is re-encoded in
+        place.  Playback and progress already follow the path's current
+        fingerprint, so a stale binding only made queue actions and undo
+        refuse a perfectly valid entry.  The old media row and its history are
+        left untouched; only the entry's pointer moves (mirroring
+        ``add_entry``).  Raises ``OSError`` when the path is gone.
+        """
+        queue_id = self._active_queue_id()
+        row = self.connection.execute(
+            "SELECT q.media_id,m.path FROM queue_entries q JOIN media m ON m.id=q.media_id "
+            "WHERE q.queue_id=? AND q.id=?",
+            (queue_id, entry_id),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("queue entry not found")
+        path = Path(row["path"])
+        media_id = self.ensure_media(path)
+        if media_id != int(row["media_id"]):
+            self.connection.execute(
+                "UPDATE queue_entries SET media_id=? WHERE id=? AND queue_id=?",
+                (media_id, entry_id, queue_id),
+            )
+        entry = next((item for item in self.queue_entries() if item.id == entry_id), None)
+        if entry is None:
+            raise RuntimeError("queue entry not found")
+        return entry
+
     def restore_entries(self, rows: list[dict[str, int | str]], ordered_ids: list[int]) -> None:
         """Restore a previously removed set in one transaction."""
         queue_id = self._active_queue_id()

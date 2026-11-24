@@ -1055,3 +1055,29 @@ async def test_cleared_vlc_playlist_goes_idle_without_errors(tmp_path: Path) -> 
     assert client.played == played  # nothing was loaded or autoplayed
     assert queue.current() is not None and queue.current().state == "stopped"
     db.close()
+
+
+def test_undo_restores_an_entry_whose_file_grew_before_removal(tmp_path: Path) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    with videos[0].open("ab") as handle:
+        handle.write(b"download finished")
+    queue.remove(0)
+    assert queue.undo() is True
+    assert queue.entries()[0].path == videos[0].resolve()
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_playing_rebinds_entry_to_current_file_identity(tmp_path: Path) -> None:
+    db, queue, videos = setup_queue(tmp_path)
+    stale_media = queue.entries()[0].media_id
+    with videos[0].open("ab") as handle:
+        handle.write(b"download finished")
+    controller = PlaybackController(queue, process=FakeProcess())  # type: ignore[arg-type]
+    controller.client = FakeClient()  # type: ignore[assignment]
+    try:
+        await controller.play_with_policy(0, choice="start_over")
+    except VLCError:
+        pass  # The fake client's playback confirmation is irrelevant here.
+    assert queue.entries()[0].media_id != stale_media
+    db.close()

@@ -1170,6 +1170,14 @@ class PlaybackController:
         if not canonical.is_file():
             self.queue.database.set_state(entry.id, "missing")
             raise FileNotFoundError("video is missing")
+        try:
+            # Keep the entry bound to the identity progress will be recorded
+            # against (the file may have finished downloading since queued).
+            await self._run_database_operation(
+                lambda: self.queue.database.refresh_entry_media(entry.id)
+            )
+        except (OSError, RuntimeError):
+            pass
         for attempt in range(3):
             try:
                 if self.client is None or attempt:

@@ -587,3 +587,56 @@ async def test_two_pane_live_row_transient_notice_and_queue_application_menu(tmp
         assert app.screen.__class__.__name__ == "Screen"
         assert entry.path == video.resolve()
     db.close()
+
+
+@pytest.mark.asyncio
+async def test_queue_actions_follow_a_file_that_finished_downloading(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    first, second = make_files(root, 2)
+    db = Database(tmp_path / "state.sqlite3")
+    queue = QueueService(db)
+    queue.open(root)
+    queue.add([first, second])
+    stale_media = queue.entries()[0].media_id
+    # The queued file grows in place (same inode) after it was queued.
+    with first.open("ab") as handle:
+        handle.write(b"rest of the download")
+    app = VLCQApp(root=root, database=db, no_vlc=True)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.1)
+        entry = app.queue.entries()[0]
+        details = ContextAction("details-queue", "Details", QueueTarget(entry.id, app._root_generation))
+        await app._dispatch_context_action(details)
+        await pilot.pause()
+        assert "refused" not in app._notice.lower()
+        refreshed = next(item for item in db.queue_entries() if item.id == entry.id)
+        assert refreshed.media_id != stale_media
+        assert refreshed.state == entry.state
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_queue_entry_can_still_be_removed_from_menu(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    first, second = make_files(root, 2)
+    db = Database(tmp_path / "state.sqlite3")
+    queue = QueueService(db)
+    queue.open(root)
+    queue.add([first, second])
+    first.unlink()
+    app = VLCQApp(root=root, database=db, no_vlc=True)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.1)
+        entry = app.queue.entries()[0]
+        play = ContextAction("play-now-queue", "Play", QueueTarget(entry.id, app._root_generation))
+        await app._dispatch_context_action(play)
+        assert "missing" in app._notice.lower()
+        app.query_one("#queue", ListView).focus()
+        await pilot.pause()
+        remove = ContextAction("remove-queue", "Remove", QueueTarget(entry.id, app._root_generation))
+        await app._dispatch_context_action(remove)
+        await pilot.pause()
+        assert [item.path for item in app.queue.entries()] == [second.resolve()]
+    db.close()
