@@ -129,6 +129,12 @@ class Database:
         except DatabaseMigrationError:
             self._close_after_migration_failure()
             raise
+        try:
+            self._consolidate_grown_media()
+        except sqlite3.Error:
+            # Best-effort repair: the split rows stay intact and readable, and
+            # the next open (or the next playback of that file) retries.
+            pass
         self._secure_files()
 
     def _close_after_migration_failure(self) -> None:
@@ -804,6 +810,9 @@ class Database:
                 "saved history predates volume tracking and the disk was renumbered; "
                 "run `vlcq recover-history --root <library>` to keep it"
             )
+        adopted = self._adopt_grown_media(canonical, identity)
+        if adopted is not None:
+            return adopted
         cursor =self.connection.execute(
             "INSERT INTO media(path,device,inode,size,mtime_ns,volume_uuid,first_observed,last_observed) "
             "VALUES(?,?,?,?,?,?,?,?)",
@@ -1053,6 +1062,131 @@ class Database:
         if len(matches) > 1:
             raise RuntimeError("ambiguous media identity; preserve the database and recover explicitly")
         return matches[0] if matches else None
+
+    # A file written in place (a download in progress, a torrent filling a
+    # preallocated file) keeps its path, inode and volume while its size and
+    # mtime change. Those rows describe one video, so its history must follow
+    # the file rather than restart on every write. A different file at the
+    # same path (rename-over, delete+recreate) gets a new inode and still
+    # starts fresh, as does an identity that shrank or whose mtime moved
+    # backwards (downloads only ever grow or fill preallocated space).
+    _SAME_FILE_ROWS = (
+        "SELECT * FROM media WHERE path=? AND inode=? AND mtime_ns<=? AND size<=? AND {volume} "
+        "ORDER BY mtime_ns DESC, size DESC, id DESC"
+    )
+
+    def _same_file_rows(self, path: Path, identity: FileIdentity) -> list[sqlite3.Row]:
+        parameter: str | int
+        if identity.volume_uuid is not None:
+            volume, parameter = "volume_uuid=?", identity.volume_uuid
+        else:
+            volume, parameter = "volume_uuid IS NULL AND device=?", identity.device
+        return self.connection.execute(
+            self._SAME_FILE_ROWS.format(volume=volume),
+            (str(path), identity.inode, identity.mtime_ns, identity.size, parameter),
+        ).fetchall()
+
+    def _adopt_grown_media(self, path: Path, identity: FileIdentity) -> int | None:
+        rows = self._same_file_rows(path, identity)
+        if not rows:
+            return None
+        survivor = int(rows[0]["id"])
+        self.connection.execute("SAVEPOINT adopt_grown_media")
+        try:
+            self._merge_media_rows(survivor, [int(row["id"]) for row in rows[1:]])
+            self.connection.execute(
+                "UPDATE media SET device=?,size=?,mtime_ns=?,volume_uuid=? WHERE id=?",
+                (identity.device, identity.size, identity.mtime_ns, identity.volume_uuid, survivor),
+            )
+            self.connection.execute("RELEASE adopt_grown_media")
+        except BaseException:
+            self.connection.execute("ROLLBACK TO adopt_grown_media")
+            self.connection.execute("RELEASE adopt_grown_media")
+            raise
+        self._mark_history_changed(path)
+        return survivor
+
+    def _merge_media_rows(self, survivor: int, others: list[int]) -> None:
+        """Fold history rows of one written-in-place file into ``survivor``.
+
+        Nothing observed is dropped: furthest position, completion and
+        coverage are unions; the resume point comes from the most recently
+        played row; queue entries are repointed. Callers own the transaction.
+        """
+        if not others:
+            return
+        ids = [survivor, *others]
+        marks = ",".join("?" for _ in ids)
+        rows = self.connection.execute(
+            f"SELECT * FROM media WHERE id IN ({marks})", ids
+        ).fetchall()
+        by_id = {int(row["id"]): row for row in rows}
+        kept = by_id[survivor]
+        played = [row for row in rows if row["last_played_at"] is not None]
+        latest_play = max(played, key=lambda row: row["last_played_at"]) if played else kept
+        durations = [int(row["duration_ms"]) for row in rows if int(row["duration_ms"]) > 0]
+        duration = int(kept["duration_ms"]) if int(kept["duration_ms"]) > 0 else max(durations, default=0)
+        initialized = [row["coverage_initialized_at"] for row in rows if row["coverage_initialized_at"]]
+        ranges = merge_intervals(
+            (int(row[0]), int(row[1]))
+            for row in self.connection.execute(
+                f"SELECT start_ms,end_ms FROM coverage_ranges WHERE media_id IN ({marks})", ids
+            )
+        )
+        self.connection.execute(
+            "UPDATE media SET position_ms=?,duration_ms=?,completion_observed=?,"
+            "first_observed=?,last_observed=?,resume_position_ms=?,last_played_at=?,"
+            "coverage_initialized_at=? WHERE id=?",
+            (
+                max(int(row["position_ms"]) for row in rows),
+                duration,
+                max(int(row["completion_observed"]) for row in rows),
+                min(str(row["first_observed"]) for row in rows),
+                max(str(row["last_observed"]) for row in rows),
+                latest_play["resume_position_ms"],
+                latest_play["last_played_at"],
+                min(initialized) if initialized else None,
+                survivor,
+            ),
+        )
+        other_marks = ",".join("?" for _ in others)
+        self.connection.execute(
+            f"UPDATE queue_entries SET media_id=? WHERE media_id IN ({other_marks})",
+            (survivor, *others),
+        )
+        self.connection.execute(f"DELETE FROM coverage_ranges WHERE media_id IN ({marks})", ids)
+        self.connection.executemany(
+            "INSERT INTO coverage_ranges(media_id,start_ms,end_ms) VALUES(?,?,?)",
+            ((survivor, start, end) for start, end in ranges),
+        )
+        self.connection.execute(f"DELETE FROM media WHERE id IN ({other_marks})", others)
+
+    def _consolidate_grown_media(self) -> None:
+        """Repair history split by older versions while files were written."""
+        groups = self.connection.execute(
+            "SELECT path,inode,COALESCE(volume_uuid,'device:'||device) AS volume FROM media "
+            "GROUP BY path,inode,volume HAVING COUNT(*)>1"
+        ).fetchall()
+        if not groups:
+            return
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            for group in groups:
+                rows = self.connection.execute(
+                    "SELECT id,size FROM media WHERE path=? AND inode=? "
+                    "AND COALESCE(volume_uuid,'device:'||device)=? "
+                    "ORDER BY mtime_ns DESC, size DESC, id DESC",
+                    (group["path"], group["inode"], group["volume"]),
+                ).fetchall()
+                survivor = rows[0]
+                self._merge_media_rows(
+                    int(survivor["id"]),
+                    [int(row["id"]) for row in rows[1:] if int(row["size"]) <= int(survivor["size"])],
+                )
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
 
     def media_fingerprint(self, media_id: int) -> FileIdentity:
         row = self.connection.execute(

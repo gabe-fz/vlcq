@@ -7,6 +7,7 @@ import pytest
 
 from vlcq.controller import PlaybackController, ResumeChoiceRequired
 from vlcq.database import Database
+from vlcq.identity import file_identity
 from vlcq.models import VLCStatus
 from vlcq.queue import QueueService
 from vlcq.vlc import VLCError, VLCPlaylistItem
@@ -1079,5 +1080,7 @@ async def test_playing_rebinds_entry_to_current_file_identity(tmp_path: Path) ->
         await controller.play_with_policy(0, choice="start_over")
     except VLCError:
         pass  # The fake client's playback confirmation is irrelevant here.
-    assert queue.entries()[0].media_id != stale_media
+    entry = queue.entries()[0]
+    assert db.media_fingerprint(entry.media_id).matches(file_identity(videos[0].resolve()))
+    assert entry.media_id == stale_media
     db.close()

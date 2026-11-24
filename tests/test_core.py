@@ -240,6 +240,8 @@ def test_replacement_does_not_inherit_progress(tmp_path: Path) -> None:
     q.open(root)
     q.add([video])
     q.update_progress(video, 5_000, 10_000)
-    video.write_bytes(b"replacement-longer")
+    # A real replacement (copy-over, mv, temp-file rename) is a new inode.
+    replacement = touch(root / "incoming.tmp", b"replacement-longer")
+    replacement.replace(video)
     q.add([video])
     assert db.progress_for(video)["position_ms"] == 0

@@ -8,6 +8,7 @@ from textual.color import Color
 from textual.widgets import Button, Input, Label, ListView, Static
 
 from vlcq.database import Database
+from vlcq.identity import file_identity
 from vlcq.models import VLCStatus
 from vlcq.queue import QueueService
 from vlcq.tui import (
@@ -611,7 +612,9 @@ async def test_queue_actions_follow_a_file_that_finished_downloading(tmp_path: P
         await pilot.pause()
         assert "refused" not in app._notice.lower()
         refreshed = next(item for item in db.queue_entries() if item.id == entry.id)
-        assert refreshed.media_id != stale_media
+        # Same file written in place: its history row now tracks the new size.
+        assert refreshed.media_id == stale_media
+        assert db.media_fingerprint(refreshed.media_id).matches(file_identity(first.resolve()))
         assert refreshed.state == entry.state
     db.close()
 
