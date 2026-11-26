@@ -239,6 +239,23 @@ classification `null`. Legacy classification can therefore differ from the cover
 UI and policy. Consumers should use this command rather than SQLite internals.
 Replaced, missing, symlink-escaped, and out-of-root identities are not exported.
 
+## Download progress (torq / qBittorrent)
+
+If [torq](../torq) is set up, vlcq shows live qBittorrent progress beside any file
+that is still downloading, for example `↓42% 12m`. The badge is cyan while
+downloading, yellow when stalled, and gray when queued or stopped. Folder rows show
+the size-weighted progress of every downloading file beneath them, and Queue rows
+show the same badge. Finished files, skipped files, and torrents with missing files
+have no badge, so ordinary rows look the same as before.
+
+vlcq polls every two seconds and only reads data: it reads torq's
+`~/.config/torq/config.toml` (or `$TORQ_CONFIG_DIR`) for the host, port and
+username, takes the Web API password from the `torq-qbittorrent` Keychain item (or
+`$TORQ_PASSWORD`), and calls `torrents/info` and `torrents/files`. It never adds,
+starts, stops or removes torrents. If qBittorrent is not running, no badges are shown.
+`vlcq doctor` reports whether the integration works (this does not change its exit
+code). Set `VLCQ_DOWNLOADS=off` to turn it off.
+
 ## Finder handoff
 
 The Finder/Automator boundary is:

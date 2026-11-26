@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .config import database_path, ffprobe_diagnostic, resolve_watched_percent
 from .database import Database, DatabaseMigrationError
+from .downloads import QBittorrentDownloads, downloads_enabled
 from .finder import resolve_handoff
 from .ipc import ControllerBusy, ControllerLock
 from .paths import PathError, canonical_root, common_root, validate_video
@@ -113,10 +114,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         watched_percent = resolve_watched_percent()
         if args.command == "doctor":
             ready, message = ffprobe_diagnostic()
+            # Download progress is optional: report it without affecting the exit code.
+            downloads_ready, downloads_message = QBittorrentDownloads().describe()
             if args.json:
-                print(json.dumps({"ffprobe": ready, "message": message}, sort_keys=True))
+                print(json.dumps(
+                    {
+                        "ffprobe": ready,
+                        "message": message,
+                        "downloads": downloads_ready,
+                        "downloads_message": downloads_message,
+                    },
+                    sort_keys=True,
+                ))
             else:
                 print(message)
+                print(downloads_message)
             return 0 if ready else 2
         if args.command in {"inspect-subtitles", "inspect"}:
             inspect_root = canonical_root(args.root)
@@ -218,6 +230,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 # actual TUI constructor.
                 if "watched_percent" in inspect.signature(VLCQApp).parameters:
                     app_kwargs["watched_percent"] = watched_percent
+                if downloads_enabled() and "downloads" in inspect.signature(VLCQApp).parameters:
+                    app_kwargs["downloads"] = QBittorrentDownloads()
                 app = VLCQApp(**app_kwargs)  # type: ignore[arg-type]
                 # Preserve the identity of explicit CLI operands so startup
                 # autoplay cannot accidentally target an older queue index.

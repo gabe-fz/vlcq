@@ -22,6 +22,7 @@ from textual.widgets import Button, Input, Label, ListItem, ListView, Static
 from .config import resolve_watched_percent
 from .controller import PlaybackController, ResumeChoiceRequired, ResumeOffer
 from .database import Database
+from .downloads import DownloadSnapshot, DownloadStatus, QBittorrentDownloads, aggregate, format_eta
 from .identity import FileIdentity, file_identity
 from .models import BrowserEntry, HistoryProjection, QueueEntry
 from .paths import VIDEO_EXTENSIONS, PathError, is_beneath, list_folder, natural_key
@@ -241,6 +242,40 @@ class ItemProgress(Static):
         _update_if_changed(self, text)
 
 
+class DownloadBadge(Static):
+    """qBittorrent progress for a file (or a folder's contents) still downloading.
+
+    Hidden entirely when nothing beneath the row is downloading, so ordinary
+    rows keep their existing layout.
+    """
+
+    def __init__(self, status: DownloadStatus | None = None) -> None:
+        super().__init__(classes="download-badge", markup=False)
+        self.status: DownloadStatus | None = None
+        self.display = False
+        self.set_status(status)
+
+    def set_status(self, status: DownloadStatus | None) -> None:
+        if status == self.status:
+            return
+        self.status = status
+        if status is None:
+            self.display = False
+            return
+        style = {
+            "downloading": "bold cyan",
+            "stalled": "yellow",
+        }.get(status.state, "bright_black")
+        text = Text(f"↓{status.percent:>2}%", style=style, no_wrap=True)
+        if status.state == "downloading":
+            if eta := format_eta(status.eta_seconds):
+                text.append(f" {eta}", style="cyan")
+        else:
+            text.append(f" {status.state}", style=style)
+        _update_if_changed(self, text)
+        self.display = True
+
+
 class SubtitleSubitem(Static):
     """An always-visible, focusable subtitle child row."""
 
@@ -267,6 +302,7 @@ class BrowserListItem(ListItem):
         history_watched: bool = False,
         history_visible: bool = False,
         subtitle_renderable: Text | None = None,
+        download_status: DownloadStatus | None = None,
     ) -> None:
         self.path = entry.path
         self.is_dir = entry.is_dir
@@ -276,7 +312,11 @@ class BrowserListItem(ListItem):
             classes += " selected-video"
         if entry.is_dir:
             super().__init__(
-                Label(renderable, classes="row-label folder-label", markup=False),
+                Horizontal(
+                    Label(renderable, classes="row-label folder-label", markup=False),
+                    DownloadBadge(download_status),
+                    classes="browser-row",
+                ),
                 classes=classes,
             )
         else:
@@ -290,6 +330,7 @@ class BrowserListItem(ListItem):
                         tooltip="Deselect video" if selected else "Select video",
                     ),
                     Label(renderable, classes="row-label", markup=False),
+                    DownloadBadge(download_status),
                     SubtitleSubitem(entry.path, subtitle),
                     HistoricalCoverage(history_percentage, watched=history_watched),
                     classes="browser-row",
@@ -316,6 +357,7 @@ class QueueListItem(ListItem):
         current_position_ms: int | None = 0,
         current_duration_ms: int | None = None,
         subtitle_renderable: Text | None = None,
+        download_status: DownloadStatus | None = None,
     ) -> None:
         del history_visible
         self.entry_id = entry.id
@@ -323,6 +365,7 @@ class QueueListItem(ListItem):
         super().__init__(
             Horizontal(
                 Label(renderable, classes="row-label", markup=False),
+                DownloadBadge(download_status),
                 SubtitleSubitem(entry.path, subtitle),
                 ItemProgress(current_position_ms, current_duration_ms),
                 HistoricalCoverage(history_percentage, watched=history_watched),
@@ -875,6 +918,7 @@ class VLCQApp(App[None], inherit_bindings=False):
     .row-label { width: auto; height: 1; min-height: 1; overflow-x: hidden; }
     .folder-label { width: auto; padding: 0 1; background: #0b1f3a; }
     .current-progress { width: auto; min-width: 20; height: 1; min-height: 1; margin-left: 1; padding: 0; content-align: left middle; overflow-x: hidden; }
+    .download-badge { width: auto; height: 1; min-height: 1; margin-left: 1; padding: 0; content-align: left middle; }
     .history-value { width: auto; min-width: 8; height: 1; min-height: 1; margin-left: 1; padding: 0; content-align: left middle; }
     .folder-entry { background: transparent; }
     .video-entry { color: $text; }
@@ -936,8 +980,15 @@ class VLCQApp(App[None], inherit_bindings=False):
         no_vlc: bool = False,
         autoplay: bool = False,
         watched_percent: int | None = None,
+        downloads: QBittorrentDownloads | None = None,
     ) -> None:
         super().__init__()
+        # Optional read-only qBittorrent (torq) progress source; None in tests
+        # and whenever the integration is disabled.
+        self.downloads = downloads
+        self.download_status: DownloadSnapshot = {}
+        self._download_folder_memo: dict[Path, DownloadStatus | None] = {}
+        self._download_task: asyncio.Task[None] | None = None
         self.watched_percent = resolve_watched_percent(watched_percent)
         self.database = database
         self.queue = QueueService(database, self.watched_percent)
@@ -1076,8 +1127,65 @@ class VLCQApp(App[None], inherit_bindings=False):
                 self.refresh_queue()
         self.call_after_refresh(self._schedule_visible_subtitle_inspections)
         self.set_interval(1, self.refresh_playback)
+        if self.downloads is not None:
+            self._schedule_download_poll()
+            self.set_interval(2, self._schedule_download_poll)
+
+    def _schedule_download_poll(self) -> None:
+        if self.downloads is None:
+            return
+        if self._download_task is not None and not self._download_task.done():
+            return
+        self._download_task = asyncio.create_task(self._poll_downloads())
+
+    async def _poll_downloads(self) -> None:
+        source = self.downloads
+        if source is None:
+            return
+        snapshot = await asyncio.to_thread(source.poll)
+        if snapshot == self.download_status:
+            return
+        self.download_status = snapshot
+        self._download_folder_memo.clear()
+        self._apply_download_badges()
+
+    def _download_status_for(self, path: Path, *, is_dir: bool = False) -> DownloadStatus | None:
+        if not self.download_status:
+            return None
+        if not is_dir:
+            return self.download_status.get(path)
+        if path not in self._download_folder_memo:
+            self._download_folder_memo[path] = aggregate(
+                [status for file, status in self.download_status.items() if is_beneath(file, path)]
+            )
+        return self._download_folder_memo[path]
+
+    def _apply_download_badges(self) -> None:
+        """Repaint only the download badges; rows are not rebuilt."""
+        try:
+            browser = self.query_one("#browser", ListView)
+            queue = self.query_one("#queue", ListView)
+        except NoMatches:
+            return
+        for row in browser.children:
+            if isinstance(row, BrowserListItem):
+                self._update_download_badge(row, row.path, is_dir=row.is_dir)
+        entries = {entry.id: entry for entry in self.queue.entries()}
+        for row in queue.children:
+            if isinstance(row, QueueListItem) and (entry := entries.get(row.entry_id)) is not None:
+                self._update_download_badge(row, entry.path)
+
+    def _update_download_badge(self, row: Widget, path: Path, *, is_dir: bool = False) -> None:
+        try:
+            row.query_one(DownloadBadge).set_status(self._download_status_for(path, is_dir=is_dir))
+        except NoMatches:
+            pass
 
     async def on_unmount(self) -> None:
+        if self._download_task is not None:
+            self._download_task.cancel()
+        if self.downloads is not None:
+            await asyncio.to_thread(self.downloads.close)
         for task in self._history_tasks.values():
             task.cancel()
         self._history_tasks.clear()
@@ -1947,6 +2055,7 @@ class VLCQApp(App[None], inherit_bindings=False):
             row.query_one(".row-label", Label).update(
                 self._browser_renderable(entry, entry.path in self.selected_paths, entry.path in queued_paths)
             )
+            self._update_download_badge(row, entry.path, is_dir=entry.is_dir)
             if not entry.is_dir:
                 row.query_one(HistoricalCoverage).set_percentage(
                     self._history_percentage(entry.path),
@@ -2080,6 +2189,9 @@ class VLCQApp(App[None], inherit_bindings=False):
                                 )
                                 if not entry.is_dir
                                 else None
+                            ),
+                            download_status=self._download_status_for(
+                                entry.path, is_dir=entry.is_dir
                             ),
                         )
                     )
@@ -2272,6 +2384,7 @@ class VLCQApp(App[None], inherit_bindings=False):
             )
             position, duration = self._queue_current_position(entry, current_id)
             row.query_one(ItemProgress).set_position(position, duration)
+            self._update_download_badge(row, entry.path)
             row.query_one(HistoricalCoverage).set_percentage(
                 self._history_percentage(entry.path),
                 watched=self._history_watched(entry.path),
@@ -2383,6 +2496,7 @@ class VLCQApp(App[None], inherit_bindings=False):
                             current_position_ms=position_ms,
                             current_duration_ms=duration_ms,
                             subtitle_renderable=self._subtitle_renderable(entry.path),
+                            download_status=self._download_status_for(entry.path),
                         )
                     )
             if target_present:
